@@ -8,19 +8,33 @@ use std::borrow::Cow;
 use syn::{GenericArgument, GenericParam, Generics, Path, PathArguments, ReturnType, Type, TypeParamBound, WherePredicate};
 
 use super::super::defaults::{DefaultPaths, standard_defaulted_parameters};
-use super::indexes::ABSOLUTE_ROOT;
+use super::indexes::{ABSOLUTE_ROOT, ScopePath};
 use super::predicates::payload;
 use super::values::{Kind, primitive_kind, resolve_type, strip, type_argument_values, type_arguments, type_name};
 use crate::ops::collect::Defaults;
 use crate::{HashMap, HashSet};
 
+pub(super) type ImportMap = HashMap<String, Option<Vec<String>>>;
+
 #[derive(Clone, PartialEq)]
 pub(super) struct Alias {
     pub(super) parameters: Vec<String>,
     pub(super) target: Type,
+    /// The lexical scope used to fill `imports` after the import pre-pass finishes.
+    pub(super) scope_path: ScopePath,
+    /// Imports visible where the alias target was written, not where it is later used.
+    pub(super) imports: ImportMap,
 }
 
 fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
+    substitute_type_inner(ty, substitutions, false)
+}
+
+fn qualify_imported_paths(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
+    substitute_type_inner(ty, substitutions, true)
+}
+
+fn substitute_type_inner(ty: &Type, substitutions: &HashMap<String, Type>, leading_paths: bool) -> Type {
     if let Type::Path(path) = ty
         && path.qself.is_none()
         && let Some(ident) = path.path.get_ident()
@@ -31,31 +45,102 @@ fn substitute_type(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
 
     let mut substituted = ty.clone();
     match &mut substituted {
-        Type::Array(array) => *array.elem = substitute_type(&array.elem, substitutions),
-        Type::Group(group) => *group.elem = substitute_type(&group.elem, substitutions),
-        Type::Paren(paren) => *paren.elem = substitute_type(&paren.elem, substitutions),
+        Type::Array(array) => *array.elem = substitute_type_inner(&array.elem, substitutions, leading_paths),
+        Type::Group(group) => *group.elem = substitute_type_inner(&group.elem, substitutions, leading_paths),
+        Type::Paren(paren) => *paren.elem = substitute_type_inner(&paren.elem, substitutions, leading_paths),
         Type::Path(path) => {
             for segment in &mut path.path.segments {
                 if let PathArguments::AngleBracketed(arguments) = &mut segment.arguments {
                     for argument in &mut arguments.args {
                         if let GenericArgument::Type(inner) = argument {
-                            *inner = substitute_type(inner, substitutions);
+                            *inner = substitute_type_inner(inner, substitutions, leading_paths);
                         }
                     }
                 }
             }
+            if leading_paths
+                && path.qself.is_none()
+                && path.path.leading_colon.is_none()
+                && let Some(first) = path.path.segments.first()
+                && let Some(Type::Path(replacement)) = substitutions.get(&first.ident.to_string())
+            {
+                let mut segments = replacement.path.segments.clone();
+                if let Some(last) = segments.last_mut()
+                    && matches!(last.arguments, PathArguments::None)
+                {
+                    last.arguments = first.arguments.clone();
+                    segments.extend(path.path.segments.iter().skip(1).cloned());
+                    path.path.leading_colon = replacement.path.leading_colon;
+                    path.path.segments = segments;
+                }
+            }
         }
-        Type::Ptr(pointer) => *pointer.elem = substitute_type(&pointer.elem, substitutions),
-        Type::Reference(reference) => *reference.elem = substitute_type(&reference.elem, substitutions),
-        Type::Slice(slice) => *slice.elem = substitute_type(&slice.elem, substitutions),
+        Type::Ptr(pointer) => *pointer.elem = substitute_type_inner(&pointer.elem, substitutions, leading_paths),
+        Type::Reference(reference) => *reference.elem = substitute_type_inner(&reference.elem, substitutions, leading_paths),
+        Type::Slice(slice) => *slice.elem = substitute_type_inner(&slice.elem, substitutions, leading_paths),
         Type::Tuple(tuple) => {
             for element in &mut tuple.elems {
-                *element = substitute_type(element, substitutions);
+                *element = substitute_type_inner(element, substitutions, leading_paths);
             }
         }
         _ => {}
     }
     substituted
+}
+
+/// Freezes generic arguments before the alias target switches to its declaration scope.
+fn qualify_imported_type(
+    ty: &Type,
+    imports: &ImportMap,
+    alias: &Alias,
+    aliases: &HashMap<String, Option<Alias>>,
+    defaults: &Defaults,
+    generics: &[String],
+    defaulted: &[String],
+) -> Type {
+    let mut substitutions: HashMap<String, Type> = imports
+        .iter()
+        .filter_map(|(name, path)| {
+            if generics.contains(name) || defaulted.contains(name) {
+                return None;
+            }
+            // A local declaration with this name may shadow an imported standard type. Keep that
+            // argument unresolved rather than attributing the import to the wrong type.
+            if defaults.defines(name) {
+                return syn::parse_str::<Type>(&format!("self::{name}")).ok().map(|ty| (name.clone(), ty));
+            }
+            let path = path.as_ref()?;
+            let qualified = path
+                .iter()
+                .filter(|segment| segment.as_str() != ABSOLUTE_ROOT)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("::");
+            syn::parse_str::<Type>(&qualified).ok().map(|ty| (name.clone(), ty))
+        })
+        .collect();
+
+    for name in alias.imports.keys() {
+        if imports.get(name).and_then(Option::as_ref).is_some()
+            || alias.parameters.contains(name)
+            || aliases.get(name).is_some_and(Option::is_some)
+            || generics.contains(name)
+            || defaulted.contains(name)
+        {
+            continue;
+        }
+        // The alias's import is not visible where this argument was written. Prevent a bare
+        // local type from acquiring that unrelated import after substitution.
+        let guarded = if name == "String" && !defaults.defines(name) {
+            "std::string::String".to_owned()
+        } else {
+            format!("self::{name}")
+        };
+        if let Ok(ty) = syn::parse_str(&guarded) {
+            let _previous = substitutions.entry(name.clone()).or_insert(ty);
+        }
+    }
+    qualify_imported_paths(ty, &substitutions)
 }
 
 /// What the value-choosing functions know about the file they are reasoning inside.
@@ -71,7 +156,7 @@ pub(super) struct Types<'a> {
     pub(super) defaulted: &'a [String],
 
     /// The module path each imported name came from, so a bare type name can be traced to its crate.
-    pub(super) imports: &'a HashMap<String, Option<Vec<String>>>,
+    pub(super) imports: &'a ImportMap,
 
     /// What the workspace's own sources say about which of their types implement `Default`.
     pub(super) defaults: &'a Defaults,
@@ -116,7 +201,27 @@ impl Types<'_> {
         self.package_type_name(ty).is_some_and(|name| self.defaults.defines(&name))
     }
 
-    fn instantiate_alias(&self, ty: &Type) -> Option<Type> {
+    pub(super) fn instantiate_alias(&self, ty: &Type) -> Option<Type> {
+        self.instantiate_alias_inner(ty, self.imports, None)
+            .map(|(resolved, _imports)| resolved)
+    }
+
+    /// Resolves a place type and returns the import scope of its final alias target.
+    pub(super) fn instantiate_alias_with_scope<'a>(
+        &'a self,
+        ty: &Type,
+        imports: &'a ImportMap,
+        scope: &'a ScopePath,
+    ) -> Option<(Type, &'a ImportMap)> {
+        self.instantiate_alias_inner(ty, imports, Some(scope))
+    }
+
+    fn instantiate_alias_inner<'a>(
+        &'a self,
+        ty: &Type,
+        mut imports: &'a ImportMap,
+        mut scope: Option<&'a ScopePath>,
+    ) -> Option<(Type, &'a ImportMap)> {
         let aliases = self.aliases?;
         let mut resolved = ty.clone();
         let mut visited = HashSet::default();
@@ -124,27 +229,48 @@ impl Types<'_> {
 
         loop {
             let Type::Path(path) = strip(&resolved) else {
-                return changed.then_some(resolved);
+                return changed.then_some((resolved, imports));
             };
             if path.qself.is_some() || path.path.segments.len() != 1 {
-                return changed.then_some(resolved);
+                return changed.then_some((resolved, imports));
             }
 
             let name = path.path.segments[0].ident.to_string();
+            if self.abstracts.contains(&name) || self.defaulted.contains(&name) {
+                return changed.then_some((resolved, imports));
+            }
             if !visited.insert(name.clone()) {
                 return None;
             }
             let Some(alias) = aliases.get(&name).and_then(Option::as_ref) else {
-                return changed.then_some(resolved);
+                return changed.then_some((resolved, imports));
             };
+            if let Some(current_scope) = scope
+                && (!current_scope.starts_with(&alias.scope_path) || imports.contains_key(&name) || imports.contains_key("*"))
+            {
+                // The file-wide alias index cannot identify a local declaration or a glob import
+                // that shadows this name. Resolve only aliases with unambiguous lexical identity.
+                return changed.then_some((resolved, imports));
+            }
             let arguments = super::values::type_argument_values(&resolved);
             let substitutions = alias
                 .parameters
                 .iter()
                 .zip(arguments)
-                .map(|(parameter, argument)| (parameter.clone(), argument.clone()))
+                .map(|(parameter, argument)| {
+                    let argument = if scope.is_some() {
+                        qualify_imported_type(argument, imports, alias, aliases, self.defaults, self.abstracts, self.defaulted)
+                    } else {
+                        argument.clone()
+                    };
+                    (parameter.clone(), argument)
+                })
                 .collect();
             resolved = substitute_type(&alias.target, &substitutions);
+            imports = &alias.imports;
+            if scope.is_some() {
+                scope = Some(&alias.scope_path);
+            }
             changed = true;
         }
     }
@@ -163,6 +289,9 @@ impl Types<'_> {
             let Some(name) = (path.path.segments.len() == 1).then(|| path.path.segments[0].ident.to_string()) else {
                 return resolved;
             };
+            if self.abstracts.contains(&name) || self.defaulted.contains(&name) {
+                return resolved;
+            }
             if !visited.insert(name.clone()) {
                 return ty;
             }
@@ -1093,6 +1222,8 @@ mod tests {
                 Some(Alias {
                     parameters: vec!["T".to_owned()],
                     target: parse_quote!(Option<T>),
+                    scope_path: Vec::new(),
+                    imports: HashMap::default(),
                 }),
             ),
             (
@@ -1100,6 +1231,8 @@ mod tests {
                 Some(Alias {
                     parameters: Vec::new(),
                     target: parse_quote!(crate::Value),
+                    scope_path: Vec::new(),
+                    imports: HashMap::default(),
                 }),
             ),
         ]);
@@ -1238,6 +1371,8 @@ mod tests {
                 Some(Alias {
                     parameters: Vec::new(),
                     target: parse_quote!(B),
+                    scope_path: Vec::new(),
+                    imports: HashMap::default(),
                 }),
             ),
             (
@@ -1245,6 +1380,8 @@ mod tests {
                 Some(Alias {
                     parameters: Vec::new(),
                     target: parse_quote!(A),
+                    scope_path: Vec::new(),
+                    imports: HashMap::default(),
                 }),
             ),
         ]);
@@ -1275,6 +1412,8 @@ mod tests {
                 Some(Alias {
                     parameters: vec!["T".to_owned()],
                     target: parse_quote!(Inner<Option<T>>),
+                    scope_path: Vec::new(),
+                    imports: HashMap::default(),
                 }),
             ),
             (
@@ -1282,6 +1421,8 @@ mod tests {
                 Some(Alias {
                     parameters: vec!["U".to_owned()],
                     target: parse_quote!(Result<U, Error>),
+                    scope_path: Vec::new(),
+                    imports: HashMap::default(),
                 }),
             ),
         ]);

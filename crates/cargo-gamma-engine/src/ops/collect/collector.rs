@@ -50,7 +50,7 @@ use predicates::{
     returns_numeric, returns_result, stmt_attrs, supports_unit_arithmetic_type,
 };
 use tables::{binary_replacements, in_place_reorder, method_renames};
-use types::{Types, returns_undefaultable_error, undefaulted_parameters};
+use types::{ImportMap, Types, returns_undefaultable_error, undefaulted_parameters};
 use values::{Kind, resolve_type, return_values};
 
 use super::Confidence;
@@ -244,7 +244,7 @@ pub(super) struct Collector<'a> {
     constants: HashMap<String, bool>,
 
     /// Unambiguous source-written field and constant types.
-    declared_types: HashMap<String, Option<Type>>,
+    declared_types: HashMap<String, Option<indexes::DeclaredType>>,
 
     /// Locally visible function return types and aliases.
     returns: HashMap<String, Option<Type>>,
@@ -1624,8 +1624,16 @@ impl<'a> Collector<'a> {
                 .or_else(|| {
                     path.path
                         .get_ident()
-                        .and_then(|ident| self.declared_types.get(&ident.to_string())?.as_ref())
+                        .and_then(|ident| self.declared_types.get(&ident.to_string())?.as_ref().map(|declared| &declared.ty))
                 }),
+            Expr::Field(field) => match &field.member {
+                Member::Named(name) => self
+                    .declared_types
+                    .get(&name.to_string())
+                    .and_then(Option::as_ref)
+                    .map(|declared| &declared.ty),
+                Member::Unnamed(_) => None,
+            },
             Expr::Paren(paren) => self.type_of_place(&paren.expr),
             Expr::Group(group) => self.type_of_place(&group.expr),
             Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => self.type_of_place(&unary.expr),
@@ -1639,7 +1647,22 @@ impl<'a> Collector<'a> {
                 .path
                 .get_ident()
                 .and_then(|ident| self.binding_types.get(&ident.to_string()))
-                .map_or_else(|| self.current_imports(), |binding| &binding.imports),
+                .map(|binding| &binding.imports)
+                .or_else(|| {
+                    path.path
+                        .get_ident()
+                        .and_then(|ident| self.declared_types.get(&ident.to_string())?.as_ref())
+                        .map(|declared| &declared.imports)
+                })
+                .unwrap_or_else(|| self.current_imports()),
+            Expr::Field(field) => match &field.member {
+                Member::Named(name) => self
+                    .declared_types
+                    .get(&name.to_string())
+                    .and_then(Option::as_ref)
+                    .map_or_else(|| self.current_imports(), |declared| &declared.imports),
+                Member::Unnamed(_) => self.current_imports(),
+            },
             Expr::Paren(paren) => self.imports_of_expression(&paren.expr),
             Expr::Group(group) => self.imports_of_expression(&group.expr),
             Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => self.imports_of_expression(&unary.expr),
@@ -1687,6 +1710,9 @@ impl<'a> Collector<'a> {
             },
             Expr::Paren(paren) => self.type_of_expression(&paren.expr),
             Expr::Group(group) => self.type_of_expression(&group.expr),
+            // A same-named field in another type may have a different value type. A field-name
+            // declaration is useful for an assignment place, but not proof for arbitrary reads.
+            Expr::Field(_) => None,
             other => self.type_of_place(other),
         }
     }
@@ -1734,50 +1760,56 @@ impl<'a> Collector<'a> {
     fn is_known_textual_or_temporal(&self, expression: &Expr) -> bool {
         if let Expr::Field(field) = expression
             && let Member::Named(name) = &field.member
-            && let Some(Some(ty)) = self.declared_types.get(&name.to_string())
+            && let Some(Some(declared)) = self.declared_types.get(&name.to_string())
         {
-            return self.is_known_textual_or_temporal_type(ty);
+            return self.is_known_textual_or_temporal_type(expression, &declared.ty);
         }
         let Some(ty) = self.type_of_expression(expression) else {
             return self
                 .inferred_expression_type(expression)
-                .is_some_and(|ty| self.is_known_textual_or_temporal_type(&ty));
+                .is_some_and(|ty| self.is_known_textual_or_temporal_type(expression, &ty));
         };
-        self.is_known_textual_or_temporal_type(ty)
+        self.is_known_textual_or_temporal_type(expression, ty)
     }
 
-    fn is_known_textual_or_temporal_type(&self, ty: &Type) -> bool {
+    fn is_known_textual_or_temporal_type(&self, expression: &Expr, ty: &Type) -> bool {
+        let imports = self.imports_of_expression(expression);
         let types = Types {
             abstracts: &self.generics,
             defaulted: &self.defaulted,
-            imports: self.current_imports(),
+            imports,
             defaults: self.defaults,
             aliases: Some(&self.aliases),
             self_type: self.impl_self_type.as_ref(),
             self_associated: Some(&self.impl_self_associated),
         };
-        let ty = types.resolve_alias(ty);
+        let (ty, imports) = dereferenced_place_type(expression, ty, &types, &self.scope_path);
 
-        match values::strip(ty) {
+        if matches!(values::strip(&ty), Type::Path(path) if path.path.get_ident().is_some_and(|name| {
+            self.generics.contains(&name.to_string()) || self.defaulted.contains(&name.to_string())
+        })) {
+            return false;
+        }
+
+        match values::strip(&ty) {
             Type::Reference(reference) => matches!(&*reference.elem, Type::Path(path) if path.path.is_ident("str")),
             Type::Path(path) => {
-                let standard_option =
-                    (path.path.is_ident("Option") && !self.current_imports().contains_key("Option") && !self.defaults.defines("Option"))
-                        || standard_type_path(&path.path, self.current_imports(), "Option", &["std", "option"])
-                        || standard_type_path(&path.path, self.current_imports(), "Option", &["core", "option"]);
+                let standard_option = (path.path.is_ident("Option") && !imports.contains_key("Option") && !self.defaults.defines("Option"))
+                    || standard_type_path(&path.path, imports, "Option", &["std", "option"])
+                    || standard_type_path(&path.path, imports, "Option", &["core", "option"]);
 
-                (path.path.is_ident("String") && !self.current_imports().contains_key("String") && !self.defaults.defines("String"))
-                    || standard_type_path(&path.path, self.current_imports(), "String", &["std", "string"])
-                    || standard_type_path(&path.path, self.current_imports(), "String", &["alloc", "string"])
-                    || standard_type_path(&path.path, self.current_imports(), "OsString", &["std", "ffi"])
-                    || standard_type_path(&path.path, self.current_imports(), "PathBuf", &["std", "path"])
+                (path.path.is_ident("String") && !imports.contains_key("String") && !self.defaults.defines("String"))
+                    || standard_type_path(&path.path, imports, "String", &["std", "string"])
+                    || standard_type_path(&path.path, imports, "String", &["alloc", "string"])
+                    || standard_type_path(&path.path, imports, "OsString", &["std", "ffi"])
+                    || standard_type_path(&path.path, imports, "PathBuf", &["std", "path"])
                     || ["Instant", "SystemTime", "Duration"]
                         .iter()
-                        .any(|name| standard_type_path(&path.path, self.current_imports(), name, &["std", "time"]))
-                    || standard_type_path(&path.path, self.current_imports(), "Duration", &["core", "time"])
+                        .any(|name| standard_type_path(&path.path, imports, name, &["std", "time"]))
+                    || standard_type_path(&path.path, imports, "Duration", &["core", "time"])
                     || ["DateTime", "NaiveDateTime"]
                         .iter()
-                        .any(|name| standard_type_path(&path.path, self.current_imports(), name, &["chrono"]))
+                        .any(|name| standard_type_path(&path.path, imports, name, &["chrono"]))
                     || standard_option
             }
             _ => false,
@@ -1788,9 +1820,9 @@ impl<'a> Collector<'a> {
         let inferred;
         let ty = if let Expr::Field(field) = expression
             && let Member::Named(name) = &field.member
-            && let Some(Some(ty)) = self.declared_types.get(&name.to_string())
+            && let Some(Some(declared)) = self.declared_types.get(&name.to_string())
         {
-            ty
+            &declared.ty
         } else if let Some(ty) = self.type_of_expression(expression) {
             ty
         } else if let Some(ty) = self.inferred_expression_type(expression) {
@@ -1799,26 +1831,35 @@ impl<'a> Collector<'a> {
         } else {
             return false;
         };
+        let imports = self.imports_of_expression(expression);
         let types = Types {
             abstracts: &self.generics,
             defaulted: &self.defaulted,
-            imports: self.current_imports(),
+            imports,
             defaults: self.defaults,
             aliases: Some(&self.aliases),
             self_type: self.impl_self_type.as_ref(),
             self_associated: Some(&self.impl_self_associated),
         };
-        let Type::Path(path) = values::strip(types.resolve_alias(ty)) else {
+        let (ty, imports) = dereferenced_place_type(expression, ty, &types, &self.scope_path);
+        let Type::Path(path) = values::strip(&ty) else {
             return false;
         };
+        if path
+            .path
+            .get_ident()
+            .is_some_and(|name| self.generics.contains(&name.to_string()) || self.defaulted.contains(&name.to_string()))
+        {
+            return false;
+        }
 
         ["Instant", "SystemTime", "Duration"]
             .iter()
-            .any(|name| standard_type_path(&path.path, self.current_imports(), name, &["std", "time"]))
-            || standard_type_path(&path.path, self.current_imports(), "Duration", &["core", "time"])
+            .any(|name| standard_type_path(&path.path, imports, name, &["std", "time"]))
+            || standard_type_path(&path.path, imports, "Duration", &["core", "time"])
             || ["DateTime", "NaiveDateTime"]
                 .iter()
-                .any(|name| standard_type_path(&path.path, self.current_imports(), name, &["chrono"]))
+                .any(|name| standard_type_path(&path.path, imports, name, &["chrono"]))
     }
 
     fn is_known_unsigned(&self, expression: &Expr) -> bool {
@@ -1835,7 +1876,7 @@ impl<'a> Collector<'a> {
                     .declared_types
                     .get(&name.to_string())
                     .and_then(Option::as_ref)
-                    .is_some_and(is_unsigned_binding),
+                    .is_some_and(|declared| is_unsigned_binding(&declared.ty)),
                 Member::Unnamed(_) => false,
             },
             Expr::Cast(cast) => is_unsigned_binding(&cast.ty),
@@ -2549,6 +2590,37 @@ impl<'a> Collector<'a> {
 
         self.inert_depth -= 1;
         result
+    }
+}
+
+/// `type_of_place` retains a binding's reference type when the expression dereferences it.
+/// Instantiate aliases at each reference layer while peeling only explicit dereferences; unknown
+/// `Deref` implementations remain unresolved.
+fn dereferenced_place_type<'a>(
+    mut expression: &Expr,
+    ty: &Type,
+    types: &'a Types<'_>,
+    scope: &'a indexes::ScopePath,
+) -> (Type, &'a ImportMap) {
+    let mut ty = ty.clone();
+    let mut imports = types.imports;
+    loop {
+        if let Some((resolved, alias_imports)) = types.instantiate_alias_with_scope(&ty, imports, scope) {
+            ty = resolved;
+            imports = alias_imports;
+        }
+        match expression {
+            Expr::Paren(paren) => expression = &paren.expr,
+            Expr::Group(group) => expression = &group.expr,
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                let Type::Reference(reference) = values::strip(&ty) else {
+                    return (ty, imports);
+                };
+                ty = (*reference.elem).clone();
+                expression = &unary.expr;
+            }
+            _ => return (ty, imports),
+        }
     }
 }
 
@@ -3343,13 +3415,19 @@ impl<'ast> Visit<'ast> for Collector<'_> {
                 continue;
             }
 
-            if mutator.starts_with("arith.") {
+            // Additive compound assignments need the same type restraint as ordinary arithmetic:
+            // `Instant += Duration` supports `-=` but not `*=`, and `String += &str` supports
+            // neither replacement. Leave multiply/divide assignments alone: `Duration *= u32`
+            // and `Duration /= u32` are both valid.
+            if mutator.starts_with("arith.") || matches!(node.op, BinOp::AddAssign(_) | BinOp::SubAssign(_)) {
                 let left_temporal = self.is_known_temporal(&node.left);
                 let right_temporal = self.is_known_temporal(&node.right);
                 let left_textual = is_textual(&node.left) || self.is_known_textual_or_temporal(&node.left) && !left_temporal;
                 let right_textual = is_textual(&node.right) || self.is_known_textual_or_temporal(&node.right) && !right_temporal;
+                let temporal_replacement_is_compatible =
+                    matches!(*operator, "-" | "-=") || matches!(node.op, BinOp::SubAssign(_)) && *operator == "+=";
 
-                if left_textual || right_textual || (left_temporal || right_temporal) && *operator != "-" {
+                if left_textual || right_textual || (left_temporal || right_temporal) && !temporal_replacement_is_compatible {
                     continue;
                 }
             }
@@ -3679,7 +3757,11 @@ impl<'ast> Visit<'ast> for Collector<'_> {
                 continue;
             }
             let expected = match &field.member {
-                Member::Named(name) => self.declared_types.get(&name.to_string()).and_then(Option::as_ref).cloned(),
+                Member::Named(name) => self
+                    .declared_types
+                    .get(&name.to_string())
+                    .and_then(Option::as_ref)
+                    .map(|declared| declared.ty.clone()),
                 Member::Unnamed(_) => None,
             };
             if let Some(expected) = expected {

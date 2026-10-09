@@ -45,8 +45,20 @@ configuration and therefore audits the whole file.
   associated function items and numeric wrappers without integer-literal
   arithmetic are not sufficient evidence for expression increment or
   decrement; focused non-default selection can still request those optimistic
-  sites. Proven text/time addition is not changed to any incompatible arithmetic
-  operator; signed and unresolved arithmetic remains in the population.
+  sites. Proven text/time addition and additive compound assignment are not
+  changed to incompatible arithmetic operators; signed and unresolved
+  arithmetic remains in the population. The assignment family interprets
+  imported types using bindings', fields', and constants' declaration scopes. Explicit
+  dereferences preserve the import scope through each nested alias target,
+  while generic alias arguments keep the imports at the use site. Generic type
+  parameters take precedence over same-named imports. A nested concrete type
+  declaration or unresolved glob import prevents a file-wide same-named alias
+  from supplying temporal evidence.
+- Registered operator substitutions include changing strict comparisons to
+  equality, reversing inclusive comparisons, changing remainder to addition,
+  and changing addition or subtraction assignment to multiplication or division
+  assignment. Each replacement has its own stable mutator name and remains
+  subject to compilation before a campaign can run it.
 - A mutation that invents `Default::default()` for a known payload requires
   positive evidence. Primitive and supported standard types, package-local
   derives or impls whose concrete generic arguments satisfy their bounds,

@@ -323,6 +323,17 @@ original expression.
 
 ### Semantic restraint
 
+The operator catalog includes `<` and `>` to `==`, `<=` to `>`, `>=` to `<`,
+`%` to `+`, `+=` to `*=`, and `-=` to `/=`. Each substitution has a distinct
+mutator name and is selected through its family and presets.
+Known textual and temporal operands screen out incompatible arithmetic and
+additive compound-assignment substitutions before instrumentation. Viable
+temporal `+=` and `-=` swaps remain available. Parameter and local types use
+the imports visible at their declaration, even when a later block shadows the
+same name. Explicit dereferences instantiate intermediate aliases using each
+alias target's declaration imports; generic arguments retain their imports at
+the use site. A nested concrete type declaration or unresolved glob import
+prevents an unrelated file-wide alias from supplying temporal evidence.
 Instrumentation duplicates source text rather than introducing temporary bindings. A temporary
 could change moves, borrows, short-circuit behavior, or destruction order. The schema may affect
 code size, inlining, and layout, but it must preserve the unmutated program's observable semantics.
