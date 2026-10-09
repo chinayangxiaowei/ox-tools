@@ -911,6 +911,13 @@ A `Result<Option<bool>, E>` yields `Err(Default::default())`, `Ok(None)`, `Ok(So
 `Cow` and `NonZero`. Depth and width are bounded so a deeply generic signature cannot generate an
 unbounded population.
 
+Tuple returns enumerate every combination when the product has at most 16
+values. Larger products keep the first eight combinations in their original order
+so cached mutant IDs still name the same replacements, then add combinations that
+cover as many previously unseen member values as the 16-value limit permits.
+Nested tuples can supply more values than the remaining slots can cover. An
+unchanged replacement is omitted from the mutant list.
+
 Where the tool cannot name a value of a type it falls back to `Default::default()` for a resolved
 package Default type, or as a conservative guess for an unresolved concrete type or alias. It
 withholds that guess for a bare type parameter, an
