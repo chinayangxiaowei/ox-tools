@@ -39,8 +39,9 @@ covers how to turn one off for a particular site.
 
 ## Choosing what to run
 
-The default preset contains the main catalog. Valid mutations with evidence of low yield are kept
-in the opt-in `@pedantic` preset so ordinary runs do not pay for them without asking.
+The default preset includes `fn_value.some`: functions returning `Option<T>` can receive
+`Some(value)` replacements when Gamma can construct a payload. The existing `@pedantic`
+preset remains a focused selector for that mutator.
 
 Ordinary runs also skip a few forms that frequently fail to compile when the source does not reveal
 enough type information:
@@ -572,7 +573,7 @@ the mutator runs when `--mutators` is not given.
 | `fn_value.err_default` | replace the body with Err(Default::default()) |  | yes |
 | `fn_value.err_with` | replace the body with Err(v) for each --error value |  | yes |
 | `fn_value.two` | replace the body with 2 |  | yes |
-| `fn_value.some` | replace the body with Some(value) |  | no |
+| `fn_value.some` | replace the body with Some(value) |  | yes |
 | `fn_value.ok` | replace the body with Ok(value) |  | yes |
 | `fn_value.empty_collection` | replace the body with an empty collection or iterator |  | yes |
 | `fn_value.one_element` | replace the body with a one-element collection or iterator |  | yes |
@@ -1063,7 +1064,7 @@ cargo gamma run --mutators @numeric,!literal.int_increment  # a preset, less one
 | --- | --- | --- |
 | `@all` | every registered mutator | `*` |
 | `@default` | the mutators enabled when none are named | `@default` |
-| `@pedantic` | additional low-yield mutations excluded from the default selection | `fn_value.some` |
+| `@pedantic` | legacy focused selection for Some(value) replacements | `fn_value.some` |
 | `@boundary` | relational and boundary conditions | `relational`, `range` |
 | `@arithmetic` | arithmetic, bitwise, shift and compound assignment | `arith`, `bitwise`, `shift`, `assign` |
 | `@logical` | logical operators and branch conditions | `logical`, `bool_expr`, `cond`, `match_guard` |
@@ -1082,9 +1083,9 @@ cargo gamma run --mutators @numeric,!literal.int_increment  # a preset, less one
 so that a script can say what it means, and so that `@default,!literal` reads as an adjustment to
 the shipped policy rather than a list that has to be re-derived every release.
 
-**`@pedantic` currently contains only `fn_value.some`.** Select it alone to study that mutation, or
-use `--mutators @default,@pedantic` to add it to an ordinary run. Membership is deliberately narrow
-until cross-repository evidence supports more candidates.
+**`@pedantic` currently contains only `fn_value.some`.** It remains available for scripts that
+select it and for focused runs. `fn_value.some` is also in `@default`, so adding `@pedantic`
+to an ordinary run does not add more mutants.
 
 **`@boundary` is the highest-yield preset per mutant.** Off-by-one errors are the defect class
 mutation testing is best at exposing, and a surviving `relational` or `range` mutant almost always

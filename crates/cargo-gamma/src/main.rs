@@ -181,14 +181,15 @@
 //! `@control` includes all the mutators that change which code runs rather than what it computes, and `@numeric`
 //! is literal replacement and expression perturbation.
 //!
-//! The `@default` mutator selection enables the main catalog; additional low-yield mutators live in `@pedantic` and are
-//! not enabled by default. Ordinary runs also skip a few forms that frequently fail to compile when the
+//! The `@default` mutator selection includes `fn_value.some`, which replaces an `Option<T>` function body
+//! with `Some(value)` when a payload value can be constructed. `@pedantic` remains a focused selector for
+//! this mutator. Ordinary runs also skip a few forms that frequently fail to compile when the
 //! source does not reveal enough type information. A non-default selector that includes the mutator —
 //! its name, family, another preset, or `all` — includes those forms.
 //!
 //! ```bash
 //! cargo gamma run --mutators @control --file src/dispatch.rs
-//! cargo gamma run --mutators @default,@pedantic
+//! cargo gamma run --mutators fn_value.some
 //! ```
 //!
 //! ## Safety and test side effects

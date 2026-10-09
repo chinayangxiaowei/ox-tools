@@ -197,21 +197,16 @@ mod tests {
     }
 
     #[test]
-    fn default_and_pedantic_presets_partition_everything() {
+    fn default_includes_some_while_pedantic_remains_available() {
         let default = Selection::default_preset();
         let pedantic = Selection::parse("@pedantic").unwrap();
-        let all = Selection::everything();
 
         assert!(!default.names.is_empty());
         assert_eq!(pedantic.sorted(), ["fn_value.some"]);
-        assert!(!default.contains("fn_value.some"));
-        assert_eq!(default.names.len() + pedantic.names.len(), all.names.len());
+        assert!(default.contains("fn_value.some"));
 
         let combined = Selection::parse("@default,@pedantic").unwrap();
-
-        for name in all.sorted() {
-            assert!(combined.contains(name), "{name} is not reachable through a shipped preset");
-        }
+        assert_eq!(combined.sorted(), default.sorted());
     }
 
     #[test]

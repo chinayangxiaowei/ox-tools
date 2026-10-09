@@ -323,6 +323,11 @@ original expression.
 
 ### Semantic restraint
 
+The default mutator selection includes whole-body `Some(value)` replacements
+for `Option<T>` returns when Gamma can construct a value of `T`. The
+`@pedantic` selector continues to select only this mutator for focused runs
+and existing scripts.
+
 Instrumentation duplicates source text rather than introducing temporary bindings. A temporary
 could change moves, borrows, short-circuit behavior, or destruction order. The schema may affect
 code size, inlining, and layout, but it must preserve the unmutated program's observable semantics.
