@@ -344,6 +344,9 @@ The default mutator selection includes whole-body `Some(value)` replacements
 for `Option<T>` returns when Gamma can construct a value of `T`. The
 `@pedantic` selector continues to select only this mutator for focused runs
 and existing scripts.
+For tuple returns, Gamma enumerates the full product when it has at most 16
+combinations. Larger products retain 16 combinations covering each available
+value in every member position before filling the remaining budget.
 
 Functions returning references receive whole-body `fn_value` candidates when
 the referent can be constructed: string literals for shared `&str`, leaked

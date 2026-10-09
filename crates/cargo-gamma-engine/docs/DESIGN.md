@@ -104,7 +104,12 @@ focused runs and existing scripts.
   cannot be borrowed as evidence for the local shadow.
   Unsized standard wrappers use shape-specific constructors, opaque iterators
   retain iterator-shaped replacements, and tuple/collection products require
-  evidence for every member. A reference return uses static literals for
+  evidence for every member. Tuple returns enumerate all products up to 16
+  combinations. Larger products retain the first eight lexicographic combinations
+  to keep existing mutant IDs tied to the same replacements, then use up to eight
+  more combinations to cover previously unseen member values. A nested tuple can
+  offer more unseen values than those eight slots can hold. Other synthesized
+  value lists are limited to eight. A reference return uses static literals for
   shared strings, leaked boxes for sized referents, and leaked vectors for
   slices with mutable or nonempty replacements. Shared empty slices, unit
   values, and zero-length arrays use promotable literals, allowing no-op
