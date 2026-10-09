@@ -334,6 +334,11 @@ original expression.
 
 ### Semantic restraint
 
+The default mutator selection includes whole-body `Some(value)` replacements
+for `Option<T>` returns when Gamma can construct a value of `T`. The
+`@pedantic` selector continues to select only this mutator for focused runs
+and existing scripts.
+
 Functions returning references receive whole-body `fn_value` candidates when
 the referent can be constructed: string literals for shared `&str`, leaked
 boxes for sized referents, and leaked vectors for mutable or nonempty slice

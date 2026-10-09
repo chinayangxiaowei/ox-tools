@@ -15,9 +15,8 @@ macro_rules! mutators {
 }
 
 mutators! {
-    // `default_on` includes generally applicable, useful mutations; measured low-yield variants
-    // are documented exceptions. Academic aliases follow established operator classes, while
-    // presets group user tasks and may intentionally overlap.
+    // `default_on` includes the ordinary mutation catalog. Academic aliases follow established
+    // operator classes, while presets group user tasks and may intentionally overlap.
     // Function value replacement.
     "fn_value.default",          true,  &["RV"],  "replace the function body with a default value";
     "fn_value.stated",           true,  &["RV"],  "replace the body with the value the site states in #[gamma::value(...)]";
@@ -35,7 +34,7 @@ mutators! {
     "fn_value.err_default",      true,  &[],      "replace the body with Err(Default::default())";
     "fn_value.err_with",         true , &[],      "replace the body with Err(v) for each --error value";
     "fn_value.two",              true,  &[],      "replace the body with 2";
-    "fn_value.some",             false, &[],      "replace the body with Some(value)";
+    "fn_value.some",             true,  &[],      "replace the body with Some(value)";
     "fn_value.ok",               true,  &[],      "replace the body with Ok(value)";
     "fn_value.empty_collection", true,  &[],      "replace the body with an empty collection or iterator";
     "fn_value.one_element",      true,  &[],      "replace the body with a one-element collection or iterator";
@@ -230,7 +229,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "pedantic",
-        description: "additional low-yield mutations excluded from the default selection",
+        description: "legacy focused selection for Some(value) replacements",
         members: &["fn_value.some"],
     },
     Preset {
