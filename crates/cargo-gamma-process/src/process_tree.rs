@@ -1202,7 +1202,7 @@ impl ProcessTree {
             match cleanup_after_observation(
                 observed,
                 || {
-                    let swept = self.sweep();
+                    let swept = self.sweep(true);
                     self.release();
 
                     swept
@@ -1254,7 +1254,7 @@ impl ProcessTree {
             if status.is_some() {
                 // Windows jobs retain object handles rather than numeric process identifiers, and
                 // platforms without groups have no identifier that a sweep could reuse.
-                let swept = self.sweep();
+                let swept = self.sweep(true);
 
                 if let Err(cause) = swept {
                     self.output_cleanup_unproven = true;
@@ -1298,7 +1298,7 @@ impl ProcessTree {
     /// The child is still killed when sweeping the surrounding subtree fails. A direct child-kill
     /// failure takes precedence over the sweep failure after both cleanup attempts complete.
     fn kill(&self, child: &mut Child) -> io::Result<()> {
-        let swept = self.sweep();
+        let swept = self.sweep(false);
 
         // The group or job may not have covered the child — the id could not be converted, the job
         // could not be created — and in any case this is what makes `wait` return.
@@ -1309,23 +1309,34 @@ impl ProcessTree {
 
     /// Ends the subtree and reaps its leader without exposing its group id to reuse.
     ///
+    /// Returns the leader's exit status when this call reaps it. On macOS, a repeated call after
+    /// proven cleanup succeeds with `None` because the leader's status has already been consumed.
+    ///
     /// # Errors
     ///
-    /// Returns [`io::ErrorKind::Other`] when this subtree's leader has already been reaped —
-    /// through an earlier [`Self::terminate`], or because [`Self::observe`] found it consumed
-    /// elsewhere — and the operating system's reason when cleanup or reaping fails. A reap
-    /// failure takes precedence when both operations fail.
-    pub fn terminate(&mut self) -> io::Result<ExitStatus> {
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| io::Error::other("the subtree leader was already reaped"))?;
+    /// Returns [`io::ErrorKind::Other`] when the leader has already been reaped, except for a
+    /// repeated macOS call after proven cleanup. An external reap leaves cleanup unproven and
+    /// still returns an error. Other errors report the operating system's reason when cleanup or
+    /// reaping fails. A reap failure takes precedence when both operations fail.
+    pub fn terminate(&mut self) -> io::Result<Option<ExitStatus>> {
+        let Some(mut child) = self.child.take() else {
+            #[cfg(target_os = "macos")]
+            if !self.output_cleanup_unproven {
+                return Ok(None);
+            }
+
+            return Err(io::Error::other("the subtree leader was already reaped"));
+        };
 
         let killed = self.kill(&mut child);
         // #[gamma::skip(stmt.delete_call, reason = "release has no effect on non-Unix mutation hosts; Unix tests assert termination frees the watched slot before reaping")]
         self.release();
 
-        let reaped = child.wait()?;
+        let reaped = child.wait();
+        if reaped.is_err() || killed.is_err() {
+            self.output_cleanup_unproven = true;
+        }
+        let reaped = reaped?;
         killed?;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -1333,7 +1344,7 @@ impl ProcessTree {
             return Err(io::Error::other("subtree termination failed as requested by a test"));
         }
 
-        Ok(reaped)
+        Ok(Some(reaped))
     }
 
     /// Ends descendants while their leader's process-group id is still reserved.
@@ -1341,7 +1352,11 @@ impl ProcessTree {
     /// An exited leader can leave servers and inherited pipe handles behind. This private
     /// primitive is reachable only from [`Self::observe`] and [`Self::terminate`], which signal
     /// before reaping that leader, so `killpg` cannot name a replacement group.
-    fn sweep(&self) -> io::Result<()> {
+    #[cfg_attr(
+        not(unix),
+        expect(unused_variables, reason = "only Unix process groups use the leader's observed exit")
+    )]
+    fn sweep(&self, leader_exited: bool) -> io::Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
         if faults::fired(faults::Fault::Sweep) {
             return Err(io::Error::other("subtree sweep failed as requested by a test"));
@@ -1356,7 +1371,13 @@ impl ProcessTree {
         // Signalling the group has to come first: killing the leader on its own leaves the group
         // without one, and the descendants are then reparented and unreachable.
         #[cfg(unix)]
-        let killed = self.group.map_or(Ok(()), group::kill);
+        let killed = self.group.map_or(Ok(()), |group| {
+            if leader_exited {
+                group::kill_after_exit(group)
+            } else {
+                group::kill(group)
+            }
+        });
 
         #[cfg(windows)]
         let boundary_killed = self.job.as_ref().map_or(Ok(()), Job::terminate);
@@ -1815,6 +1836,7 @@ mod tests {
         assert_ne!(STDOUT_STREAM, STDERR_STREAM);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn terminating_an_already_reaped_subtree_reports_the_exact_reason() {
         let mut subtree = ProcessTree {
@@ -1837,6 +1859,19 @@ mod tests {
         let reason = subtree.terminate().expect_err("an absent leader was already reaped");
 
         assert_eq!(reason.to_string(), "the subtree leader was already reaped");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminating_an_already_cleaned_subtree_is_idempotent() {
+        let mut subtree = ProcessTree {
+            child: None,
+            output_cleanup_unproven: false,
+            group: None,
+            slot: None,
+        };
+
+        assert_eq!(subtree.terminate().expect("cleanup already completed"), None);
     }
 
     #[test]
@@ -3479,7 +3514,7 @@ mod tests {
         let mut subtree = captured_no_op_subtree();
         let sweep = faults::arm(faults::Fault::Sweep);
 
-        let reason = subtree.sweep().expect_err("the sweep fault is reported");
+        let reason = subtree.sweep(false).expect_err("the sweep fault is reported");
 
         assert!(reason.to_string().contains("subtree sweep failed"), "{reason}");
         drop(sweep);
@@ -3507,7 +3542,10 @@ mod tests {
         let spawned = prepared.spawn().expect("spawn");
         let mut subtree = ProcessTree::adopt(spawned).expect("adoption");
 
-        let status = subtree.terminate().expect("an unarmed termination succeeds");
+        let status = subtree
+            .terminate()
+            .expect("an unarmed termination succeeds")
+            .expect("this call reaps the leader");
 
         assert!(!status.success(), "the sleeping child exited before termination reached it");
         assert!(subtree.released(), "termination retained its interrupt registration");
@@ -3523,8 +3561,12 @@ mod tests {
 
         assert!(reason.to_string().contains("failed as requested"), "{reason}");
         assert!(subtree.released(), "fault reporting retained the interrupt registration");
+        let repeated = subtree.terminate();
+        #[cfg(target_os = "macos")]
+        assert_eq!(repeated.expect("cleanup already completed"), None);
+        #[cfg(not(target_os = "macos"))]
         assert!(
-            subtree.terminate().is_err(),
+            repeated.is_err(),
             "fault reporting left a supposedly terminated child in the lifecycle"
         );
 

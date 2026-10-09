@@ -20,7 +20,13 @@ crate's dependency graph and must remain dependency-free.
 
 - Unix process groups and Windows job objects provide process-tree control.
   Unix group identifiers less than or equal to one are rejected because
-  `killpg` reserves them for special or undefined behavior.
+  `killpg` reserves them for special or undefined behavior. On macOS, a group
+  sweep after a non-reaping observation of the leader's exit accepts `EPERM`
+  only when a process-group query finds that leader as its sole remaining member:
+  the kernel also returns it for this zombie-only group. A live or uninspectable
+  member preserves the error. A sweep of a running leader still reports `EPERM`;
+  group containment remains best-effort
+  where descendants can change credentials or leave the group.
 - Linux cgroups and Windows job objects provide process-tree memory limits.
 - On Linux, terminal interrupts kill both the process group and the cgroup, so
   descendants that create a new session cannot escape cleanup.

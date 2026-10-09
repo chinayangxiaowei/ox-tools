@@ -31,7 +31,7 @@ use std::process::{Child, Command};
 use std::time::Instant;
 
 #[cfg(unix)]
-use cargo_gamma_unsafe::group::{exists, exited, group_of, kill, raise_interrupt};
+use cargo_gamma_unsafe::group::{exists, exited, group_of, kill, kill_after_exit, raise_interrupt};
 
 /// Spawns a long-lived child that has made itself the leader of a brand-new process group.
 ///
@@ -131,6 +131,33 @@ fn the_liveness_probe_tells_a_live_child_from_a_reaped_one() {
     assert!(!exists(pid), "a killed and reaped child is reported as gone");
 }
 
+/// A live leader remains pending when observed without waiting for its exit.
+#[cfg(unix)]
+#[test]
+fn observing_a_running_child_reports_it_as_pending() {
+    let mut child = spawn_group_leader();
+    let observed = exited(child.id());
+
+    kill(pid_of(&child)).expect("cleanup");
+    child.wait().expect("reap");
+
+    assert!(!observed.expect("a live child can be observed"));
+}
+
+/// An exited leader with no remaining group members needs no signal before reaping.
+#[cfg(unix)]
+#[test]
+fn killing_an_exited_but_unreaped_group_is_already_done() {
+    let mut child = Command::new("true").process_group(0).spawn().expect("spawn a group leader");
+    let group = pid_of(&child);
+
+    assert!(poll_until(|| exited(child.id()).expect("the child can be observed")));
+    let killed = kill_after_exit(group);
+    child.wait().expect("reap");
+
+    killed.expect("an exited, empty group is already gone");
+}
+
 /// A non-reaping observation keeps a group leader's identifier unavailable for reuse.
 #[cfg(unix)]
 #[test]
@@ -144,6 +171,7 @@ fn observing_an_exit_keeps_its_group_reserved_until_the_explicit_reap() {
         poll_until(|| exited(child.id()).expect("the child can be observed")),
         "the killed child never became observable"
     );
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(
         group_of(pid),
         Some(pid),

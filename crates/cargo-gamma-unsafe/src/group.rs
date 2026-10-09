@@ -87,6 +87,44 @@ pub fn kill(group: i32) -> io::Result<()> {
     map_killpg_error(io::Error::last_os_error())
 }
 
+/// Kills a group after its leader has been observed exiting without being reaped.
+///
+/// macOS can return `EPERM` when the group contains only a zombie leader: its `killpg` path
+/// excludes zombies and reports no signalable members as a permission error. The same error can
+/// mean an inaccessible live member. Only a group listing containing exactly the observed,
+/// unreaped leader proves the former case; every other result preserves the permission error.
+/// The unreaped leader keeps the numeric group id tied to this subtree while it is inspected.
+///
+/// # Errors
+///
+/// Returns errors from [`kill`], including macOS `EPERM` unless the leader is the group's only
+/// remaining member.
+pub fn kill_after_exit(group: i32) -> io::Result<()> {
+    let killed = kill(group);
+
+    #[cfg(target_os = "macos")]
+    if killed.as_ref().is_err_and(|cause| cause.raw_os_error() == Some(libc::EPERM)) && only_exited_leader_remains(group) {
+        return Ok(());
+    }
+
+    killed
+}
+
+/// A two-entry snapshot suffices: a second member, or a sole member with another pid, prevents
+/// treating `EPERM` as success. A failed or incomplete query also leaves the original error intact.
+#[cfg(target_os = "macos")]
+fn only_exited_leader_remains(group: i32) -> bool {
+    let mut members: [libc::pid_t; 2] = [0; 2];
+    let bytes =
+        libc::c_int::try_from(core::mem::size_of_val(&members)).expect("two pid_t values always fit in the proc_listpgrppids byte count");
+
+    // SAFETY: `members` is writable storage for two pid_t values, and `bytes` is its exact byte
+    // length. The kernel writes no more than this length and returns the number of pids written.
+    let listed = unsafe { libc::proc_listpgrppids(group, members.as_mut_ptr().cast(), bytes) };
+
+    listed == 1 && members[0] == group
+}
+
 /// Treats an already-absent group as gone while preserving every other operating-system error.
 fn map_killpg_error(cause: io::Error) -> io::Result<()> {
     if cause.raw_os_error() == Some(libc::ESRCH) {
@@ -162,7 +200,13 @@ pub fn raise_quit() {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use core::time::Duration;
+    #[cfg(target_os = "macos")]
+    use std::io::BufRead as _;
+    #[cfg(target_os = "macos")]
+    use std::os::unix::process::CommandExt as _;
     use std::process::Command;
+    #[cfg(target_os = "macos")]
+    use std::process::Stdio;
     use std::thread;
     use std::time::Instant;
 
@@ -230,6 +274,30 @@ mod tests {
         let error = map_killpg_error(io::Error::from_raw_os_error(libc::EPERM)).expect_err("a permission failure is not an absent group");
 
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_group_with_another_member_is_not_a_zombie_only_group() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & echo ready; wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the shell starts as a process-group leader");
+        let group = i32::try_from(child.id()).expect("a child pid fits a process-group identifier");
+        let mut ready = String::new();
+        let announced = std::io::BufReader::new(child.stdout.take().expect("stdout was piped above"))
+            .read_line(&mut ready)
+            .expect("the shell announces after its sleep child starts");
+        let only_leader = only_exited_leader_remains(group);
+        let killed = kill(group);
+        let reaped = child.wait();
+
+        assert!(announced > 0 && ready == "ready\n", "the child was not started: {ready:?}");
+        assert!(!only_leader, "a live group member was mistaken for the sole exited leader");
+        killed.expect("the test's live group can be terminated");
+        reaped.expect("the test's group leader can be reaped");
     }
 
     /// A process id that is not this process's child cannot be observed for its exit, so the kernel
