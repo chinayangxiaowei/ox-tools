@@ -768,6 +768,42 @@ fn a_mixed_workspace_checks_libraries_under_the_test_feature_graph() {
         output.contains("6 mutants (2 killed, 0 survived, 0 timed out, 0 out of memory, 4 uncovered => 33.3%)"),
         "the untested libraries were not compiled under the same feature graph: {output}"
     );
+
+    // Exercise --re through the same real Cargo build and test path, selecting only the app's
+    // accepts function even though the two library packages also define accepts.
+    let (code, output) = session(
+        &dir,
+        &[
+            "--workspace",
+            "--mutators",
+            "relational",
+            "--re",
+            "^app/src/main\\.rs:[0-9]+:[0-9]+: accepts:",
+            "--incremental",
+            "no",
+        ],
+    );
+
+    assert_eq!(code, EXIT_OK, "{output}");
+    let report = fs::read_to_string(dir.path().join("target/cargo-gamma/gamma-report.json"))
+        .unwrap_or_else(|error| panic!("could not read the filtered mixed fixture's report: {error}"));
+    let document: serde_json::Value =
+        serde_json::from_str(&report).unwrap_or_else(|error| panic!("the filtered mixed fixture's report is invalid JSON: {error}"));
+    let files = document["files"].as_object().expect("a completed report has a files object");
+    let mutants = files["app/src/main.rs"]["mutants"]
+        .as_array()
+        .expect("the selected app function has mutants");
+
+    assert_eq!(files.len(), 1, "the regex included another package: {files:?}");
+    assert_eq!(
+        mutants.len(),
+        2,
+        "the app's relational variants were not both selected: {mutants:?}"
+    );
+    assert!(
+        mutants.iter().all(|mutant| mutant["status"] == "Killed"),
+        "the app tests did not judge both mutants: {mutants:?}"
+    );
 }
 
 fn promote_hints(dir: &TempDir) -> (i32, String) {

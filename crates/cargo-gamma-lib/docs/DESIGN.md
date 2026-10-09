@@ -87,6 +87,13 @@ configuration, reports, diagnostics, and exit codes. The Rust API is an
 implementation detail used by the thin executable crate. Its rustdoc is hidden,
 and its hand-written README warns downstream users not to depend on it.
 
+`--re` compiles one or more Rust regular expressions into a single alternative match. Discovery
+matches them against the same full name printed by `list mutants`, including the workspace-relative
+file and location, qualified item path, and mutation summary. A malformed pattern is a usage error.
+The filter runs after source and diff discovery but before exact-ID selection, sharding, and ordinal
+assignment. `list files` under this filter shows only files with selected mutants. `unsuppress`
+rejects `--re`, since a partial mutant population cannot establish that a directive is idle.
+
 ### Progress and dashboard
 
 The ordinary live display uses one active phase line at a time. Workspace

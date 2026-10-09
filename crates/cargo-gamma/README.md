@@ -302,7 +302,14 @@ cargo gamma run --test-package ledger      # let this package's tests judge a mu
 cargo gamma run --exclude-test conformance # keep a test target out of the oracle
 cargo gamma run --test-workspace           # let every package's tests judge a mutant
 cargo gamma run --test-lib                 # use only library unit-test harnesses
+cargo gamma list mutants --re one_line    # preview mutants in this function
+cargo gamma run --re one_line             # test only matching mutants
 ```
+
+`--re` matches the full name shown by `cargo gamma list mutants`: workspace-relative file,
+line and column, qualified function path, and change description. It uses a Rust regular
+expression, matches substrings by default, and may be repeated to include matches from any
+pattern. Use `list mutants --re ...` to preview the exact population before a run.
 
 By default, each mutant is judged by tests from its own package. That applies both to a run inside
 `ledger-core` and to a whole-workspace run containing it: crates that depend on `ledger-core` are

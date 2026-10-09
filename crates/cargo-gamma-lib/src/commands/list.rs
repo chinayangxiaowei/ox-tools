@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -171,17 +171,31 @@ fn list_files<H: Host>(
 
     crate::report::skipped(host, &plan, styler)?;
 
+    // A name filter selects mutants, so a file listing under that filter names only files that
+    // actually contain one of the selected mutants.
+    let selected_paths = (!select.name_patterns.is_empty()).then(|| {
+        plan.mutants
+            .iter()
+            .map(|mutant| mutant.file.as_ref())
+            .collect::<std::collections::HashSet<&Utf8Path>>()
+    });
+    let files: Vec<_> = plan
+        .files
+        .iter()
+        .filter(|file| selected_paths.as_ref().is_none_or(|paths| paths.contains(file.path.as_path())))
+        .collect();
+
     let mut stream = host.results();
 
     if json {
-        let paths: Vec<&Utf8PathBuf> = plan.files.iter().map(|file| &file.path).collect();
+        let paths: Vec<&Utf8PathBuf> = files.iter().map(|file| &file.path).collect();
 
         write_pretty_json(&mut stream, &paths, "the file list")?;
 
         return Ok(EXIT_OK);
     }
 
-    for file in &plan.files {
+    for file in files {
         writeln!(stream, "{}", encode_controls(file.path.as_str()))?;
     }
 
@@ -244,10 +258,10 @@ fn describe_for_listing(mutant: &crate::model::Mutant) -> String {
         .filter(|_| mutant.outcome == crate::model::Outcome::Ignored)
         .map(|suppression| suppression.channel.as_str())
     else {
-        return mutant.describe();
+        return mutant.selection_name();
     };
 
-    format!("{} [suppressed: {channel}]", mutant.describe())
+    format!("{} [suppressed: {channel}]", mutant.selection_name())
 }
 
 /// Writes the listing as a report document.
@@ -454,6 +468,45 @@ mod tests {
 
         assert_eq!(code, EXIT_OK);
         assert!(host.out().contains("relational.lt_to_le"), "{}", host.out());
+    }
+
+    #[test]
+    fn listed_names_are_the_names_matched_by_re() {
+        let dir = crate_dir("list-mutants-re-");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
+        let mut command = args(root.clone(), ListKind::Mutants, false);
+        let ListCommand::Mutants(ref mut mutants) = command.command else {
+            panic!("the fixture requested a mutant listing");
+        };
+        mutants.select.name_patterns.push(": less: ".to_owned());
+        mutants.select.mutators = Some("relational".to_owned());
+
+        let mut host = Sink::default();
+        let code = list(&mut host, &command, Styler::new(false)).expect("list filtered mutants");
+        let text = host.out();
+
+        assert_eq!(code, EXIT_OK);
+        assert!(text.lines().any(|line| line.contains(": less: ")), "{text}");
+        assert!(text.lines().all(|line| line.contains(": less: ")), "{text}");
+
+        let mut files = args(root, ListKind::Files, false);
+        let ListCommand::Files(ref mut listing) = files.command else {
+            panic!("the fixture requested a file listing");
+        };
+        listing.select.name_patterns.push(": less: ".to_owned());
+
+        let mut host = Sink::default();
+        list(&mut host, &files, Styler::new(false)).expect("list files with matching mutants");
+        assert_eq!(host.out().trim(), "src/lib.rs");
+
+        let ListCommand::Files(ref mut listing) = files.command else {
+            panic!("the fixture requested a file listing");
+        };
+        listing.select.name_patterns = vec!["does_not_match".to_owned()];
+
+        let mut host = Sink::default();
+        list(&mut host, &files, Styler::new(false)).expect("list files with no matching mutants");
+        assert!(host.out().is_empty(), "{}", host.out());
     }
 
     /// A suppressed mutant is marked and counted, so the listing does not overstate the run.

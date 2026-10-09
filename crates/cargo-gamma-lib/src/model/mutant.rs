@@ -190,6 +190,20 @@ impl Mutant {
         format!("{}:{}:{}: {} [{}]", self.file, self.line, self.column, self.summary(), self.mutator)
     }
 
+    /// The name shown by `list mutants` and matched by `--re`.
+    #[must_use]
+    pub(crate) fn selection_name(&self) -> String {
+        format!(
+            "{}:{}:{}: {}: {} [{}]",
+            self.file,
+            self.line,
+            self.column,
+            self.item_path,
+            self.summary(),
+            self.mutator
+        )
+    }
+
     /// How long the run spent deciding this mutant.
     ///
     /// The stored figure is milliseconds because that is what a report holds; every reader of it

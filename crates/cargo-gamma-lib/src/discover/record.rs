@@ -632,7 +632,7 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
     type Error = &'static str;
 
     fn try_from(compact: CompactGeneralizedHints) -> Result<Self, Self::Error> {
-        let items = compact
+        let items: Vec<ItemHints> = compact
             .items
             .into_iter()
             .map(|item| {
@@ -646,8 +646,8 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
                         .collect::<Result<_, _>>()?,
                 })
             })
-            .collect::<Result<_, _>>()?;
-        let binaries = compact
+            .collect::<Result<_, &'static str>>()?;
+        let binaries: Vec<FileBinaryHints> = compact
             .binaries
             .into_iter()
             .map(|file| {
@@ -660,7 +660,7 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
                         .collect::<Result<_, _>>()?,
                 })
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, &'static str>>()?;
         let test_sets = compact
             .test_sets
             .into_iter()

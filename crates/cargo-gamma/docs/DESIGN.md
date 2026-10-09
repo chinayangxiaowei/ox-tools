@@ -224,12 +224,20 @@ implementation choice.
 Selection narrows the population before expensive work:
 
 - package, file, mutator, and diff selection decide what may become a mutant;
+- `--re` selects mutants by a regular expression over the full name shown by `list mutants`:
+  workspace-relative location, qualified function path, and change description. Repeated patterns
+  match any one of them; the filter is applied before sharding and compilation. With `list files`,
+  it leaves only files containing a selected mutant;
 - conditional-compilation evidence excludes code absent from this build;
 - explicitly tagged project policy can mark every implementation whose final written trait-path
   segment is a named unqualified Rust identifier as ignored, without coupling selection to path
   qualification or human-readable report text;
 - suppressions withdraw explicitly accepted sites;
 - sharding assigns stable portions of the population to separate campaigns.
+
+`unsuppress` audits whether each directive still governs any mutant in its source file, regardless
+of a run's name filter. It rejects `--re` instead of treating a partial match as evidence that a
+directive has become idle.
 
 Trait-name policy is deliberately lexical. `impl Debug`, `impl fmt::Debug`, and
 `impl core::fmt::Debug` share the final written identifier `Debug`, while an imported alias retains

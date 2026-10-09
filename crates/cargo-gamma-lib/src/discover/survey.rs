@@ -15,6 +15,7 @@ use std::thread;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Target, TargetKind};
+use regex::RegexSet;
 use syn::visit::{self, Visit};
 use walkdir::WalkDir;
 
@@ -199,6 +200,7 @@ pub struct Survey {
     untracked_build_script_inputs: bool,
 
     diff: Option<Diff>,
+    name_patterns: Option<RegexSet>,
     shard: Option<(u32, u32)>,
     only_mutants: Option<HashSet<MutantId>>,
     settled: HashMap<MutantId, super::Settled>,
@@ -302,6 +304,12 @@ impl Survey {
         cache_inputs: bool,
     ) -> Result<Self> {
         cargo.validate()?;
+
+        let name_patterns = if args.name_patterns.is_empty() {
+            None
+        } else {
+            Some(RegexSet::new(&args.name_patterns).map_err(|error| error!("invalid --re pattern: {error}").usage())?)
+        };
 
         let features = features::from_extra(&args.features, &cargo.extra);
         let metadata = load_metadata(&args.dir, &features)?;
@@ -484,6 +492,7 @@ impl Survey {
             specs,
             cfgs,
             diff,
+            name_patterns,
             shard,
             only_mutants: None,
             settled: HashMap::default(),
@@ -677,6 +686,10 @@ impl Survey {
 
                 diff.touches(&mutant.file, start, end)
             });
+        }
+
+        if let Some(patterns) = self.name_patterns.as_ref() {
+            mutants.retain(|mutant| patterns.is_match(&mutant.selection_name()));
         }
 
         if let Some(only) = self.only_mutants.as_ref() {
@@ -4645,6 +4658,65 @@ mod tests {
             "{:?}",
             scanned.mutants
         );
+    }
+
+    #[test]
+    fn a_name_pattern_selects_only_mutants_in_the_matching_function() {
+        let (_directory, root) = workspace();
+
+        let survey = survey(
+            &root,
+            SelectArgs {
+                name_patterns: vec![": add: ".to_owned()],
+                ..SelectArgs::default()
+            },
+        );
+        let mut ordinals = 0;
+        let scanned = survey
+            .scan(None, &Selection::parse("arith.add_to_sub").expect("selection"), &mut ordinals)
+            .expect("the fixture must scan");
+
+        assert!(!scanned.mutants.is_empty(), "the matching function yielded no mutants");
+        assert!(scanned.mutants.iter().all(|mutant| mutant.item_path.as_ref() == "add"));
+        assert_eq!(ordinals as usize, scanned.mutants.len());
+        assert!(scanned.mutants.iter().all(|mutant| mutant.selection_name().contains(": add: ")));
+    }
+
+    #[test]
+    fn repeated_name_patterns_match_either_pattern() {
+        let (_directory, root) = workspace();
+
+        let survey = survey(
+            &root,
+            SelectArgs {
+                name_patterns: vec!["does_not_match".to_owned(), ": main: ".to_owned()],
+                ..SelectArgs::default()
+            },
+        );
+        let mut ordinals = 0;
+        let scanned = survey
+            .scan(None, &Selection::parse("arith.add_to_sub").expect("selection"), &mut ordinals)
+            .expect("the fixture must scan");
+
+        assert!(!scanned.mutants.is_empty());
+        assert!(scanned.mutants.iter().all(|mutant| mutant.item_path.as_ref() == "main"));
+    }
+
+    #[test]
+    fn invalid_name_pattern_is_a_usage_error() {
+        let (_directory, root) = workspace();
+        let error = Survey::new(
+            &SelectArgs {
+                dir: root,
+                name_patterns: vec!["[".to_owned()],
+                ..SelectArgs::default()
+            },
+            None,
+        )
+        .expect_err("an invalid regex must fail before scanning");
+
+        assert!(error.is_usage(), "{error}");
+        assert!(error.to_string().contains("invalid --re pattern"), "{error}");
     }
 
     #[test]
