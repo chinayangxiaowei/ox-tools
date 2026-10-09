@@ -55,7 +55,25 @@ therefore covers the complete descendant tree.
   take precedence over surrounding group or boundary sweep errors. Within a
   Linux sweep, failure of the cgroup kill takes precedence over process-group
   failure because the cgroup is the boundary that also reaches descendants
-  that called `setsid`. If subsequent cleanup cannot prove that descendants
+  that called `setsid`. On macOS, both observation and direct termination check
+  the leader's exit without reaping it before sweeping the group. If a running
+  leader exits during a failed sweep, termination rechecks the exit before
+  retrying the exited-leader path. That path accepts `EPERM` only after checking
+  that the observed, unreaped leader is the group's sole remaining member. The
+  kernel can return this error for that zombie-only group, but an inaccessible
+  live member or an inconclusive group query leaves cleanup unproven. A sweep
+  of a running leader still reports the error. If observation finds that the
+  leader was already reaped elsewhere, numeric group and child capabilities are
+  revoked before direct termination can signal them. The owner must not reap
+  the leader concurrently through its numeric PID: doing so can free that ID
+  between observation and sweep, and no process-group signal can then prove it
+  still names this subtree. A non-`ECHILD` observation error still attempts a
+  running-leader group sweep and direct child termination, then reports the
+  observation error if the direct kill succeeded.
+  `terminate` returns the leader's exit status when it
+  reaps the child. On macOS, repeating it after proven cleanup succeeds without
+  a status; an external reap or failed cleanup still reports an error because
+  descendants may remain. If subsequent cleanup cannot prove that descendants
   released their pipe handles, its failure takes precedence over an earlier
   output setup or observation failure. A failure from an output reader already
   started likewise takes precedence over failure to start the other reader.
