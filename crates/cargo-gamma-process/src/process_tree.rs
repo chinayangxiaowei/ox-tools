@@ -1136,6 +1136,13 @@ impl ProcessTree {
     /// only capability that can still reach a descendant of the subtree that really was this run's
     /// — and this is the last moment at which that remains true.
     #[cfg(unix)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Linux can fail this operation, and Unix call sites share its result type"
+        )
+    )]
     fn revoke_group(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         let boundary_killed = self.cgroup.as_ref().map_or(Ok(()), Cgroup::kill);
