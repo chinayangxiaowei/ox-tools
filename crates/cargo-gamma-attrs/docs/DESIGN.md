@@ -37,6 +37,9 @@ The supported attributes, selector grammar, and diagnostics are part of
 cargo-gamma's source-level configuration contract. Invalid directives fail at
 compile time instead of becoming silent no-ops.
 
+`#[gamma::value(...)]` accepts a reference expression for a function returning
+a reference. The expression is checked by the ordinary mutant build.
+
 Compiler-hosted diagnostic consumers belong to the provisioned
 [real-toolchain system-test boundary](../../cargo-gamma-lib/docs/design/system-tests.md);
 scripted process results cannot prove public macro acceptance or rejection.

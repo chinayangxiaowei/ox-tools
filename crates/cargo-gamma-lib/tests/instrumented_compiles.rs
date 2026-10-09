@@ -635,6 +635,47 @@ pub fn iterator() -> impl Iterator<Item = u32> { std::iter::once(1) }
 }
 
 #[test]
+fn reference_return_values_still_compile() {
+    let source = "
+type Ref<'a> = &'a u8;
+pub struct NoDefault(pub u8);
+pub fn shared(value: &u8) -> &u8 { value }
+pub fn mutable(value: &mut u8) -> &mut u8 { value }
+pub fn shared_slice(values: &[u8]) -> &[u8] { values }
+pub fn mutable_slice(values: &mut [u8]) -> &mut [u8] { values }
+pub fn text() -> &'static str { \"original\" }
+#[allow(unused_parens)]
+pub fn grouped_text() -> &'static (str) { \"original\" }
+pub fn qualified_text() -> &'static core::primitive::str { \"original\" }
+pub fn mutable_text(value: &mut str) -> &mut str { value }
+pub fn qualified_mutable_text(value: &mut core::primitive::str) -> &mut core::primitive::str { value }
+pub fn aliased(value: Ref<'_>) -> Ref<'_> { value }
+pub fn borrowed_unit(value: &()) -> &() { value }
+pub fn empty_array(value: &[u8; 0]) -> &[u8; 0] { value }
+pub fn empty_custom_array(value: &[NoDefault; 0]) -> &[NoDefault; 0] { value }
+pub fn mutable_empty_custom_array(value: &mut [NoDefault; 0]) -> &mut [NoDefault; 0] { value }
+";
+
+    assert!(compiles("reference_returns", source, "fn_value") >= 14);
+}
+
+#[test]
+fn diverse_reference_return_values_still_compile() {
+    let source = "
+pub fn boolean(value: &bool) -> &bool { value }
+pub fn floating(value: &f64) -> &f64 { value }
+pub fn string_slice(value: &[String]) -> &[String] { value }
+pub fn map(value: &std::collections::HashMap<u8, u8>) -> &std::collections::HashMap<u8, u8> { value }
+pub fn arc_str(value: &std::sync::Arc<str>) -> &std::sync::Arc<str> { value }
+pub fn rc_str(value: &std::rc::Rc<str>) -> &std::rc::Rc<str> { value }
+pub fn nested_option<'a>(value: &'a Option<&'static str>) -> &'a Option<&'static str> { value }
+pub fn nested_result(value: &Result<Option<u8>, String>) -> &Result<Option<u8>, String> { value }
+";
+
+    assert!(compiles("diverse_reference_returns", source, "fn_value") >= 20);
+}
+
+#[test]
 fn singleton_tuple_return_values_still_compile() {
     let source = "
 pub fn singleton() -> (u32,) { (1,) }
@@ -711,6 +752,9 @@ pub fn aliased() -> Alias { vec![String::new()] }
 #[gamma::value(core::iter::empty())]
 pub fn streamed() -> impl Iterator<Item = u32> { 0..10 }
 
+#[gamma::value(Box::leak(Box::new(7)))]
+pub fn selected() -> &'static u8 { &1 }
+
 pub struct Holder;
 impl Holder {
     #[gamma::value(String::from(\"stated\"))]
@@ -724,7 +768,7 @@ impl Holder {
     let file = SourceFile::parse("subject.rs", source.to_owned()).expect("the subject must parse");
     let stated = collect::collect(&file, &Selection::parse("fn_value.stated").expect("the selector must resolve"));
 
-    assert_eq!(stated.len(), 7, "{stated:?}");
+    assert_eq!(stated.len(), 8, "{stated:?}");
     assert!(compiles("stated", source, "fn_value") > stated.len());
 }
 

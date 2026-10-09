@@ -133,16 +133,7 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
 
     match kind {
         // The kinds whose values are written out rather than built from another type's.
-        kind @ (Kind::Unit
-        | Kind::Bool
-        | Kind::Signed
-        | Kind::Unsigned
-        | Kind::Float
-        | Kind::StaticStr
-        // A string literal is shared, and leaking an allocation would invent ownership and
-        // lifetime behavior, so `literal_values` deliberately returns nothing for `&mut str`.
-        | Kind::MutStr
-        | Kind::NonZero) => {
+        kind @ (Kind::Unit | Kind::Bool | Kind::Signed | Kind::Unsigned | Kind::Float | Kind::StaticStr | Kind::NonZero) => {
             let confidence = if (matches!(kind, Kind::Bool | Kind::Signed | Kind::Unsigned | Kind::Float)
                 && !types.supports_primitive_kind(resolved, kind))
                 || kind == Kind::NonZero && !types.supports_nonzero_api(resolved)
@@ -177,11 +168,7 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
             } else {
                 Confidence::Optimistic
             };
-            let mut values = vec![(
-                "fn_value.none",
-                CompactString::new("None"),
-                outer_confidence,
-            )];
+            let mut values = vec![("fn_value.none", CompactString::new("None"), outer_confidence)];
             let inner = inner_values(source, 0, depth, types);
 
             if inner.is_empty() {
@@ -286,21 +273,17 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
                 )]
             };
 
-            values.extend(
-                inner_values(source, 0, depth, types)
-                    .into_iter()
-                    .map(|(_name, text, confidence)| {
-                        (
-                            "fn_value.one_element",
-                            format_compact!("core::iter::once({text}).collect()"),
-                            if confidence == Confidence::Optimistic || outer_confidence == Confidence::Optimistic {
-                                Confidence::Optimistic
-                            } else {
-                                Confidence::Proven
-                            },
-                        )
-                    }),
-            );
+            values.extend(inner_values(source, 0, depth, types).into_iter().map(|(_name, text, confidence)| {
+                (
+                    "fn_value.one_element",
+                    format_compact!("core::iter::once({text}).collect()"),
+                    if confidence == Confidence::Optimistic || outer_confidence == Confidence::Optimistic {
+                        Confidence::Optimistic
+                    } else {
+                        Confidence::Proven
+                    },
+                )
+            }));
 
             cap(values)
         }
@@ -450,7 +433,7 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
 
             cap(values)
         }
-        Kind::Reference => reference_values(resolved, depth, types),
+        Kind::Reference | Kind::MutStr => reference_values(resolved, depth, types),
         Kind::Array => {
             if types.has_proven_default(resolved) {
                 vec![proven("fn_value.default", "Default::default()")]
@@ -572,27 +555,93 @@ pub(super) fn literal_values(kind: Kind, ty: &Type) -> Vec<ReplacementValue> {
     }
 }
 
-/// Source-independent, promotable values for a reference return.
+/// Values for a reference return, using a leaked allocation when a temporary cannot be borrowed.
 ///
-/// Arbitrary references are not constructible from their referent type alone: allocation leaks
-/// can change mutability, inference, lifetime bounds, and runtime behavior. The only current
-/// reference value is the shared empty slice, whose literal promotion supplies the declared
-/// lifetime without allocation. Mutable and other shared references contribute no candidate.
-pub(super) fn reference_values(ty: &Type, _depth: usize, _types: &Types<'_>) -> Vec<ReplacementValue> {
+/// A shared return is explicitly reborrowed as `&T`: without `&*`, nested positions such as
+/// `impl Iterator<Item = &T>` can infer the `&mut T` returned by `Box::leak` instead.
+pub(super) fn reference_values(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<ReplacementValue> {
     let Some(elem) = reference_elem(ty) else {
         return Vec::new();
     };
-    match strip(ty) {
-        Type::Reference(reference) if reference.mutability.is_none() && matches!(strip(elem), Type::Slice(_)) => {
-            vec![proven("fn_value.empty_collection", "&[]")]
+    let Type::Reference(reference) = strip(ty) else {
+        return Vec::new();
+    };
+    let prefix = if reference.mutability.is_none() { "&*" } else { "" };
+
+    match strip(elem) {
+        Type::Tuple(tuple) if reference.mutability.is_none() && tuple.elems.is_empty() => {
+            vec![proven("fn_value.unit", "&()")]
         }
-        _ => Vec::new(),
+        Type::Array(array)
+            if reference.mutability.is_none()
+                && matches!(&array.len, syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(len), .. })
+                    if len.base10_parse::<usize>().ok() == Some(0)) =>
+        {
+            vec![proven("fn_value.default", "&[]")]
+        }
+        Type::Slice(slice) => {
+            // An empty shared slice needs no allocation. Keeping its literal spelling also lets
+            // the no-op check discard a function that already returns `&[]`.
+            let empty = if reference.mutability.is_none() {
+                "&[]"
+            } else {
+                "Vec::leak(vec![])"
+            };
+            let mut values = vec![proven("fn_value.empty_collection", empty)];
+            values.extend(
+                values_for(&slice.elem, depth.saturating_sub(1), types)
+                    .into_iter()
+                    .map(|(_name, text, confidence)| {
+                        (
+                            "fn_value.one_element",
+                            format_compact!("{prefix}Vec::leak(vec![{text}])"),
+                            confidence,
+                        )
+                    }),
+            );
+            cap(values)
+        }
+        _ if is_str_type(elem) => {
+            if reference.mutability.is_some() {
+                vec![
+                    proven("fn_value.empty_string", "Box::leak(String::new().into_boxed_str())"),
+                    proven("fn_value.xyzzy_string", "Box::leak(String::from(\"xyzzy\").into_boxed_str())"),
+                ]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => cap(values_for(elem, depth.saturating_sub(1), types)
+            .into_iter()
+            .map(|(name, text, confidence)| (name, format_compact!("{prefix}Box::leak(Box::new({text}))"), confidence))
+            .collect()),
     }
 }
 
 fn is_unsized_string_wrapper(ty: &Type) -> bool {
-    matches!(resolve_type(ty), Kind::Wrapper)
-        && type_argument(ty, 0).is_some_and(|inner| matches!(strip(inner), Type::Path(path) if path.path.is_ident("str")))
+    matches!(resolve_type(ty), Kind::Wrapper) && type_argument(ty, 0).is_some_and(is_str_type)
+}
+
+/// Recognizes the primitive `str` directly or through its standard qualified paths.
+fn is_str_type(ty: &Type) -> bool {
+    let Type::Path(path) = strip(ty) else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    if path.path.is_ident("str") {
+        return true;
+    }
+
+    let mut segments = path.path.segments.iter();
+    matches!(
+        (segments.next(), segments.next(), segments.next(), segments.next()),
+        (Some(root), Some(primitive), Some(name), None)
+            if (root.ident == "core" || root.ident == "std")
+                && primitive.ident == "primitive"
+                && name.ident == "str"
+    )
 }
 
 /// The type a reference points at, seeing through parentheses and invisible grouping.
@@ -600,6 +649,7 @@ pub(super) fn reference_elem(ty: &Type) -> Option<&Type> {
     match ty {
         Type::Reference(reference) => Some(&reference.elem),
         Type::Paren(paren) => reference_elem(&paren.elem),
+        Type::Group(group) => reference_elem(&group.elem),
         _ => None,
     }
 }
@@ -723,10 +773,11 @@ fn path_text(ty: &Type) -> Option<String> {
     )
 }
 
-/// Sees through parentheses to the type underneath.
+/// Sees through transparent parentheses and grouping to the type underneath.
 pub(super) fn strip(ty: &Type) -> &Type {
     match ty {
         Type::Paren(paren) => strip(&paren.elem),
+        Type::Group(group) => strip(&group.elem),
         other => other,
     }
 }
@@ -787,11 +838,11 @@ pub(super) fn resolve_type(ty: &Type) -> Kind {
     match ty {
         Type::Tuple(tuple) if tuple.elems.is_empty() => Kind::Unit,
 
-        Type::Reference(reference) => match &*reference.elem {
+        Type::Reference(reference) => match strip(&reference.elem) {
             // Mutability is load-bearing, not decoration: `StaticStr`'s values are string literals,
             // which are `&'static str` and cannot be returned where `&mut str` was promised. A
             // mutable one therefore gets its own kind rather than being folded in here.
-            Type::Path(path) if path.path.is_ident("str") => {
+            ty if is_str_type(ty) => {
                 if reference.mutability.is_some() {
                     Kind::MutStr
                 } else {
@@ -806,6 +857,7 @@ pub(super) fn resolve_type(ty: &Type) -> Kind {
         Type::Array(_) => Kind::Array,
 
         Type::Paren(paren) => resolve_type(&paren.elem),
+        Type::Group(group) => resolve_type(&group.elem),
 
         // The traits whose `impl Trait` returns this tool can synthesize a value for. All four are
         // satisfied by `gamma_rt::Either` whenever both of its sides satisfy them, and both
@@ -1286,10 +1338,19 @@ mod tests {
                 "fn_value.one_element:core::iter::once(false)",
             ]
         );
-        assert_eq!(texts(values_for(&parse_quote!(&bool), RETURN_DEPTH, &types)), Vec::<String>::new());
+        assert_eq!(
+            texts(values_for(&parse_quote!(&bool), RETURN_DEPTH, &types)),
+            [
+                "fn_value.bool_true:&*Box::leak(Box::new(true))",
+                "fn_value.bool_false:&*Box::leak(Box::new(false))"
+            ]
+        );
         assert_eq!(
             texts(values_for(&parse_quote!(&mut bool), RETURN_DEPTH, &types)),
-            Vec::<String>::new()
+            [
+                "fn_value.bool_true:Box::leak(Box::new(true))",
+                "fn_value.bool_false:Box::leak(Box::new(false))"
+            ]
         );
     }
 

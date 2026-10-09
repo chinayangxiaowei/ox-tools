@@ -92,10 +92,15 @@ configuration and therefore audits the whole file.
   cannot be borrowed as evidence for the local shadow.
   Unsized standard wrappers use shape-specific constructors, opaque iterators
   retain iterator-shaped replacements, and tuple/collection products require
-  evidence for every member. Shared empty slices may use `&[]`; arbitrary shared or mutable
-  references are not fabricated with `Box::leak`, and mutable string slices
-  receive no automatic replacement because the only source-independent
-  construction would leak once per invocation.
+  evidence for every member. A reference return uses static literals for
+  shared strings, leaked boxes for sized referents, and leaked vectors for
+  slices with mutable or nonempty replacements. Shared empty slices, unit
+  values, and zero-length arrays use promotable literals, allowing no-op
+  detection when the original already returns the same value.
+  Standard qualified and parenthesized `str` forms receive the same string
+  candidates. Shared leaked values are explicitly reborrowed so nested positions
+  infer `&T` instead of `&mut T`. A stated value may replace a reference-returning
+  function's body when the author knows a suitable expression.
 - Statement and loop deletion is gated only for concrete intra-procedural
   compile hazards: deferred-binding initialization, explicit `drop` calls, and
   branch/loop type transitions already proven by local syntax. The divergent
@@ -135,8 +140,8 @@ configuration and therefore audits the whole file.
 - The discovery pre-pass is confined to code discovery would mutate: not
   configured out and not test-only, including field-level gates.
 - A stated value is reported as an error where discovery would never read it —
-  on a declaration, a `const fn`, or an empty body — matching the proc macro's
-  compile-time rejections, so a hint that generates nothing is never silent.
+  on a declaration, a `const fn`, or an empty body — so a hint that generates
+  nothing is never silent.
   The public error retains a typed `StatedValueError` source until diagnostic
   rendering, including through the fused audit-and-collect entry point.
 - The crate forbids unsafe code.

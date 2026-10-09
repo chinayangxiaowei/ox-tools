@@ -4022,7 +4022,7 @@ fn default_payloads_require_positive_evidence_through_aliases_closures_and_assig
 }
 
 #[test]
-fn whole_function_values_preserve_alias_unsized_iterator_tuple_and_reference_shapes() {
+fn whole_function_values_preserve_alias_unsized_iterator_and_tuple_shapes() {
     let source = r"
                 use std::collections::{HashMap, HashSet};
                 use std::sync::Arc;
@@ -4053,15 +4053,63 @@ fn whole_function_values_preserve_alias_unsized_iterator_tuple_and_reference_sha
             .iter()
             .any(|candidate| candidate.item_path.as_ref() == "text" && candidate.replacement == "Arc::from(\"\")")
     );
-    assert!(
-        found
-            .iter()
-            .any(|candidate| candidate.item_path.as_ref() == "shared" && candidate.replacement == "&[]")
-    );
-    assert!(!found.iter().any(|candidate| candidate.item_path.as_ref() == "mutable"));
+    assert!(found.iter().any(|candidate| candidate.item_path.as_ref() == "shared"));
+    assert!(found.iter().any(|candidate| candidate.item_path.as_ref() == "mutable"));
     assert!(found.iter().any(|candidate| candidate.item_path.as_ref() == "opaque"));
     assert!(!found.iter().any(|candidate| candidate.item_path.as_ref() == "mixed"));
-    assert!(found.iter().all(|candidate| !candidate.replacement.contains("Box::leak")));
+    assert!(found.iter().any(|candidate| candidate.replacement.contains("Vec::leak")));
+    assert!(found.iter().any(|candidate| candidate.replacement.contains("Box::leak")));
+}
+
+#[test]
+fn reference_returns_have_whole_body_and_inner_mutations() {
+    let source = r#"
+        fn text() -> &'static str { "hello" }
+        fn slice(values: &[u8]) -> (&[u8]) { if values.len() > 1 { &values[1..] } else { values } }
+        fn mutable(values: &mut [u8]) -> &mut [u8] { values }
+        struct S;
+        impl S { fn method(&self) -> &str { "hello" } }
+        trait T { fn method(&self) -> &'static str { "hello" } }
+    "#;
+    let whole = candidates(source, "fn_value");
+    assert!(whole.iter().any(|candidate| candidate.item_path.as_ref() == "text"));
+    assert!(whole.iter().any(|candidate| candidate.item_path.as_ref() == "slice"));
+    assert!(whole.iter().any(|candidate| candidate.item_path.as_ref() == "mutable"));
+    assert!(whole.iter().any(|candidate| candidate.item_path.as_ref() == "S::method"));
+
+    let inner = candidates(source, "literal.str_to_empty,relational");
+    assert!(inner.iter().any(|candidate| candidate.item_path.as_ref() == "text"), "{inner:?}");
+    assert!(inner.iter().any(|candidate| candidate.item_path.as_ref() == "slice"), "{inner:?}");
+
+    let nested = candidates("fn optional() -> Option<&'static str> { Some(\"hello\") }", "fn_value.none");
+    assert_eq!(nested.len(), 1, "{nested:?}");
+}
+
+#[test]
+fn a_stated_value_can_replace_a_reference_return() {
+    let source = "#[gamma::value(\"other\")] fn text() -> &'static str { \"hello\" }";
+    let found = candidates(source, "fn_value.stated");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].replacement, "\"other\"");
+}
+
+#[test]
+fn a_local_alias_to_a_reference_has_a_whole_body_mutant() {
+    let source = "type Ref<'a> = &'a str; type Alias<'a> = Ref<'a>; fn text() -> Alias<'static> { \"hello\" }";
+    assert!(!candidates(source, "fn_value").is_empty());
+}
+
+#[test]
+fn the_fused_scan_accepts_a_stated_reference_alias() {
+    let source = "#[gamma::value(\"other\")] fn text() -> Alias<'static> { \"hello\" }\n\
+                  type Alias<'a> = &'a str;";
+    let file = SourceFile::parse("test.rs", source.to_owned()).expect("the fixture parses");
+    let selection = Selection::parse("fn_value.stated").expect("the selector resolves");
+    let defaults = Defaults::of(&file.ast);
+
+    let found = check_stated_and_collect_with(&file, &selection, &CfgSet::unconditional(), &defaults)
+        .expect("a stated value on a reference alias produces a mutant");
+    assert_eq!(found.len(), 1, "{found:?}");
 }
 
 #[test]
@@ -4911,27 +4959,33 @@ fn standard_time_types_are_not_replaced_with_default() {
     }
 }
 
-/// A reference cannot point at a temporary, so `&Default::default()` would not compile and the
-/// family would otherwise pass over every reference-returning function in silence. Leaking a box gives
-/// a `&'static mut T`, which lives long enough for any signature, and the values are the
-/// element type's own.
+/// A reference cannot point at a temporary, so `&Default::default()` would not compile. Leaking
+/// the replacement gives the reference a lifetime long enough for the return signature.
 ///
 /// A shared reference is reborrowed rather than left to coerce. Coercion is enough in a return
 /// position, but not where the value is what a type is *inferred* from — an
 /// `impl Iterator<Item = &T>` would infer `Once<&mut T>` and be withdrawn as unviable.
 #[test]
-fn a_shared_reference_return_is_not_fabricated_by_leaking_a_box() {
+fn a_shared_reference_return_is_fabricated_by_leaking_a_box() {
     let found = candidates("fn f(v: &Vec<String>) -> &String { &v[0] }", "fn_value");
 
-    assert!(found.is_empty(), "{found:?}");
+    assert!(
+        found
+            .iter()
+            .any(|candidate| candidate.replacement == "&*Box::leak(Box::new(String::new()))"),
+        "{found:?}"
+    );
 }
 
 /// A mutable reference is not reborrowed, because `Box::leak` already yields exactly that.
 #[test]
-fn a_mutable_reference_return_is_not_fabricated_by_leaking_a_box() {
+fn a_mutable_reference_return_is_fabricated_by_leaking_a_box() {
     let found = candidates("fn f(v: &mut Vec<u8>) -> &mut u8 { &mut v[0] }", "fn_value");
 
-    assert!(found.is_empty(), "{found:?}");
+    assert!(
+        found.iter().any(|candidate| candidate.replacement == "Box::leak(Box::new(0))"),
+        "{found:?}"
+    );
 }
 
 /// A reference to something abstract still yields nothing. `Box::new` needs a value of the

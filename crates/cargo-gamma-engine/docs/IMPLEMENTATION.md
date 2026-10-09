@@ -62,9 +62,14 @@ alias target has the standard type's inherent `new`.
 
 Return-value construction resolves local aliases without replacing their
 declared shape. Recursive products stop when any member lacks construction
-evidence. Reference construction is deliberately limited to source-independent
-promotable values such as `&[]`; the engine does not synthesize arbitrary
-borrowed values by leaking allocations.
+evidence. Reference construction uses static string literals when possible,
+`Box::leak` for sized referents, and `Vec::leak` for mutable or nonempty slice
+replacements. Shared empty slices and zero-length arrays use `&[]`, and shared
+unit returns use `&()`; these literal forms let no-op detection discard an
+unchanged return instead of reporting an equivalent leak. Parenthesized and standard qualified
+primitive `str` types take the same string path. Mutable strings use a leaked
+boxed string. The compile oracle withdraws guesses whose payload construction
+or lifetime bounds do not fit the signature.
 
 Deletion safety remains an intra-procedural syntax analysis. The collector
 records deferred locals before examining assignments, protects explicit

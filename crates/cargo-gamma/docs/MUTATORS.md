@@ -154,17 +154,26 @@ fn shipping_zone(order: &Order) -> Zone { Zone::Domestic }
 
 A function returning a non-iterator `impl Trait` gets no mutant, and neither does anything evaluated
 in a `const` context — both are explained under
-[What the catalog deliberately omits](#what-the-catalog-deliberately-omits). A site that gets no
-mutant, or the wrong one, can [state the value itself](#stating-the-value-yourself). A function
-returning `impl Iterator` is the exception: the schema wraps original and replacement iterators in
-its shared `Either` type, as described below. When a workspace-defined type shadows a standard
-collection name and positively implements `Default`, its empty replacement uses that proved default
+[What the catalog deliberately omits](#what-the-catalog-deliberately-omits). A function returning
+`impl Iterator` is the exception: the schema wraps original and replacement iterators in its
+shared `Either` type, as described below. For an eligible return type, a site that gets no mutant,
+or the wrong one, can [state the value itself](#stating-the-value-yourself). When a
+workspace-defined type shadows a standard collection name and positively implements `Default`,
+its empty replacement uses that proved default
 rather than assuming the shadow also provides the standard type's `new` constructor.
 Gamma keeps this evidence separate per package and applies it to unambiguous unqualified names, so
 an unrelated same-named type elsewhere in the workspace cannot change the decision. Qualified
 local paths and aliases remain unresolved rather than borrowing evidence by their final segment. A
 **resolved package Default type** is a local type whose declarations establish `Default`; an
 **unresolved concrete type or alias** has no such positive evidence.
+Functions returning `&T` or `&mut T` can receive whole-body replacements.
+Gamma uses static literals for shared strings, `Box::leak` for sized referents,
+and `Vec::leak` for mutable or nonempty slice replacements. Shared empty
+slices and zero-length arrays use `&[]`; shared unit returns use `&()`.
+These substitutions can make a reference point to a
+different allocation. A stated value can supply a specific reference instead.
+Mutations within the body remain eligible, and a reference nested in an owned
+return type, such as `Option<&T>`, composes with its outer type.
 
 ### `relational`
 
@@ -942,11 +951,18 @@ standard name and matches its shape remains ambiguous only without positive work
 evidence. With that evidence it uses `Default::default()`; without it, the guessed standard
 constructor may produce an unviable mutant.
 
-A function returning a reference is not given a fabricated leaked allocation. Such a
-replacement can change ownership and lifetime behavior independently of the returned value, and
-reference payloads frequently lack enough source evidence to construct a compiling value. This
-includes `&mut str`: its only source-independent construction would leak a fresh `String` on every
-invocation. Use `#[gamma::value(...)]` where a stable reference value is available and meaningful.
+A reference return can receive a whole-body replacement. For `&T` and `&mut T`,
+Gamma constructs a value of `T` and leaks a box to give the reference a lifetime
+that satisfies the signature. Shared returns explicitly reborrow the leaked value
+as `&T`. For a nonempty `&[T]` replacement or any `&mut [T]` replacement,
+it leaks a vector; an empty shared slice or zero-length array uses `&[]`, and a
+shared unit return uses `&()`, so unchanged returns are not counted as mutants.
+For `&mut str`, it leaks a boxed string. A shared
+`&str`, including parenthesized and standard qualified spellings of `str`, uses
+a static literal. A guessed referent that
+cannot be constructed becomes an unviable mutant at build time. Leaked
+allocations persist for the mutant process's lifetime and may change resource
+use independently of the returned value.
 
 A function returning `impl Iterator` is offered `core::iter::empty()`, and `core::iter::once(v)` for
 each value its `Item` type yields. This is the one return type whose mutant cannot simply be dropped
@@ -981,7 +997,7 @@ to the item unchanged, so it costs a normal build nothing.
 It is worth reaching for in two situations:
 
 - **A site the tool withholds a mutant from.** A bare type parameter, an unresolved associated
-  type, a reference, a `Box<dyn Trait>` or a non-iterator `impl Trait` are all types with no value
+  type, a `Box<dyn Trait>` or a non-iterator `impl Trait` are all types with no value
   the tool can conservatively name.
   Stating one creates the mutant, and the function stops being invisible to the family whose whole
   question is whether anything checks what it returns.
@@ -1011,8 +1027,8 @@ The rules are deliberately few:
   mutant that fails to build and is withdrawn as `unviable`, exactly like a wrong guess. Refusing to
   generate it would mean guessing again, in the direction of silently discarding the mutants of
   authors who were right.
-- **Not on a `const fn` or an empty body.** Stated-value mutation is supported only on non-const
-  functions and methods with non-empty bodies.
+- **Not on a `const fn` or an empty body.** Stated-value mutation is supported
+  on non-const functions and methods with non-empty bodies, including reference returns.
 
 A supported stated value is visible without building anything in `cargo gamma list mutants`.
 Unsupported annotations are rejected rather than treated as working hints that quietly do nothing.

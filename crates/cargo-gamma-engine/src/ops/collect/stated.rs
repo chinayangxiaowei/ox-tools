@@ -123,11 +123,10 @@ pub(super) fn stated_range(attrs: &[Attribute]) -> Option<Range<usize>> {
 ///
 /// Returns an error if a stated value is malformed, duplicated, written on something that is not a
 /// function, written on a function with no body to replace, or written on a function from which
-/// discovery never reads a value — a `const fn`, or one whose body is empty. The proc macro rejects
-/// all of them at compile time, so a crate that builds cannot reach them — but this tool reads
+/// discovery never reads a value — a `const fn` or one whose body is empty. It reads
 /// source rather than build output, and `gamma list mutants` runs against trees that have never
-/// been compiled. Ignoring one there would leave a hint that reads as if it works and does nothing,
-/// which is the failure mode the whole channel exists to avoid.
+/// been compiled. Ignoring an invalid value there would leave a hint that reads as if it works and
+/// does nothing, which is the failure mode the whole channel exists to avoid.
 ///
 /// Fatal rather than a warning, for the same reason a suppression naming no mutator is: the run
 /// that swallows it reports a score computed from a population the author did not ask for.
@@ -190,14 +189,14 @@ impl Audit {
     /// Records what an item's own attributes get wrong, and which of them a function claimed.
     ///
     /// `inert` explains why discovery never reads a stated value from the function — because it is
-    /// a `const fn`, or because its body is empty. Both return before `stated_range` is consulted,
-    /// so an attribute there produces no mutant and reads as if it does; naming the reason is what
-    /// turns that silence into a diagnostic.
+    /// a `const fn` or its body is empty. These return before
+    /// `stated_range` is consulted, so an attribute there produces no mutant and reads as if it
+    /// does; naming the reason is what turns that silence into a diagnostic.
     ///
     /// A malformed argument list is reported ahead of an inert position, because it is the more
     /// specific mistake: an author who wrote `#[gamma::value(1 +)]` on a `const fn` has two things
     /// to fix, and the expression is the one they can see is wrong.
-    fn item(&mut self, attrs: &[Attribute], inert: Option<&'static str>) {
+    fn item(&mut self, attrs: &[Attribute], inert: Option<StatedValueError>) {
         let stated: Vec<&Attribute> = attrs.iter().filter(|attribute| is_stated_value(attribute)).collect();
 
         if let Some(second) = stated.get(1) {
@@ -211,14 +210,7 @@ impl Audit {
 
             if malformed {
                 self.faults.push((attribute.span().byte_range(), StatedValueError::Malformed));
-            } else if let Some(message) = inert {
-                let fault = if message == CONSTANT {
-                    StatedValueError::Constant
-                } else if message == EMPTY {
-                    StatedValueError::Empty
-                } else {
-                    StatedValueError::Bodiless
-                };
+            } else if let Some(fault) = inert {
                 self.faults.push((attribute.span().byte_range(), fault));
             }
         }
@@ -288,14 +280,14 @@ impl<'ast> Visit<'ast> for Audit {
 
 /// Returns why discovery would never read a stated value from a function it reaches.
 ///
-/// The two conditions are exactly the early returns discovery makes before it consults an item's
+/// The conditions are exactly the early returns discovery makes before it consults an item's
 /// stated value. Keeping them here prevents the three function grammars from drifting apart.
 /// `const` is checked first because resolving it is required before any mutant can exist.
-const fn inert_reason(constant: bool, empty: bool) -> Option<&'static str> {
+fn inert_reason(constant: bool, empty: bool) -> Option<StatedValueError> {
     if constant {
-        Some(CONSTANT)
+        Some(StatedValueError::Constant)
     } else if empty {
-        Some(EMPTY)
+        Some(StatedValueError::Empty)
     } else {
         None
     }
@@ -530,6 +522,26 @@ mod tests {
                 "`{source}`: {rejected}"
             );
         }
+    }
+
+    #[test]
+    fn a_value_stated_on_a_reference_return_is_accepted() {
+        let sources = [
+            "#[gamma::value(\"other\")]\nfn f() -> &'static str { \"original\" }",
+            "struct S; impl S { #[gamma::value(&[])] fn f(&self) -> &[u8] { &[] } }",
+            "trait T { #[gamma::value(&[])] fn f(&self) -> (&[u8]) { &[] } }",
+        ];
+
+        for source in sources {
+            check(&file(source)).expect("a reference-returning function can have a stated value");
+        }
+    }
+
+    #[test]
+    fn a_stated_reference_alias_is_accepted_even_when_declared_later() {
+        let source = "#[gamma::value(\"other\")] fn f() -> Alias<'static> { \"original\" }\n\
+                      type Alias<'a> = Ref<'a>; type Ref<'a> = &'a str;";
+        check(&file(source)).expect("a reference alias can have a stated value");
     }
 
     /// A `const fn` with an empty body is inert twice over, and the const reason is the one

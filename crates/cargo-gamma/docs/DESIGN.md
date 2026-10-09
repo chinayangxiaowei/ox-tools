@@ -334,6 +334,19 @@ original expression.
 
 ### Semantic restraint
 
+Functions returning references receive whole-body `fn_value` candidates when
+the referent can be constructed: string literals for shared `&str`, leaked
+boxes for sized referents, and leaked vectors for mutable or nonempty slice
+replacements. Shared empty slices and zero-length arrays use `&[]`, and shared
+unit returns use `&()`, so unchanged returns are recognized instead of
+reported as surviving mutants. Standard qualified and
+parenthesized `str` forms use the same string candidates. A leaked allocation
+can change resource use as well as the returned value, so a test may kill such
+a mutant by observing allocation effects. `#[gamma::value(...)]` can provide a
+specific reference instead of these guesses. Internal expressions remain
+eligible, and an owned outer return such as `Option<&T>` is composed from its
+own replacement values.
+
 Instrumentation duplicates source text rather than introducing temporary bindings. A temporary
 could change moves, borrows, short-circuit behavior, or destruction order. The schema may affect
 code size, inlining, and layout, but it must preserve the unmutated program's observable semantics.

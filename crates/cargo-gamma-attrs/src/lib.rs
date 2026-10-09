@@ -550,6 +550,14 @@ pub fn expect_killed(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// #[gamma::value(())]
 /// fn nothing() {}
 /// ```
+///
+/// ```rust
+/// // A reference return can state a replacement of the same type.
+/// #[gamma::value("other")]
+/// fn text() -> &'static str {
+///     "original"
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn value(attr: TokenStream, item: TokenStream) -> TokenStream {
     cargo_gamma_attrs_impl::value(attr.into(), item.into()).into()

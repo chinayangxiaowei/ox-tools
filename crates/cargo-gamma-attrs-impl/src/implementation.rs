@@ -217,10 +217,10 @@ fn hex(bytes: &[u8]) -> String {
 /// never type-checks as the body of more than one signature, so the inheriting reading would be a
 /// promise the compiler breaks at every use.
 ///
-/// Finally, it rejects `const fn` and empty bodies because cargo-gamma does not define stated-value
-/// mutation sites for them. Accepting the annotation would leave a hint that reads as working and
-/// produces no mutant anywhere — the same silence the bodiless-declaration diagnostic already
-/// exists to prevent.
+/// Finally, it rejects `const fn` and empty bodies because cargo-gamma does not
+/// define stated-value mutation sites for them. Accepting the annotation would leave a hint that
+/// reads as working and produces no mutant anywhere — the same silence the bodiless-declaration
+/// diagnostic already exists to prevent.
 #[must_use]
 pub fn value(attr: TokenStream, item: TokenStream) -> TokenStream {
     let validation = validate_value(attr, &item);
@@ -1389,6 +1389,18 @@ mod tests {
                 Ok(()),
                 "`{expression}` should have been accepted"
             );
+        }
+    }
+
+    #[test]
+    fn a_stated_value_on_a_reference_return_is_accepted() {
+        for item in [
+            "fn f() -> &'static str { \"original\" }",
+            "fn f(&self) -> &str { \"original\" }",
+            "fn f() -> (&'static str) { \"original\" }",
+        ] {
+            let result = validate_value(stream("\"other\""), &stream(item));
+            assert_eq!(result, Ok(()), "{item}");
         }
     }
 
