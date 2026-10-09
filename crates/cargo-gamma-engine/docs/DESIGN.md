@@ -55,6 +55,10 @@ focused runs and existing scripts.
   and changing addition or subtraction assignment to multiplication or division
   assignment. Each replacement has its own stable mutator name and remains
   subject to compilation before a campaign can run it.
+- A match pattern is not evaluated, so its literals are not mutated. The `if`
+  guard attached to a match arm is evaluated and receives ordinary expression
+  mutations, including relational substitutions, alongside whole-guard
+  `match_guard` mutations.
 - A mutation that invents `Default::default()` for a known payload requires
   positive evidence. Primitive and supported standard types, package-local
   derives or impls whose concrete generic arguments satisfy their bounds,

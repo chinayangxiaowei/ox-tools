@@ -337,6 +337,8 @@ original expression.
 The operator catalog includes `<` and `>` to `==`, `<=` to `>`, `>=` to `<`,
 `%` to `+`, `+=` to `*=`, and `-=` to `/=`. Each substitution has a distinct
 mutator name and is selected through its family and presets.
+Comparisons inside a match arm's `if` guard receive the same relational
+mutations as comparisons elsewhere, while the pattern remains untouched.
 
 The default mutator selection includes whole-body `Some(value)` replacements
 for `Option<T>` returns when Gamma can construct a value of `T`. The
