@@ -445,22 +445,38 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: i32, b: i32) -> bool { a < b }",
         "relational",
-        &[("relational.lt_to_le", "(a) <= (b)"), ("relational.lt_to_gt", "(a) > (b)")],
+        &[
+            ("relational.lt_to_le", "(a) <= (b)"),
+            ("relational.lt_to_gt", "(a) > (b)"),
+            ("relational.lt_to_eq", "(a) == (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a <= b }",
         "relational",
-        &[("relational.le_to_lt", "(a) < (b)"), ("relational.le_to_ge", "(a) >= (b)")],
+        &[
+            ("relational.le_to_lt", "(a) < (b)"),
+            ("relational.le_to_ge", "(a) >= (b)"),
+            ("relational.le_to_gt", "(a) > (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a > b }",
         "relational",
-        &[("relational.gt_to_ge", "(a) >= (b)"), ("relational.gt_to_lt", "(a) < (b)")],
+        &[
+            ("relational.gt_to_ge", "(a) >= (b)"),
+            ("relational.gt_to_lt", "(a) < (b)"),
+            ("relational.gt_to_eq", "(a) == (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a >= b }",
         "relational",
-        &[("relational.ge_to_gt", "(a) > (b)"), ("relational.ge_to_le", "(a) <= (b)")],
+        &[
+            ("relational.ge_to_gt", "(a) > (b)"),
+            ("relational.ge_to_le", "(a) <= (b)"),
+            ("relational.ge_to_lt", "(a) < (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a == b }",
@@ -495,7 +511,11 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: i32, b: i32) -> i32 { a % b }",
         "arith",
-        &[("arith.rem_to_div", "(a) / (b)"), ("arith.rem_to_mul", "(a) * (b)")],
+        &[
+            ("arith.rem_to_div", "(a) / (b)"),
+            ("arith.rem_to_mul", "(a) * (b)"),
+            ("arith.rem_to_add", "(a) + (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> i32 { a & b }",
@@ -543,12 +563,12 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: &mut i32, b: i32) { *a += b; }",
         "assign",
-        &[("assign.add_to_sub", "*a -= (b)")],
+        &[("assign.add_to_sub", "*a -= (b)"), ("assign.add_to_mul", "*a *= (b)")],
     ),
     (
         "fn f(a: &mut i32, b: i32) { *a -= b; }",
         "assign",
-        &[("assign.sub_to_add", "*a += (b)")],
+        &[("assign.sub_to_add", "*a += (b)"), ("assign.sub_to_div", "*a /= (b)")],
     ),
     (
         "fn f(a: &mut i32, b: i32) { *a *= b; }",
@@ -627,7 +647,7 @@ fn the_operator_oracle_covers_every_replacement_the_tables_offer() {
     let pairs: usize = OPERATOR_ORACLE.iter().map(|(_, _, expected)| expected.len()).sum();
 
     assert_eq!(OPERATOR_ORACLE.len(), 28, "one row per binary and compound-assignment operator");
-    assert_eq!(pairs, 42, "one assertion per binary operator mutation");
+    assert_eq!(pairs, 49, "one assertion per operator substitution");
 }
 
 #[test]
@@ -2750,7 +2770,7 @@ fn booleans_flip_to_the_other_value() {
 fn compound_assignment_is_mutated() {
     let found = mutators("fn f(a: &mut i32) { *a += 1; }", "assign");
 
-    assert_eq!(found, vec!["assign.add_to_sub"]);
+    assert_eq!(found, vec!["assign.add_to_mul", "assign.add_to_sub"]);
 }
 
 #[test]
@@ -3120,8 +3140,10 @@ fn different_replacements_at_one_site_get_distinct_ids() {
     let selection = Selection::parse("relational").unwrap();
     let mutants = into_definitions(&file, collect(&file, &selection));
 
-    assert_eq!(mutants.len(), 2);
+    assert_eq!(mutants.len(), 3);
     assert_ne!(mutants[0].id, mutants[1].id);
+    assert_ne!(mutants[0].id, mutants[2].id);
+    assert_ne!(mutants[1].id, mutants[2].id);
 }
 
 #[test]

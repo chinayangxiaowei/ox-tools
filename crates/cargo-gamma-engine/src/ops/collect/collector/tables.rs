@@ -64,31 +64,57 @@ pub(super) fn in_place_reorder(expression: &Expr) -> Option<&'static str> {
     }
 }
 
+/// The relational replacements for a comparison operator, if it is one.
+const fn relational_replacements(op: &BinOp) -> Option<&'static [(&'static str, &'static str)]> {
+    if matches!(op, BinOp::Lt(_)) {
+        return Some(&[
+            ("relational.lt_to_le", "<="),
+            ("relational.lt_to_gt", ">"),
+            ("relational.lt_to_eq", "=="),
+        ]);
+    }
+    if matches!(op, BinOp::Le(_)) {
+        return Some(&[
+            ("relational.le_to_lt", "<"),
+            ("relational.le_to_ge", ">="),
+            ("relational.le_to_gt", ">"),
+        ]);
+    }
+    if matches!(op, BinOp::Gt(_)) {
+        return Some(&[
+            ("relational.gt_to_ge", ">="),
+            ("relational.gt_to_lt", "<"),
+            ("relational.gt_to_eq", "=="),
+        ]);
+    }
+    if matches!(op, BinOp::Ge(_)) {
+        return Some(&[
+            ("relational.ge_to_gt", ">"),
+            ("relational.ge_to_le", "<="),
+            ("relational.ge_to_lt", "<"),
+        ]);
+    }
+    if matches!(op, BinOp::Eq(_)) {
+        return Some(&[("relational.eq_to_ne", "!=")]);
+    }
+    if matches!(op, BinOp::Ne(_)) {
+        return Some(&[("relational.ne_to_eq", "==")]);
+    }
+
+    None
+}
+
 /// The mutators and replacement operators available for a binary operator.
 #[expect(
     clippy::useless_let_if_seq,
     reason = "independent checks avoid an untestable wildcard arm required only because syn::BinOp is non-exhaustive"
 )]
 pub(super) const fn binary_replacements(op: &BinOp) -> &'static [(&'static str, &'static str)] {
+    if let Some(replacements) = relational_replacements(op) {
+        return replacements;
+    }
+
     let mut replacements: &'static [(&'static str, &'static str)] = &[];
-    if matches!(op, BinOp::Lt(_)) {
-        replacements = &[("relational.lt_to_le", "<="), ("relational.lt_to_gt", ">")];
-    }
-    if matches!(op, BinOp::Le(_)) {
-        replacements = &[("relational.le_to_lt", "<"), ("relational.le_to_ge", ">=")];
-    }
-    if matches!(op, BinOp::Gt(_)) {
-        replacements = &[("relational.gt_to_ge", ">="), ("relational.gt_to_lt", "<")];
-    }
-    if matches!(op, BinOp::Ge(_)) {
-        replacements = &[("relational.ge_to_gt", ">"), ("relational.ge_to_le", "<=")];
-    }
-    if matches!(op, BinOp::Eq(_)) {
-        replacements = &[("relational.eq_to_ne", "!=")];
-    }
-    if matches!(op, BinOp::Ne(_)) {
-        replacements = &[("relational.ne_to_eq", "==")];
-    }
     if matches!(op, BinOp::Add(_)) {
         replacements = &[("arith.add_to_sub", "-"), ("arith.add_to_mul", "*")];
     }
@@ -102,7 +128,7 @@ pub(super) const fn binary_replacements(op: &BinOp) -> &'static [(&'static str, 
         replacements = &[("arith.div_to_mul", "*"), ("arith.div_to_rem", "%")];
     }
     if matches!(op, BinOp::Rem(_)) {
-        replacements = &[("arith.rem_to_div", "/"), ("arith.rem_to_mul", "*")];
+        replacements = &[("arith.rem_to_div", "/"), ("arith.rem_to_mul", "*"), ("arith.rem_to_add", "+")];
     }
     if matches!(op, BinOp::BitAnd(_)) {
         replacements = &[("bitwise.and_to_or", "|"), ("bitwise.and_to_xor", "^")];
@@ -126,10 +152,10 @@ pub(super) const fn binary_replacements(op: &BinOp) -> &'static [(&'static str, 
         replacements = &[("logical.or_to_and", "&&")];
     }
     if matches!(op, BinOp::AddAssign(_)) {
-        replacements = &[("assign.add_to_sub", "-=")];
+        replacements = &[("assign.add_to_sub", "-="), ("assign.add_to_mul", "*=")];
     }
     if matches!(op, BinOp::SubAssign(_)) {
-        replacements = &[("assign.sub_to_add", "+=")];
+        replacements = &[("assign.sub_to_add", "+="), ("assign.sub_to_div", "/=")];
     }
     if matches!(op, BinOp::MulAssign(_)) {
         replacements = &[("assign.mul_to_div", "/=")];
@@ -197,7 +223,11 @@ mod tests {
 
         assert_eq!(
             binary_replacements(&relational.op),
-            &[("relational.lt_to_le", "<="), ("relational.lt_to_gt", ">")]
+            &[
+                ("relational.lt_to_le", "<="),
+                ("relational.lt_to_gt", ">"),
+                ("relational.lt_to_eq", "==")
+            ]
         );
         assert_eq!(
             binary_replacements(&arithmetic.op),

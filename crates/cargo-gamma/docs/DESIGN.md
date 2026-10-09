@@ -334,6 +334,10 @@ original expression.
 
 ### Semantic restraint
 
+The operator catalog includes `<` and `>` to `==`, `<=` to `>`, `>=` to `<`,
+`%` to `+`, `+=` to `*=`, and `-=` to `/=`. Each substitution has a distinct
+mutator name and is selected through its family and presets.
+
 The default mutator selection includes whole-body `Some(value)` replacements
 for `Option<T>` returns when Gamma can construct a value of `T`. The
 `@pedantic` selector continues to select only this mutator for focused runs

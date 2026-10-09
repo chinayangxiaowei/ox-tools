@@ -50,6 +50,11 @@ focused runs and existing scripts.
   decrement; focused non-default selection can still request those optimistic
   sites. Proven text/time addition is not changed to any incompatible arithmetic
   operator; signed and unresolved arithmetic remains in the population.
+- Registered operator substitutions include changing strict comparisons to
+  equality, reversing inclusive comparisons, changing remainder to addition,
+  and changing addition or subtraction assignment to multiplication or division
+  assignment. Each replacement has its own stable mutator name and remains
+  subject to compilation before a campaign can run it.
 - A mutation that invents `Default::default()` for a known payload requires
   positive evidence. Primitive and supported standard types, package-local
   derives or impls whose concrete generic arguments satisfy their bounds,
