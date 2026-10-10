@@ -2225,6 +2225,21 @@ fn arrays_of_promotable_references_have_proven_defaults() {
 }
 
 #[test]
+fn default_selection_includes_some_values_for_option_returns() {
+    let source = "fn choose(value: u8) -> Option<u8> { Some(value) }";
+    let found = candidates(source, "@default");
+
+    for replacement in ["Some(0)", "Some(1)"] {
+        assert!(
+            found
+                .iter()
+                .any(|candidate| { candidate.mutator == "fn_value.some" && candidate.replacement == replacement }),
+            "missing {replacement}: {found:?}"
+        );
+    }
+}
+
+#[test]
 fn shadowed_option_replacements_remain_optimistic() {
     let source = "struct Option<T>(T); fn f() -> Option<u8> { Option(1) }";
     let found = candidates(source, "fn_value");

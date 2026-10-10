@@ -139,9 +139,10 @@ exclude-trait-impls = ["Debug", "Display"]
 commas and handed to exactly the same parser, so the two forms accept the same selectors — the list
 exists only so each entry can carry a comment saying why it is there, which is the thing most worth
 recording about a mutator you have switched off. See [MUTATORS.md](MUTATORS.md) for the catalog.
-`@pedantic` contains valid but commonly low-yield mutations that are not enabled by default. Select
-it alone for a focused run, or add it to the normal selection with
-`mutators = ["@default", "@pedantic"]`.
+`fn_value.some` is enabled by default, so functions returning `Option<T>` receive
+`Some(value)` candidates when Gamma can construct a payload. The existing
+`@pedantic` selector still selects only `fn_value.some` for focused runs;
+adding it to `@default` does not change the selection.
 
 A non-default selector can also include source locations that an ordinary run skips because their
 types are unclear and the generated mutation often does not compile. This currently applies to
