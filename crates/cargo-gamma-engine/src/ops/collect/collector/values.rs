@@ -17,12 +17,14 @@ use crate::ops::collect::Confidence;
 /// population of the whole file.
 pub(super) const RETURN_DEPTH: usize = 3;
 
-/// The most replacement values any single return type may contribute.
+/// The most replacement values a non-tuple return type may contribute.
 ///
-/// The bound is on the product, not on any one level, because it is the product that decides how
-/// many mutants a function costs. A tuple of four booleans is sixteen combinations, and every one
-/// of them is a separate build round's worth of test time.
+/// Nested options, collections, and wrappers use this bound to keep one return type from
+/// dominating the mutant population. Tuple products have a separate bound below.
 pub(super) const RETURN_WIDTH: usize = 8;
+
+/// Tuple products get enough room for two three-choice members or four booleans.
+const TUPLE_RETURN_WIDTH: usize = 16;
 
 type ReplacementValue = (&'static str, CompactString, Confidence);
 
@@ -473,57 +475,103 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
     }
 }
 
-/// Every combination of a tuple's element values, which is where the width bound earns its keep:
-/// three fields with three values each is twenty-seven mutants for a single function, and the
-/// user has to read every one of them.
+/// Every combination of a small tuple's element values, or a bounded selection from a large one.
 pub(super) fn tuple_values(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<ReplacementValue> {
     let Type::Tuple(tuple) = strip(ty) else {
         return vec![optimistic("fn_value.default", "Default::default()")];
     };
 
-    let mut combinations: Vec<(Vec<CompactString>, Confidence)> = vec![(Vec::new(), Confidence::Proven)];
+    let choices: Vec<Vec<ReplacementValue>> = tuple
+        .elems
+        .iter()
+        .map(|element| values_for(element, depth.saturating_sub(1), types))
+        .collect();
+    let lengths: Vec<usize> = choices.iter().map(Vec::len).collect();
 
-    for element in &tuple.elems {
-        let choices = values_for(element, depth.saturating_sub(1), types);
-        let mut next = Vec::new();
-
-        'combinations: for (existing, existing_confidence) in &combinations {
-            for (_name, text, choice_confidence) in &choices {
-                if next.len() >= RETURN_WIDTH {
-                    break 'combinations;
-                }
-
-                let mut combination = existing.clone();
-
-                combination.push(text.clone());
-                let confidence = if *existing_confidence == Confidence::Optimistic || *choice_confidence == Confidence::Optimistic {
-                    Confidence::Optimistic
-                } else {
-                    Confidence::Proven
-                };
-                next.push((combination, confidence));
-            }
-        }
-
-        combinations = next;
-
-        if combinations.is_empty() {
-            break;
-        }
-    }
-
-    combinations
+    tuple_indices(&lengths)
         .into_iter()
-        .map(|(parts, confidence)| {
+        .map(|indices| {
+            let mut parts = Vec::with_capacity(indices.len());
+            let mut confidence = Confidence::Proven;
+            for (member, index) in choices.iter().zip(indices) {
+                let (_name, text, member_confidence) = &member[index];
+                parts.push(text.as_str());
+                confidence = combined_confidence(confidence, *member_confidence);
+            }
             let text = if parts.len() == 1 {
                 format_compact!("({},)", parts[0])
             } else {
                 format_compact!("({})", parts.join(", "))
             };
-
             ("fn_value.tuple", text, confidence)
         })
         .collect()
+}
+
+/// Selects all small products, preserving the legacy prefix before sampling larger products.
+fn tuple_indices(lengths: &[usize]) -> Vec<Vec<usize>> {
+    if lengths.contains(&0) {
+        return Vec::new();
+    }
+
+    let product = lengths.iter().fold(1usize, |count, length| count.saturating_mul(*length));
+    let mut selected = Vec::new();
+    let mut indices = vec![0; lengths.len()];
+
+    // Mutant IDs use a replacement's position in this list. The first eight lexicographic
+    // combinations existed before tuple products gained a larger budget, so moving one would
+    // attach an old cached verdict to a different replacement.
+    loop {
+        if selected.len() >= product.min(RETURN_WIDTH) {
+            break;
+        }
+        selected.push(indices.clone());
+        if !advance_tuple_indices(&mut indices, lengths) {
+            return selected;
+        }
+    }
+
+    if product > TUPLE_RETURN_WIDTH {
+        let coverage_slots = TUPLE_RETURN_WIDTH - RETURN_WIDTH;
+        let mut slots = vec![vec![0; lengths.len()]; coverage_slots];
+        for (member, length) in lengths.iter().copied().enumerate() {
+            let missing = (0..length).filter(|value| !selected.iter().any(|indices| indices[member] == *value));
+            for (offset, value) in missing.take(coverage_slots).enumerate() {
+                let slot = (member + offset) % coverage_slots;
+                slots[slot][member] = value;
+            }
+        }
+        for indices in slots {
+            if !selected.contains(&indices) {
+                selected.push(indices);
+            }
+        }
+    }
+
+    loop {
+        if selected.len() >= TUPLE_RETURN_WIDTH {
+            break;
+        }
+        if !selected.contains(&indices) {
+            selected.push(indices.clone());
+        }
+        if !advance_tuple_indices(&mut indices, lengths) {
+            break;
+        }
+    }
+
+    selected
+}
+
+fn advance_tuple_indices(indices: &mut [usize], lengths: &[usize]) -> bool {
+    for (index, length) in indices.iter_mut().zip(lengths).rev() {
+        *index += 1;
+        if *index < *length {
+            return true;
+        }
+        *index = 0;
+    }
+    false
 }
 
 /// The replacement values for a type that has a fixed list of them.
@@ -1321,14 +1369,14 @@ mod tests {
         let tuple: Type = parse_quote!((bool, bool, bool, bool));
         let values = tuple_values(&tuple, RETURN_DEPTH, &types);
 
-        assert_eq!(values.len(), RETURN_WIDTH);
+        assert_eq!(values.len(), TUPLE_RETURN_WIDTH);
         assert_eq!(
             values.first().map(|(_, text, _confidence)| text.as_str()),
             Some("(true, true, true, true)")
         );
         assert_eq!(
             values.last().map(|(_, text, _confidence)| text.as_str()),
-            Some("(true, false, false, false)")
+            Some("(false, false, false, false)")
         );
         assert_eq!(cap(vec![proven("x", "x"); RETURN_WIDTH + 1]).len(), RETURN_WIDTH);
 
@@ -1340,6 +1388,55 @@ mod tests {
         let array: PathSegment = parse_quote!(Array<u8, 4>);
         assert_eq!(type_arguments(&cow), 1);
         assert_eq!(type_arguments(&array), 1);
+    }
+
+    #[test]
+    fn tuple_products_complete_small_cases_and_cover_each_member_when_capped() {
+        let abstracts = Vec::new();
+        let imports = HashMap::default();
+        let defaults = Defaults::default();
+        let types = test_types(&abstracts, &imports, &defaults);
+        let pair: Type = parse_quote!((Vec<usize>, Vec<usize>));
+        let values = tuple_values(&pair, RETURN_DEPTH, &types);
+
+        assert_eq!(values.len(), 9);
+        assert!(
+            values
+                .iter()
+                .any(|(_, text, _)| { text == "(core::iter::once(1).collect(), core::iter::once(1).collect())" }),
+            "{values:?}"
+        );
+
+        for lengths in [&[3, 3, 3][..], &[2; 20][..]] {
+            let selected = tuple_indices(lengths);
+            assert_eq!(selected.len(), TUPLE_RETURN_WIDTH);
+            for (member, length) in lengths.iter().copied().enumerate() {
+                for value in 0..length {
+                    assert!(selected.iter().any(|indices| indices[member] == value), "{selected:?}");
+                }
+            }
+        }
+
+        // These replacements had indices 0 through 7 in the earlier eight-value catalog. Their IDs
+        // must continue to name the same values when a wider product is sampled.
+        let wide: Type = parse_quote!((bool, bool, bool, bool, bool));
+        let values = tuple_values(&wide, RETURN_DEPTH, &types);
+        assert_eq!(values.len(), TUPLE_RETURN_WIDTH);
+        assert_eq!(values[0].1, "(true, true, true, true, true)");
+        assert_eq!(values[1].1, "(true, true, true, true, false)");
+        assert_eq!(values[7].1, "(true, true, false, false, false)");
+
+        // An inner tuple can itself contribute sixteen choices. Only eight new slots remain
+        // after the stable prefix, so sampling covers as many missing choices as the cap permits.
+        let nested = tuple_indices(&[16, 16]);
+        assert_eq!(nested.len(), TUPLE_RETURN_WIDTH);
+        assert_eq!(
+            &nested[..RETURN_WIDTH],
+            &(0..RETURN_WIDTH).map(|value| vec![0, value]).collect::<Vec<_>>()
+        );
+        for value in 0..16 {
+            assert!(nested.iter().any(|indices| indices[1] == value), "{nested:?}");
+        }
     }
 
     #[test]

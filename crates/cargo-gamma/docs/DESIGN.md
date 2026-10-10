@@ -323,6 +323,11 @@ original expression.
 
 ### Semantic restraint
 
+For tuple returns, Gamma enumerates the full product when it has at most 16
+combinations. Larger products retain the first eight combinations for stable
+mutant identities, then use up to eight more to cover as many distinct member
+values as the remaining budget allows.
+
 Instrumentation duplicates source text rather than introducing temporary bindings. A temporary
 could change moves, borrows, short-circuit behavior, or destruction order. The schema may affect
 code size, inlining, and layout, but it must preserve the unmutated program's observable semantics.

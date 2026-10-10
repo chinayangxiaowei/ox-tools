@@ -92,10 +92,15 @@ configuration and therefore audits the whole file.
   cannot be borrowed as evidence for the local shadow.
   Unsized standard wrappers use shape-specific constructors, opaque iterators
   retain iterator-shaped replacements, and tuple/collection products require
-  evidence for every member. Shared empty slices may use `&[]`; arbitrary shared or mutable
-  references are not fabricated with `Box::leak`, and mutable string slices
-  receive no automatic replacement because the only source-independent
-  construction would leak once per invocation.
+  evidence for every member. Tuple returns enumerate all products up to 16
+  combinations. Larger products retain the first eight lexicographic combinations
+  to keep existing mutant IDs tied to the same replacements, then use up to eight
+  more combinations to cover previously unseen member values. A nested tuple can
+  offer more unseen values than those eight slots can hold. Other synthesized
+  value lists are limited to eight. Shared empty slices may use `&[]`; arbitrary
+  shared or mutable references are not fabricated with `Box::leak`, and mutable
+  string slices receive no automatic replacement because the only
+  source-independent construction would leak once per invocation.
 - Statement and loop deletion is gated only for concrete intra-procedural
   compile hazards: deferred-binding initialization, explicit `drop` calls, and
   branch/loop type transitions already proven by local syntax. The divergent
