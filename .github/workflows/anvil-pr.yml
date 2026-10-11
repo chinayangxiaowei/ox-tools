@@ -8,7 +8,8 @@ name: Anvil
 # Treat changes as compatibility changes for repository rulesets.
 
 on:
-  pull_request: {}
+  pull_request:
+    branches-ignore: [main-macos-ci]
   merge_group: {}
 
 permissions:
