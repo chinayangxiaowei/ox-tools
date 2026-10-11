@@ -4036,6 +4036,54 @@ fn explicitly_dereferenced_field_uses_its_declaration_imports() {
 }
 
 #[test]
+fn cross_module_field_alias_uses_its_declaration_scope() {
+    let source = r"
+        mod model {
+            pub type Clock = std::time::Instant;
+            pub struct State { pub deadline: Clock }
+        }
+        fn target(state: &mut model::State) {
+            state.deadline += std::time::Duration::from_secs(1);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_sub", "state.deadline -= (std::time::Duration::from_secs(1))")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn cross_module_dereferenced_field_alias_uses_its_declaration_scope() {
+    let source = r"
+        mod model {
+            pub type Clock = std::time::Instant;
+            pub struct State<'a> { pub deadline: &'a mut Clock }
+        }
+        fn target(state: &mut model::State<'_>) {
+            *state.deadline += std::time::Duration::from_secs(1);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_sub", "*state.deadline -= (std::time::Duration::from_secs(1))")],
+        "{found:?}"
+    );
+}
+
+#[test]
 fn unrelated_imported_clock_does_not_borrow_a_file_wide_temporal_alias() {
     let source = r"
         mod temporal { pub type Clock = std::time::Instant; }
@@ -4345,6 +4393,53 @@ fn local_generic_alias_argument_is_not_reinterpreted_by_outer_imports() {
             ("assign.add_to_sub", "**deadline -= (1)")
         ],
         "{found:?}"
+    );
+}
+
+#[test]
+fn local_generic_alias_argument_is_not_reinterpreted_by_outer_aliases() {
+    let source = r"
+        type Clock = std::time::Instant;
+        type Ref<'a, T> = &'a mut T;
+        fn target() {
+            struct Clock;
+            impl std::ops::AddAssign<i32> for Clock { fn add_assign(&mut self, _: i32) {} }
+            impl std::ops::MulAssign<i32> for Clock { fn mul_assign(&mut self, _: i32) {} }
+            let mut value = Clock;
+            let mut inner = &mut value;
+            let deadline: &mut Ref<'_, Clock> = &mut inner;
+            **deadline += 1;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{found:?}"
+    );
+
+    let file = SourceFile::parse("test.rs", source.to_owned()).expect("the fixture parses");
+    let selection = Selection::parse("assign.add_to_sub,assign.add_to_mul").expect("the operators are registered");
+    let without_workspace_defaults = collect_with(&file, &selection, &CfgSet::unconditional(), &Defaults::default());
+    let replacements = without_workspace_defaults
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{without_workspace_defaults:?}"
     );
 }
 

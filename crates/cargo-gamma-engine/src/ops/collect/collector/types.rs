@@ -109,13 +109,19 @@ fn qualify_imported_type(
             if defaults.defines(name) {
                 return syn::parse_str::<Type>(&format!("self::{name}")).ok().map(|ty| (name.clone(), ty));
             }
-            let path = path.as_ref()?;
-            let qualified = path
-                .iter()
-                .filter(|segment| segment.as_str() != ABSOLUTE_ROOT)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("::");
+            let qualified = if let Some(path) = path {
+                path.iter()
+                    .filter(|segment| segment.as_str() != ABSOLUTE_ROOT)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("::")
+            } else if name != "*" {
+                // A local type or ambiguous import is visible at this use site even when the
+                // workspace-wide Default index has no declaration for it.
+                format!("self::{name}")
+            } else {
+                return None;
+            };
             syn::parse_str::<Type>(&qualified).ok().map(|ty| (name.clone(), ty))
         })
         .collect();

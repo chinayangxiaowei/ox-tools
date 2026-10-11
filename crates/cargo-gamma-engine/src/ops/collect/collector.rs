@@ -1670,6 +1670,28 @@ impl<'a> Collector<'a> {
         }
     }
 
+    fn scope_of_expression(&self, expression: &Expr) -> &ScopePath {
+        let declared = match expression {
+            Expr::Path(path) => path.path.get_ident().and_then(|ident| {
+                let name = ident.to_string();
+                if self.binding_types.contains_key(&name) {
+                    None
+                } else {
+                    self.declared_types.get(&name).and_then(Option::as_ref)
+                }
+            }),
+            Expr::Field(field) => match &field.member {
+                Member::Named(name) => self.declared_types.get(&name.to_string()).and_then(Option::as_ref),
+                Member::Unnamed(_) => None,
+            },
+            Expr::Paren(paren) => return self.scope_of_expression(&paren.expr),
+            Expr::Group(group) => return self.scope_of_expression(&group.expr),
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => return self.scope_of_expression(&unary.expr),
+            _ => None,
+        };
+        declared.map_or(&self.scope_path, |declared| &declared.scope_path)
+    }
+
     fn reusable_payload(&self, span: &Range<usize>) -> Option<&str> {
         self.reusable_payloads
             .iter()
@@ -1783,7 +1805,7 @@ impl<'a> Collector<'a> {
             self_type: self.impl_self_type.as_ref(),
             self_associated: Some(&self.impl_self_associated),
         };
-        let (ty, imports) = dereferenced_place_type(expression, ty, &types, &self.scope_path);
+        let (ty, imports) = dereferenced_place_type(expression, ty, &types, self.scope_of_expression(expression));
 
         if matches!(values::strip(&ty), Type::Path(path) if path.path.get_ident().is_some_and(|name| {
             self.generics.contains(&name.to_string()) || self.defaulted.contains(&name.to_string())
@@ -1841,7 +1863,7 @@ impl<'a> Collector<'a> {
             self_type: self.impl_self_type.as_ref(),
             self_associated: Some(&self.impl_self_associated),
         };
-        let (ty, imports) = dereferenced_place_type(expression, ty, &types, &self.scope_path);
+        let (ty, imports) = dereferenced_place_type(expression, ty, &types, self.scope_of_expression(expression));
         let Type::Path(path) = values::strip(&ty) else {
             return false;
         };

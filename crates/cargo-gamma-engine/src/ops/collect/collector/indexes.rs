@@ -44,7 +44,7 @@ fn merge_type(index: &mut HashMap<String, Option<Type>>, name: &str, ty: &Type) 
 #[derive(Clone, PartialEq)]
 pub(super) struct DeclaredType {
     pub(super) ty: Type,
-    scope_path: ScopePath,
+    pub(super) scope_path: ScopePath,
     pub(super) imports: ImportMap,
 }
 
