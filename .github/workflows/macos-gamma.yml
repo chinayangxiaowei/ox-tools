@@ -1,0 +1,51 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+#
+# Fork-local native validation for PRs targeting main-macos-ci.
+# Keep that branch based on upstream main with workflow-only changes.
+# Test the PR head itself so the result also identifies the upstream PR's code.
+name: macOS gamma
+
+on:
+  pull_request:
+    branches: [main-macos-ci]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-gamma-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: Native macOS 15 ARM64
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Record tested commit and native environment
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
+          {
+            printf '### Tested revision\n\n'
+            git log -1 --format='%H%n%s'
+            printf '\n### Native runner\n\n'
+            sw_vers
+            uname -m
+            printf '\n### Rust toolchain\n\n'
+            rustc --version --verbose
+            cargo --version
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Test process cleanup, platform calls, and CLI
+        run: cargo test --locked -p cargo-gamma-unsafe -p cargo-gamma-process -p cargo-gamma
+      - name: Build release CLI
+        run: cargo build --locked --release -p cargo-gamma
