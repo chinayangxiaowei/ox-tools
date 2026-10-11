@@ -47,6 +47,20 @@ configuration and therefore audits the whole file.
   decrement; focused non-default selection can still request those optimistic
   sites. Proven text/time addition is not changed to any incompatible arithmetic
   operator; signed and unresolved arithmetic remains in the population.
+- Registered operator substitutions include changing remainder to addition and
+  addition assignment to multiplication assignment, both enabled by default.
+  Each replacement has its own stable mutator name and remains subject to
+  compilation before a campaign can run it. Compound-assignment
+  candidates are emitted without inferring support for the replacement trait
+  from operand names or aliases. Those indexes do not establish Rust name
+  resolution or trait support; filtering on them can silently discard valid
+  custom implementations when names are shadowed. The coordinator withdraws
+  incompatible candidates during compilation; this may require extra convergence
+  rounds. Withdrawn candidates do not count as survivors.
+- `assign.add_to_mul` skips integer-literal unit steps, including suffixes,
+  alternate bases, and parentheses, to avoid stalled counter mutants. This
+  syntactic rule applies to custom assignments and explicit selection too;
+  variables, constants, and expressions are not evaluated to infer a unit step.
 - A mutation that invents `Default::default()` for a known payload requires
   positive evidence. Primitive and supported standard types, package-local
   derives or impls whose concrete generic arguments satisfy their bounds,
