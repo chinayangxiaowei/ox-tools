@@ -172,11 +172,14 @@ pub struct SuppressArgs {
     /// A surviving mutant is never eligible and cannot be made eligible: it is a real gap in the
     /// test suite, and suppressing it would remove the gap from the score rather than from the code.
     ///
-    /// Timeouts and out-of-memory verdicts are both eligible by default because they are one
-    /// situation seen through two ceilings: whichever the runaway mutant reaches first is a property
-    /// of the machine, so suppressing only one produces directives that hold on one host and not on
-    /// another.
-    #[arg(long, value_name = "LIST", default_value = "timeout,outofmem", help_heading = "Suppressing")]
+    /// Timeouts, out-of-memory verdicts, and reference leak limits are eligible by default.
+    /// A runaway mutant can reach any of these guards before an assertion rejects it.
+    #[arg(
+        long,
+        value_name = "LIST",
+        default_value = "timeout,outofmem,leaklimit",
+        help_heading = "Suppressing"
+    )]
     pub eligible: String,
 
     /// Edit source files that have uncommitted changes.
@@ -662,8 +665,8 @@ pub struct RunArgs {
 
     /// Fail the run if the assertion-killed mutation score is below this percentage.
     ///
-    /// Timeouts and out-of-memory mutants count against the score because no test assertion
-    /// rejected them.
+    /// Timeouts, out-of-memory mutants, and reference leak limits count against the score because
+    /// no test assertion rejected them.
     #[arg(long, value_name = "PERCENT", value_parser = percentage, help_heading = "Run control")]
     pub min_score: Option<f64>,
 
@@ -1341,7 +1344,7 @@ mod tests {
     /// failure would surface only when a user ran `suppress` with no `--eligible`.
     #[test]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn suppress_defaults_to_suppressing_both_timeouts_and_out_of_memory() {
+    fn suppress_defaults_to_suppressing_resource_outcomes() {
         let cli = Cli::try_parse_from(["cargo-gamma", "suppress"]).expect("suppress parses with no arguments");
 
         let Command::Suppress(args) = cli.command else {
@@ -1350,7 +1353,14 @@ mod tests {
 
         let eligible = crate::fix::Eligible::parse(&args.eligible).expect("the default must be a value the parser accepts");
 
-        assert_eq!(eligible, vec![crate::fix::Eligible::Timeout, crate::fix::Eligible::OutOfMemory]);
+        assert_eq!(
+            eligible,
+            vec![
+                crate::fix::Eligible::Timeout,
+                crate::fix::Eligible::OutOfMemory,
+                crate::fix::Eligible::LeakLimit
+            ]
+        );
         assert!(!args.apply, "suppress must preview unless source edits are explicitly requested");
     }
 

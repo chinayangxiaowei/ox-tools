@@ -87,6 +87,29 @@ configuration, reports, diagnostics, and exit codes. The Rust API is an
 implementation detail used by the thin executable crate. Its rustdoc is hidden,
 and its hand-written README warns downstream users not to depend on it.
 
+Shared whole-body reference replacements to promotable values borrow those values
+directly. Generated replacements calling `Box::leak` can allocate on each call;
+composed values may leak more than one allocation. The sweep schedules one such
+mutant at a time to avoid combining their memory use across workers. Each call
+to a generated leak replacement is counted before construction by the injected
+runtime, which stops the test process after 8192 calls and reports the distinct
+`leaklimit` verdict rather than a test kill or `outofmem`. The verdict requires a
+runtime receipt in the per-run reach file; test output containing the diagnostic
+text alone cannot produce it. A runtime diagnostic that opening, writing, or
+closing the receipt failed leaves the mutant pending, even if the receipt bytes
+were written. On macOS, the first
+completed construction establishes an RSS baseline; later calls that grow
+current RSS by at least 64 MiB also produce `leaklimit`. This is a soft
+process-local growth check, not an enforced memory ceiling. A normal test may
+construct the value once, so that first call is allowed; a one-call OOM is a
+separate resource problem, not a reason to discard the candidate. The counter
+and RSS baseline belong to one process with one active mutant. On other hosts,
+generated leaks remain pending when any reachable test binary lacks an enforced
+memory ceiling. A census that proves no test reaches the site still reports no
+coverage. Ordinary timeout and memory policies apply to the mutants that run.
+The diagnostics bundle counts `leaklimit` separately from `outofmem`, so its
+outcome counters still account for every mutant.
+
 ### Progress and dashboard
 
 The ordinary live display uses one active phase line at a time. Workspace
@@ -368,10 +391,10 @@ does not depend on the terminal's global saved-cursor slot, which other
 programs may overwrite or some terminals may not implement. Recomputing the
 physical row count at the current terminal width removes obsolete rows after
 terminal reflow. Survivor,
-timeout, out-of-memory, and flaky verdicts are still written as individual
-lines above the display. Clearing, exceptional output, finalization, and
-failure abandonment all restore the cursor before ordinary diagnostics or the
-final summary are written.
+timeout, out-of-memory, reference-leak-limit, and flaky verdicts are still
+written as individual lines above the display. Clearing, exceptional output,
+finalization, and failure abandonment all restore the cursor before ordinary
+diagnostics or the final summary are written.
 
 All three layouts use Unicode separators and box drawing. The same resolved
 color policy used by ordinary console reporting is carried into the dashboard:

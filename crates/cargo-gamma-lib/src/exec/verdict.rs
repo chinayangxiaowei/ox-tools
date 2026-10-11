@@ -196,6 +196,9 @@ pub(super) enum Verdict {
         limit: u64,
     },
 
+    /// A generated reference replacement exhausted its process-local call or RSS allowance.
+    ReferenceLeakLimit,
+
     /// A test failed with the mutant active and failed again with no mutant active.
     ///
     /// Not a verdict about the mutant either way. The suite noticed something, but the same thing
@@ -712,6 +715,19 @@ fn settle(
             Verdict::Unmetered(
                 "the guard runtime could not acquire the process startup environment or install its startup selection".to_owned(),
             ),
+            usage,
+        );
+    }
+
+    // Receipt I/O may fail even after its bytes reached the file. This diagnostic must take
+    // precedence over both an ordinary test failure and a subsequently recovered receipt.
+    if active.is_some()
+        && text
+            .windows(gamma_rt::REFERENCE_LEAK_RECEIPT_ERROR_MARKER.len())
+            .any(|window| window == gamma_rt::REFERENCE_LEAK_RECEIPT_ERROR_MARKER)
+    {
+        return (
+            Verdict::Unjudged("the guard runtime could not record the generated reference leak limit".to_owned()),
             usage,
         );
     }
@@ -1407,14 +1423,17 @@ pub(super) fn observe_baseline(work: &Workspace, binary: &TestBinary, attempt: A
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn observe_with(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>, retain_failure: bool) -> Observation {
+    let active = attempt.active;
     let capture = ReachCapture::new(work, attempt);
     let attempt = capture.as_ref().map_or(attempt, |capture| Attempt {
         census: Some(&capture.path),
         ..attempt
     });
     let progress = Arc::new(Mutex::new(Progress::new(watch(work))));
-    let (verdict, usage, failure) = run_with(work, binary, attempt, &progress, retain_failure);
-    let reach = capture.map_or(ReachObservation::Unknown, ReachCapture::finish);
+    let (mut verdict, usage, failure) = run_with(work, binary, attempt, &progress, retain_failure);
+    let reach_evidence = capture.map(ReachCapture::finish);
+    let reach = reach_evidence.map_or(ReachObservation::Unknown, |evidence| evidence.reach);
+    verdict = verdict_with_reference_leak_receipt(verdict, active, reach_evidence);
     let quiet = quiet_of(&progress);
 
     #[expect(clippy::unwrap_used, reason = "the reader only panics if the whole process is unwinding")]
@@ -1437,6 +1456,22 @@ struct ReachCapture {
     ordinal: u32,
 }
 
+#[derive(Clone, Copy)]
+struct ReachEvidence {
+    reach: ReachObservation,
+    reference_leak_limit: bool,
+}
+
+fn verdict_with_reference_leak_receipt(verdict: Verdict, active: Option<u32>, evidence: Option<ReachEvidence>) -> Verdict {
+    // The runtime writes this receipt immediately before exiting. A printed diagnostic alone is
+    // not evidence, and infrastructure failures must not be overwritten by a resource verdict.
+    if active.is_some() && matches!(verdict, Verdict::Failed(_)) && evidence.is_some_and(|evidence| evidence.reference_leak_limit) {
+        Verdict::ReferenceLeakLimit
+    } else {
+        verdict
+    }
+}
+
 impl ReachCapture {
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(work: &Workspace, attempt: Attempt<'_>) -> Option<Self> {
@@ -1454,18 +1489,27 @@ impl ReachCapture {
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn finish(self) -> ReachObservation {
+    fn finish(self) -> ReachEvidence {
         let bytes = fs::read(self.path.as_std_path());
         let _removed = fs::remove_file(self.path.as_std_path());
         let Ok(bytes) = bytes else {
-            return ReachObservation::Unknown;
+            return ReachEvidence {
+                reach: ReachObservation::Unknown,
+                reference_leak_limit: false,
+            };
         };
 
+        ReachEvidence::from_bytes(&bytes, self.ordinal)
+    }
+}
+
+impl ReachEvidence {
+    fn from_bytes(bytes: &[u8], ordinal: u32) -> Self {
         let mut sealed = false;
         let mut reached = false;
         for record in bytes.chunks_exact(core::mem::size_of::<u32>()) {
             let value = u32::from_le_bytes(record.try_into().expect("chunks_exact yields exactly one runtime reach record"));
-            if value == self.ordinal {
+            if value == ordinal {
                 reached = true;
             }
             if value == gamma_rt::OVERFLOW {
@@ -1484,12 +1528,20 @@ impl ReachCapture {
             }
         }
 
-        if reached {
+        let reach = if reached {
             ReachObservation::Reached
         } else if sealed && bytes.len().is_multiple_of(core::mem::size_of::<u32>()) {
             ReachObservation::NotReached
         } else {
             ReachObservation::Unknown
+        };
+        let last_record = bytes
+            .chunks_exact(core::mem::size_of::<u32>())
+            .last()
+            .map(|record| u32::from_le_bytes(record.try_into().expect("chunks_exact yields exactly one runtime reach record")));
+        Self {
+            reach,
+            reference_leak_limit: last_record == Some(gamma_rt::REFERENCE_LEAK_LIMIT_RECORD) && bytes.len().is_multiple_of(4),
         }
     }
 }
@@ -1553,13 +1605,16 @@ fn announced_failures(progress: &Mutex<Progress>) -> Vec<String> {
 }
 
 /// Whether the runtime has independently disqualified this test process as evidence.
+#[cfg(test)]
 fn environment_failure(progress: &Mutex<Progress>) -> bool {
     #[expect(clippy::unwrap_used, reason = "the reader only panics if the whole process is unwinding")]
     progress.lock().unwrap().environment_error
 }
 
 fn environment_verdict(progress: &Mutex<Progress>) -> Option<Verdict> {
-    environment_failure(progress).then(|| {
+    #[expect(clippy::unwrap_used, reason = "the reader only panics if the process is unwinding")]
+    let progress = progress.lock().unwrap();
+    progress.environment_error.then(|| {
         Verdict::Unmetered(
             "the guard runtime could not acquire the process startup environment or install its startup selection".to_owned(),
         )
@@ -2003,21 +2058,81 @@ mod tests {
         assert!(matches!(environment_verdict(&progress), Some(Verdict::Unmetered(reason)) if reason.contains("startup")));
     }
 
-    fn reach_fixture(records: &[u32], ordinal: u32) -> ReachObservation {
-        let directory = tempfile::tempdir().expect("the reach fixture directory is created");
-        let path = Utf8PathBuf::from_path_buf(directory.path().join("reach.bin")).expect("the fixture path is UTF-8");
-        let bytes: Vec<u8> = records.iter().flat_map(|record| record.to_le_bytes()).collect();
-        fs::write(path.as_std_path(), bytes).expect("the reach fixture is written");
+    #[test]
+    fn printed_reference_leak_marker_is_not_a_runtime_verdict() {
+        let progress = Mutex::new(Progress::new(Watch::Nextest));
+        progress
+            .lock()
+            .expect("the progress lock is not poisoned")
+            .heard_diagnostic(core::str::from_utf8(gamma_rt::REFERENCE_LEAK_LIMIT_MARKER).expect("the marker is ASCII"));
+        assert_eq!(environment_verdict(&progress), None);
 
-        ReachCapture { path, ordinal }.finish()
+        let (verdict, _usage) = settle(
+            true,
+            Some(7),
+            Some(nextest::TEST_RUN_FAILED),
+            gamma_rt::REFERENCE_LEAK_LIMIT_MARKER,
+            b"FAIL [ 0.1s] example::test",
+            MemoryUsage::default(),
+        );
+        assert!(matches!(verdict, Verdict::Failed(_)));
+    }
+
+    #[test]
+    fn reference_leak_receipt_errors_leave_failed_mutants_unjudged() {
+        let receipt = reach_fixture(&[gamma_rt::REFERENCE_LEAK_LIMIT_RECORD], 7);
+        for (under_nextest, code) in [(false, 86), (true, nextest::TEST_RUN_FAILED)] {
+            let (verdict, _usage) = settle(
+                under_nextest,
+                Some(7),
+                Some(code),
+                gamma_rt::REFERENCE_LEAK_RECEIPT_ERROR_MARKER,
+                b"",
+                MemoryUsage::default(),
+            );
+            let expected = Verdict::Unjudged("the guard runtime could not record the generated reference leak limit".to_owned());
+            assert_eq!(verdict, expected);
+            // A close failure can leave complete bytes behind. They cannot turn this into a verdict.
+            assert_eq!(verdict_with_reference_leak_receipt(verdict, Some(7), Some(receipt)), expected);
+        }
+    }
+
+    #[test]
+    fn reference_leak_receipt_error_text_does_not_interrupt_or_reclassify_baselines() {
+        let progress = Mutex::new(Progress::new(Watch::Nextest));
+        progress
+            .lock()
+            .expect("the progress lock is not poisoned")
+            .heard_diagnostic(core::str::from_utf8(gamma_rt::REFERENCE_LEAK_RECEIPT_ERROR_MARKER).expect("the marker is ASCII"));
+        assert_eq!(environment_verdict(&progress), None);
+
+        for (under_nextest, code) in [(false, 86), (true, nextest::TEST_RUN_FAILED)] {
+            let (verdict, _usage) = settle(
+                under_nextest,
+                None,
+                Some(code),
+                gamma_rt::REFERENCE_LEAK_RECEIPT_ERROR_MARKER,
+                b"",
+                MemoryUsage::default(),
+            );
+            assert_eq!(verdict, Verdict::Failed(None));
+        }
+    }
+
+    fn reach_fixture(records: &[u32], ordinal: u32) -> ReachEvidence {
+        let bytes: Vec<u8> = records.iter().flat_map(|record| record.to_le_bytes()).collect();
+        ReachEvidence::from_bytes(&bytes, ordinal)
     }
 
     #[test]
     fn positive_reach_survives_an_incomplete_observation_but_negative_reach_does_not() {
-        assert_eq!(reach_fixture(&[7], 7), ReachObservation::Reached);
-        assert_eq!(reach_fixture(&[gamma_rt::SEAL], 7), ReachObservation::NotReached);
-        assert_eq!(reach_fixture(&[], 7), ReachObservation::Unknown);
-        assert_eq!(reach_fixture(&[gamma_rt::OVERFLOW, gamma_rt::SEAL], 7), ReachObservation::Unknown);
+        assert_eq!(reach_fixture(&[7], 7).reach, ReachObservation::Reached);
+        assert_eq!(reach_fixture(&[gamma_rt::SEAL], 7).reach, ReachObservation::NotReached);
+        assert_eq!(reach_fixture(&[], 7).reach, ReachObservation::Unknown);
+        assert_eq!(
+            reach_fixture(&[gamma_rt::OVERFLOW, gamma_rt::SEAL], 7).reach,
+            ReachObservation::Unknown
+        );
     }
 
     #[test]
@@ -2082,11 +2197,35 @@ mod tests {
     }
 
     #[test]
+    fn reference_leak_verdict_requires_the_runtime_receipt() {
+        let receipt = reach_fixture(&[gamma_rt::REFERENCE_LEAK_LIMIT_RECORD], 7);
+        assert!(receipt.reference_leak_limit);
+        assert_eq!(receipt.reach, ReachObservation::Unknown);
+        assert_eq!(
+            verdict_with_reference_leak_receipt(Verdict::Failed(None), Some(7), Some(receipt)),
+            Verdict::ReferenceLeakLimit
+        );
+        assert_eq!(
+            verdict_with_reference_leak_receipt(Verdict::Failed(None), None, Some(receipt)),
+            Verdict::Failed(None)
+        );
+        assert_eq!(
+            verdict_with_reference_leak_receipt(Verdict::Failed(None), Some(7), None),
+            Verdict::Failed(None)
+        );
+        assert_eq!(
+            verdict_with_reference_leak_receipt(Verdict::Passed, Some(7), Some(receipt)),
+            Verdict::Passed
+        );
+        assert!(!reach_fixture(&[gamma_rt::REFERENCE_LEAK_LIMIT_RECORD, gamma_rt::SEAL], 7).reference_leak_limit);
+    }
+
+    #[test]
     fn malformed_reach_streams_are_never_negative_evidence() {
-        assert_eq!(reach_fixture(&[gamma_rt::SEAL, gamma_rt::SEAL], 7), ReachObservation::Unknown);
-        assert_eq!(reach_fixture(&[gamma_rt::SEAL, 9], 7), ReachObservation::Unknown);
-        assert_eq!(reach_fixture(&[9, gamma_rt::SEAL], 7), ReachObservation::NotReached);
-        assert_eq!(reach_fixture(&[9, gamma_rt::OVERFLOW], 7), ReachObservation::Unknown);
+        assert_eq!(reach_fixture(&[gamma_rt::SEAL, gamma_rt::SEAL], 7).reach, ReachObservation::Unknown);
+        assert_eq!(reach_fixture(&[gamma_rt::SEAL, 9], 7).reach, ReachObservation::Unknown);
+        assert_eq!(reach_fixture(&[9, gamma_rt::SEAL], 7).reach, ReachObservation::NotReached);
+        assert_eq!(reach_fixture(&[9, gamma_rt::OVERFLOW], 7).reach, ReachObservation::Unknown);
     }
 
     #[test]

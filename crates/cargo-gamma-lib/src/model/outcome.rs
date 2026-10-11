@@ -27,13 +27,19 @@ pub enum Outcome {
     /// Counted as undetected because no assertion established that the suite rejected the change.
     Timeout,
 
-    /// The mutant's test run passed the memory ceiling derived from that binary's own baseline.
+    /// The mutant's test run passed its memory ceiling.
     ///
-    /// Counted as undetected: the ceiling established that the mutant changed resource use, but no
+    /// Counted as undetected: the resource limit established that the mutant changed resource use, but no
     /// assertion established that the suite rejected the change. It remains distinct from
     /// [`Self::Survived`] because its remedy is a resource bound or terminating assertion rather
     /// than an assertion over a completed result.
     OutOfMemory,
+
+    /// A generated reference replacement exhausted its call or RSS growth allowance.
+    ///
+    /// The guard stopped the process before an assertion rejected the mutant, so it counts as
+    /// undetected. This is distinct from a process exceeding its enforced memory ceiling.
+    LeakLimit,
 
     /// The mutant could not be compiled. Not a test-suite failing.
     CompileError,
@@ -84,10 +90,11 @@ impl Outcome {
     /// nothing in the compiler had an opinion about it. Reporters walk this instead, so a run's
     /// verdicts are enumerated in one place, in one order, and the test below refuses an array that
     /// has fallen behind the enum.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Killed,
         Self::Timeout,
         Self::OutOfMemory,
+        Self::LeakLimit,
         Self::Survived,
         Self::NoCoverage,
         Self::Flaky,
@@ -111,7 +118,7 @@ impl Outcome {
     pub const fn scoring(self) -> Scoring {
         match self {
             Self::Killed => Scoring::Detected,
-            Self::Survived | Self::Timeout | Self::OutOfMemory | Self::NoCoverage => Scoring::Undetected,
+            Self::Survived | Self::Timeout | Self::OutOfMemory | Self::LeakLimit | Self::NoCoverage => Scoring::Undetected,
             Self::Flaky | Self::CompileError | Self::Ignored | Self::NotBuilt | Self::Pending => Scoring::Excluded,
         }
     }
@@ -137,6 +144,7 @@ impl Outcome {
             Self::Survived => "survived",
             Self::Timeout => "timeout",
             Self::OutOfMemory => "outofmem",
+            Self::LeakLimit => "leaklimit",
             Self::Flaky => "flaky",
             Self::CompileError => "unviable",
             Self::Ignored => "ignored",
@@ -163,10 +171,12 @@ mod tests {
         assert!(Outcome::Killed.is_detected());
         assert!(!Outcome::Timeout.is_detected());
         assert!(!Outcome::OutOfMemory.is_detected());
+        assert!(!Outcome::LeakLimit.is_detected());
         assert!(!Outcome::Survived.is_detected());
 
         assert!(Outcome::Timeout.is_valid());
         assert!(Outcome::OutOfMemory.is_valid());
+        assert!(Outcome::LeakLimit.is_valid());
         assert!(Outcome::Survived.is_valid());
         assert!(Outcome::NoCoverage.is_valid());
         assert!(!Outcome::CompileError.is_valid());
@@ -174,7 +184,7 @@ mod tests {
         assert!(!Outcome::Pending.is_valid());
     }
 
-    /// A run stopped by the clock or the memory ceiling scores against the suite, not for it.
+    /// A run stopped by the clock or a resource guard scores against the suite, not for it.
     ///
     /// Both outcomes mean the same thing about the tests: the mutant changed how the code behaves
     /// and no assertion said so. The suite noticed nothing — a budget did — so neither may be
@@ -184,11 +194,12 @@ mod tests {
     /// as a kill does the same for a mutant that merely allocated. Both remain in the denominator,
     /// because the mutant did run and something about it was observed.
     #[test]
-    fn a_timeout_and_a_memory_limit_score_as_undetected_mutants() {
+    fn resource_limits_score_as_undetected_mutants() {
         assert_eq!(Outcome::Timeout.scoring(), Scoring::Undetected);
         assert_eq!(Outcome::OutOfMemory.scoring(), Scoring::Undetected);
+        assert_eq!(Outcome::LeakLimit.scoring(), Scoring::Undetected);
 
-        for outcome in [Outcome::Timeout, Outcome::OutOfMemory] {
+        for outcome in [Outcome::Timeout, Outcome::OutOfMemory, Outcome::LeakLimit] {
             assert!(!outcome.is_detected(), "{outcome} must not be credited as a detection");
             assert!(outcome.is_valid(), "{outcome} must stay in the denominator");
         }
@@ -197,6 +208,7 @@ mod tests {
         // a flake or an unviable mutant takes.
         assert_eq!(Outcome::Timeout.scoring(), Outcome::Survived.scoring());
         assert_eq!(Outcome::OutOfMemory.scoring(), Outcome::Survived.scoring());
+        assert_eq!(Outcome::LeakLimit.scoring(), Outcome::Survived.scoring());
         assert_ne!(Outcome::Timeout.scoring(), Outcome::Killed.scoring());
         assert_ne!(Outcome::OutOfMemory.scoring(), Outcome::Flaky.scoring());
     }
@@ -228,13 +240,14 @@ mod tests {
                 Outcome::Killed => 0,
                 Outcome::Timeout => 1,
                 Outcome::OutOfMemory => 2,
-                Outcome::Survived => 3,
-                Outcome::NoCoverage => 4,
-                Outcome::Flaky => 5,
-                Outcome::CompileError => 6,
-                Outcome::Ignored => 7,
-                Outcome::NotBuilt => 8,
-                Outcome::Pending => 9,
+                Outcome::LeakLimit => 3,
+                Outcome::Survived => 4,
+                Outcome::NoCoverage => 5,
+                Outcome::Flaky => 6,
+                Outcome::CompileError => 7,
+                Outcome::Ignored => 8,
+                Outcome::NotBuilt => 9,
+                Outcome::Pending => 10,
             }
         }
 
@@ -267,6 +280,7 @@ mod tests {
         assert_eq!(Outcome::Survived.as_str(), "survived");
         assert_eq!(Outcome::Timeout.as_str(), "timeout");
         assert_eq!(Outcome::OutOfMemory.as_str(), "outofmem");
+        assert_eq!(Outcome::LeakLimit.as_str(), "leaklimit");
         assert_eq!(Outcome::Flaky.as_str(), "flaky");
         assert_eq!(Outcome::CompileError.as_str(), "unviable");
         assert_eq!(Outcome::Ignored.as_str(), "ignored");

@@ -190,11 +190,56 @@ fn a_leaked_default_is_not_offered_to_a_body_that_already_leaks_one() {
 }
 
 #[test]
+fn a_standard_qualified_leak_is_not_offered_as_an_equivalent_bare_leak() {
+    for source in [
+        "fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "use std::boxed::Box; fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "mod unrelated { struct Box; } fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+    ] {
+        let found = mutators(source, "fn_value", &CfgSet::unconditional());
+        assert!(found.is_empty(), "{source}: {found:?}");
+    }
+}
+
+#[test]
+fn a_shadowed_box_or_std_root_keeps_a_qualified_leak_mutant() {
+    for source in [
+        "mod std {} fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "mod alloc {} fn f<T: Default + 'static>() -> &'static T { &*alloc::boxed::Box::leak(alloc::boxed::Box::new(T::default())) }",
+        "mod Box {} fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "fn f<T: Default + 'static>() -> &'static T { mod std {} &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "struct Box; fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "fn f<T: Default + 'static>() -> &'static T { struct Box; &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "extern crate alloc as std; fn f<T: Default + 'static>() -> &'static T { &*std::boxed::Box::leak(std::boxed::Box::new(T::default())) }",
+        "mod other { pub use std::boxed::Box; } fn f<T: Default + 'static>() -> &'static T { &*other::Box::leak(other::Box::new(T::default())) }",
+    ] {
+        let found = mutators(source, "fn_value", &CfgSet::unconditional());
+        assert_eq!(found, vec!["fn_value.default"], "{source}: {found:?}");
+    }
+}
+
+#[test]
+fn an_empty_shared_slice_is_not_replaced_with_another_empty_slice() {
+    let source = "fn empty() -> &'static [u8] { &[] }";
+    let found = mutators(source, "fn_value.empty_collection", &CfgSet::unconditional());
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn shared_zero_sized_literals_do_not_become_equivalent_leaks() {
+    for source in ["fn unit() -> &'static () { &() }", "fn array() -> &'static [u8; 0] { &[] }"] {
+        let found = mutators(source, "fn_value", &CfgSet::unconditional());
+        assert!(found.is_empty(), "{source}: {found:?}");
+    }
+}
+
+#[test]
 fn a_reference_value_is_not_fabricated_with_a_generic_leak() {
     let source = "fn f<T: Default>() -> &'static T { Box::leak(Box::new(make())) }";
     let found = mutators(source, "fn_value", &CfgSet::unconditional());
 
-    assert!(found.is_empty(), "{found:?}");
+    assert_eq!(found, vec!["fn_value.default"], "{found:?}");
 }
 
 #[test]
@@ -333,7 +378,7 @@ fn a_parenthesized_reference_return_type_is_still_a_reference() {
     let source = "fn f<T: Default>() -> (&'static mut T) { g() }";
     let found = mutators(source, "fn_value", &CfgSet::unconditional());
 
-    assert!(found.is_empty(), "{found:?}");
+    assert_eq!(found, vec!["fn_value.default"], "{found:?}");
 }
 
 #[test]
@@ -342,7 +387,7 @@ fn only_standard_default_bounds_make_generic_fallbacks_available() {
     let custom = "mod custom { pub trait Default {} } fn f<T: custom::Default>() -> &'static mut T { g() }";
     let aliased_custom = "mod custom { pub trait Default {} } use custom::Default as Alias; fn f<T: Alias>() -> &'static mut T { g() }";
 
-    assert!(mutators(standard, "fn_value", &CfgSet::unconditional()).is_empty());
+    assert_eq!(mutators(standard, "fn_value", &CfgSet::unconditional()), vec!["fn_value.default"]);
     assert!(mutators(custom, "fn_value", &CfgSet::unconditional()).is_empty());
     assert!(mutators(aliased_custom, "fn_value", &CfgSet::unconditional()).is_empty());
 }
@@ -364,6 +409,22 @@ fn a_parenthesized_leak_is_still_the_leak_it_wraps() {
     let found = mutators(source, "fn_value", &CfgSet::unconditional());
 
     assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_leak_inside_an_option_does_not_create_an_equivalent_mutant() {
+    let source = "fn f<T: Default + 'static>() -> Option<&'static T> { Some(&*Box::leak(Box::new(T::default()))) }";
+    let found = mutators(source, "fn_value.some_default", &CfgSet::unconditional());
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_shadowed_bare_vec_macro_with_distinct_expansions_keeps_its_mutant() {
+    let source = "macro_rules! vec { (T::default()) => { std::vec![T::default(), T::default()] }; ($value:expr) => { std::vec![$value] }; } fn f<T: Default + 'static>() -> &'static [T] { &*Vec::leak(vec![T::default()]) }";
+    let found = mutators(source, "fn_value.one_element", &CfgSet::unconditional());
+
+    assert_eq!(found, vec!["fn_value.one_element"], "{found:?}");
 }
 
 #[test]
@@ -520,8 +581,7 @@ fn values_for_return(ty: &str) -> Vec<String> {
 #[test]
 fn every_return_type_is_served_the_values_that_belong_to_it() {
     // One row per kind the resolver can name. Both halves matter: the mutator says what
-    // question is being asked, and the replacement says whether the type was understood --
-    // `&[u8]` and `&u8` agree on the former and disagree on the latter.
+    // question is being asked, and the replacement says whether the type was understood.
     let cases: &[(&str, &[&str])] = &[
         ("()", &["fn_value.unit=()"]),
         ("bool", &["fn_value.bool_false=false", "fn_value.bool_true=true"]),
@@ -529,10 +589,6 @@ fn every_return_type_is_served_the_values_that_belong_to_it() {
         ("u32", &["fn_value.one=1", "fn_value.zero=0"]),
         ("f32", &["fn_value.minus_one=-1.0", "fn_value.one=1.0", "fn_value.zero=0.0"]),
         ("f64", &["fn_value.minus_one=-1.0", "fn_value.one=1.0", "fn_value.zero=0.0"]),
-        ("&'static str", &["fn_value.empty_string=\"\"", "fn_value.xyzzy_string=\"xyzzy\""]),
-        // No automatic replacement may retain one fresh allocation per invocation.
-        ("&'static mut str", &[]),
-        ("&mut str", &[]),
         (
             "String",
             &["fn_value.empty_string=String::new()", "fn_value.xyzzy_string=\"xyzzy\".to_owned()"],
@@ -544,9 +600,6 @@ fn every_return_type_is_served_the_values_that_belong_to_it() {
                 "fn_value.two=NonZeroU32::new(2).unwrap()",
             ],
         ),
-        ("&'static [u8]", &["fn_value.empty_collection=&[]"]),
-        ("&'static u8", &[]),
-        ("&'static mut u8", &[]),
         (
             "Vec<u8>",
             &[
@@ -587,6 +640,114 @@ fn every_return_type_is_served_the_values_that_belong_to_it() {
 
     for (ty, expected) in cases {
         assert_eq!(values_for_return(ty), *expected, "{ty}");
+    }
+}
+
+#[test]
+fn reference_return_types_are_served_the_values_of_their_referents() {
+    // Shared references promote literal values; mutable references use leaked storage.
+    let cases: &[(&str, &[&str])] = &[
+        ("&'static str", &["fn_value.empty_string=\"\"", "fn_value.xyzzy_string=\"xyzzy\""]),
+        ("&'static ()", &["fn_value.unit=&()"]),
+        ("&'static [u8; 0]", &["fn_value.default=&[]"]),
+        ("&'static mut [u8; 0]", &["fn_value.default=&mut []"]),
+        (
+            "&'static mut str",
+            &[
+                "fn_value.empty_string=Box::leak(String::new().into_boxed_str())",
+                "fn_value.xyzzy_string=Box::leak(String::from(\"xyzzy\").into_boxed_str())",
+            ],
+        ),
+        (
+            "&mut str",
+            &[
+                "fn_value.empty_string=Box::leak(String::new().into_boxed_str())",
+                "fn_value.xyzzy_string=Box::leak(String::from(\"xyzzy\").into_boxed_str())",
+            ],
+        ),
+        (
+            "&'static [u8]",
+            &[
+                "fn_value.empty_collection=&[]",
+                "fn_value.one_element=&[0]",
+                "fn_value.one_element=&[1]",
+            ],
+        ),
+        (
+            "&'static mut [u8]",
+            &[
+                "fn_value.empty_collection=&mut []",
+                "fn_value.one_element=Box::leak(Box::new([0]))",
+                "fn_value.one_element=Box::leak(Box::new([1]))",
+            ],
+        ),
+        ("&'static u8", &["fn_value.one=&1", "fn_value.zero=&0"]),
+        (
+            "&'static mut u8",
+            &["fn_value.one=Box::leak(Box::new(1))", "fn_value.zero=Box::leak(Box::new(0))"],
+        ),
+    ];
+
+    for (ty, expected) in cases {
+        assert_eq!(values_for_return(ty), *expected, "{ty}");
+    }
+}
+
+#[test]
+fn shared_reference_values_promote_only_name_independent_compositions() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "&'static Option<u8>",
+            &[
+                "fn_value.none=&*Box::leak(Box::new(None))",
+                "fn_value.some=&*Box::leak(Box::new(Some(0)))",
+                "fn_value.some=&*Box::leak(Box::new(Some(1)))",
+            ],
+        ),
+        (
+            "&'static (u8, bool)",
+            &[
+                "fn_value.tuple=&(0, false)",
+                "fn_value.tuple=&(0, true)",
+                "fn_value.tuple=&(1, false)",
+                "fn_value.tuple=&(1, true)",
+            ],
+        ),
+        (
+            "&'static [Option<u8>]",
+            &[
+                "fn_value.empty_collection=&[]",
+                "fn_value.one_element=&*Box::leak(Box::new([None]))",
+                "fn_value.one_element=&*Box::leak(Box::new([Some(0)]))",
+                "fn_value.one_element=&*Box::leak(Box::new([Some(1)]))",
+            ],
+        ),
+    ];
+
+    for (ty, expected) in cases {
+        assert_eq!(values_for_return(ty), *expected, "{ty}");
+    }
+}
+
+#[test]
+fn standard_primitive_str_spellings_receive_string_values() {
+    for ty in ["&'static (str)", "&'static core::primitive::str", "&'static ::std::primitive::str"] {
+        assert_eq!(
+            values_for_return(ty),
+            ["fn_value.empty_string=\"\"", "fn_value.xyzzy_string=\"xyzzy\""],
+            "{ty}"
+        );
+    }
+
+    for ty in ["&mut (str)", "&mut core::primitive::str"] {
+        assert_eq!(
+            values_for_return(ty),
+            [
+                "fn_value.empty_string=Box::leak(String::new().into_boxed_str())",
+                "fn_value.xyzzy_string=Box::leak(String::from(\"xyzzy\").into_boxed_str())",
+            ],
+            "{ty}"
+        );
     }
 }
 

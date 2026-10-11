@@ -255,9 +255,10 @@ The same selector language also supports `#[gamma::expect_survived(...)]` and
 These are assertions about the test oracle, not suppressions: governed mutants still run and still
 count normally. Once a governed mutant has a score-bearing outcome, a disagreement fails the
 campaign's correctness gate. `expect_killed` requires `killed`;
-`expect_survived` accepts every undetected outcome — `survived`, `uncovered`, `timeout`, or
-`outofmem` — because its assertion is that the suite did not detect the mutant, not that execution
-completed normally. Unviable, ignored, not-built, flaky, and pending mutants prove neither
+`expect_survived` accepts every undetected outcome — `survived`, `uncovered`, `timeout`,
+`outofmem`, or `leaklimit` — because its assertion is that the suite did not detect
+the mutant, not that execution completed normally. Unviable, ignored, not-built,
+flaky, and pending mutants prove neither
 expectation. An expectation that currently governs no mutant is not reported as an idle
 suppression.
 
@@ -322,6 +323,31 @@ sites can still make the encoding grow superlinearly because enclosing guards re
 original expression.
 
 ### Semantic restraint
+
+Functions returning references can receive whole-body `fn_value` candidates:
+literals for promotable values and leaked allocations for constructible
+referents. Local aliases with type arguments are supported; aliases with const
+parameters and direct references to `impl Trait` are withheld. Unknown
+referents are validated by compilation. Token-identical replacements and a
+narrow boxed-default case are removed as no-ops, while macro and qualified-path
+equivalence is not inferred. `#[gamma::value(...)]` can supply a specific
+reference. Internal expressions remain eligible.
+
+Generated reference leaks are serialized across workers. Shared promotable values
+are borrowed directly, without a leaked allocation; empty mutable slices and
+mutable zero-length arrays use `&mut []`. Every generated leak has
+an in-process allowance of 8192 calls; reaching it yields `leaklimit`, not
+`outofmem` or a test kill. On macOS, the first completed construction establishes
+an RSS baseline and later calls that grow current RSS by at least 64 MiB also
+yield `leaklimit`. This soft check does not bound the first construction or
+the process tree. A function can be called once during an otherwise normal test,
+so one construction is not evidence of repeated leakage. Gamma keeps that
+candidate and treats a one-call OOM as a separate resource problem; the growth
+check addresses repeated calls. Only one mutant is active in each process, so
+its counter and RSS baseline cannot include another mutant. On other hosts,
+generated leaks need an enforced memory ceiling for every reachable
+test binary; without one they remain pending, unless a census proves the site
+has no test coverage.
 
 Instrumentation duplicates source text rather than introducing temporary bindings. A temporary
 could change moves, borrows, short-circuit behavior, or destruction order. The schema may affect
@@ -1111,6 +1137,7 @@ A verdict states what evidence the campaign obtained:
 | `killed` | A relevant test failed with the mutant active | Detected |
 | `timeout` | The mutant exceeded a confirmed time or stall budget before an assertion rejected it | Undetected |
 | `outofmem` | The mutant exceeded its memory ceiling before an assertion rejected it | Undetected |
+| `leaklimit` | The generated reference leak guard reached its call or RSS growth allowance before an assertion rejected it | Undetected |
 | `survived` | Every relevant test passed | Undetected |
 | `uncovered` | No test reached the mutation site | Undetected |
 | `unviable` | The mutation could not compile | Excluded |
@@ -1125,9 +1152,9 @@ The mutation score is:
 detected / (detected + undetected)
 ```
 
-Only `killed` enters the numerator. Timeouts and memory exhaustion establish that the mutant
-changed resource behavior, but they remain undetected because no test assertion rejected the
-change. Consequently, `--min-score 100` fails closed on either outcome.
+Only `killed` enters the numerator. Timeouts, memory exhaustion, and reference
+leak guard limits remain undetected because no test assertion rejected the
+change. Consequently, `--min-score 100` fails closed on all three outcomes.
 
 Flaky outcomes remain outside that percentage because they are inconclusive, but `--max-flaky`
 provides an independent run and merge gate. The default has no flaky budget; a configured value
@@ -1202,7 +1229,8 @@ The mutant panel uses an adaptive waffle: one cell per mutant through 100 mutant
 terminal widths while giving each cell an approximately one-percent meaning; the gutter is the
 smallest spacing that keeps label and value columns visually distinct across all layouts. Its
 legend reports unviable, pending, killed, survived,
-timed-out, out-of-memory, flaky, and uncovered counts in that order, plus the mutation score.
+timed-out, out-of-memory, reference-leak-limit, flaky, and uncovered counts in
+that order, plus the mutation score.
 The hints panel reports only explicit and inferred hint counts and hit rates. The execution panel
 reports binary count, busy workers, recent throughput, whole and filtered selections,
 average and maximum selection runtime, selections per completed mutant, the measured baseline memory peak
@@ -1235,8 +1263,8 @@ native separators. Hints promotion is recommended only when the successfully per
 state is resolvable through the same locator used by the command and would add, correct, or remove
 exact killer or compiler-ordering knowledge in the checked-in hints artifact. Generalized
 seed/transfer counter churn alone does not trigger the reminder. Suppression is recommended only
-when that same resolvable state contains the timeout or out-of-memory outcomes the command will
-consume.
+when that same resolvable state contains timeout, out-of-memory, or
+reference-leak-limit outcomes the command will consume.
 Incomplete, truncated, or unsaved output is labelled `warning`. Routine internal adjustments are
 silent.
 

@@ -6,7 +6,41 @@
 use rustc_lexer::{LiteralKind, TokenKind};
 
 use super::super::defaults::DefaultPaths;
+use super::indexes::ABSOLUTE_ROOT;
+use crate::HashMap;
 use crate::ops::collect::Shape;
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct QualifiedBoxPaths {
+    std: bool,
+    alloc: bool,
+}
+
+impl QualifiedBoxPaths {
+    pub(super) fn in_scope(imports: &HashMap<String, Option<Vec<String>>>, generics: &[String], defaulted: &[String]) -> Self {
+        if generics.iter().chain(defaulted).any(|name| name == "Box") {
+            return Self::default();
+        }
+
+        let bare_box_is_standard = match imports.get("Box") {
+            None => !imports.contains_key("*"),
+            Some(Some(path)) => {
+                let path = if path.first().is_some_and(|segment| segment == ABSOLUTE_ROOT) {
+                    &path[1..]
+                } else {
+                    path.as_slice()
+                };
+                matches!(path, [root, boxed, name] if matches!(root.as_str(), "std" | "alloc") && boxed == "boxed" && name == "Box")
+            }
+            Some(None) => false,
+        };
+
+        Self {
+            std: bare_box_is_standard && !imports.contains_key("std"),
+            alloc: bare_box_is_standard && !imports.contains_key("alloc"),
+        }
+    }
+}
 
 /// Returns whether a replacement reproduces the code it would replace.
 ///
@@ -29,7 +63,14 @@ use crate::ops::collect::Shape;
 /// only in how the value inside spells its default: a type parameter explicitly bounded by the
 /// standard `Default` trait can write `T::default()` instead of `Default::default()`. Those are
 /// the same call, so the mutant is the original program under another name.
-pub(super) fn is_noop(replacement: &str, original: &str, shape: Shape, defaults: &DefaultPaths, defaulted_types: &[String]) -> bool {
+pub(super) fn is_noop(
+    replacement: &str,
+    original: &str,
+    shape: Shape,
+    defaults: &DefaultPaths,
+    defaulted_types: &[String],
+    qualified_box: QualifiedBoxPaths,
+) -> bool {
     let original = if matches!(shape, Shape::Block | Shape::IterBlock) {
         let trimmed = original.trim();
 
@@ -45,7 +86,7 @@ pub(super) fn is_noop(replacement: &str, original: &str, shape: Shape, defaults:
         return true;
     }
 
-    is_same_leak(replacement, original, defaults, defaulted_types)
+    is_same_leak(replacement, original, defaults, defaulted_types, qualified_box)
 }
 
 /// Returns whether two expressions are the same `Box::leak(Box::new(...))`, up to how the value
@@ -53,7 +94,13 @@ pub(super) fn is_noop(replacement: &str, original: &str, shape: Shape, defaults:
 ///
 /// Deliberately narrow: it answers for this one shape and nothing else, rather than pretending to
 /// decide equivalence in general.
-pub(super) fn is_same_leak(replacement: &str, original: &str, defaults: &DefaultPaths, defaulted_types: &[String]) -> bool {
+pub(super) fn is_same_leak(
+    replacement: &str,
+    original: &str,
+    defaults: &DefaultPaths,
+    defaulted_types: &[String],
+    qualified_box: QualifiedBoxPaths,
+) -> bool {
     // Every match requires the terminal method identifier checked later by `path_ends_with` in
     // both expressions, so its absence from either raw text rules out a match without tokenizing
     // either one. Almost no replacement or original has this shape, so this skips the two token
@@ -62,8 +109,22 @@ pub(super) fn is_same_leak(replacement: &str, original: &str, defaults: &Default
         return false;
     }
 
-    let (Some(replacement), Some(original)) = (leaked_value(replacement), leaked_value(original)) else {
-        return false;
+    let (replacement, original) = if let (Some(replacement), Some(original)) = (
+        leaked_value_with_paths(replacement, qualified_box),
+        leaked_value_with_paths(original, qualified_box),
+    ) {
+        (replacement, original)
+    } else {
+        let (Some(replacement), Some(original)) = (some_argument(replacement), some_argument(original)) else {
+            return false;
+        };
+        let (Some(replacement), Some(original)) = (
+            leaked_value_with_paths(replacement, qualified_box),
+            leaked_value_with_paths(original, qualified_box),
+        ) else {
+            return false;
+        };
+        (replacement, original)
     };
 
     if is_default_call(replacement, defaults, defaulted_types) && is_default_call(original, defaults, defaulted_types) {
@@ -71,6 +132,10 @@ pub(super) fn is_same_leak(replacement: &str, original: &str, defaults: &Default
     }
 
     same_tokens(replacement, original)
+        || matches!(
+            (some_argument(replacement), some_argument(original)),
+            (Some(replacement), Some(original)) if is_same_leak(replacement, original, defaults, defaulted_types, qualified_box)
+        )
 }
 
 /// The value a `Box::leak(Box::new(value))` leaks, or `None` for any other expression.
@@ -79,7 +144,12 @@ pub(super) fn is_same_leak(replacement: &str, original: &str, defaults: &Default
 /// without this the reborrow would hide the shape from the no-op check — so a body that already
 /// leaks a default would be handed a mutant that is the same program, and it would survive every
 /// suite that will ever be written.
+#[cfg(test)]
 pub(super) fn leaked_value(text: &str) -> Option<&str> {
+    leaked_value_with_paths(text, QualifiedBoxPaths::default())
+}
+
+fn leaked_value_with_paths(text: &str, qualified_box: QualifiedBoxPaths) -> Option<&str> {
     let tokens = lexemes(text)?;
     let mut expression = strip_parentheses(&tokens);
 
@@ -87,10 +157,15 @@ pub(super) fn leaked_value(text: &str) -> Option<&str> {
         expression = strip_parentheses(expression.get(2..)?);
     }
 
-    let leaked = call_argument(text, expression, "Box", "leak")?;
+    let leaked = call_argument_with_paths(text, expression, "Box", "leak", qualified_box)?;
     let tokens = lexemes(leaked)?;
 
-    call_argument(leaked, strip_parentheses(&tokens), "Box", "new")
+    call_argument_with_paths(leaked, strip_parentheses(&tokens), "Box", "new", qualified_box)
+}
+
+fn some_argument(text: &str) -> Option<&str> {
+    let tokens = lexemes(text)?;
+    call_argument(text, strip_parentheses(&tokens), "", "Some")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -102,11 +177,23 @@ struct Lexeme<'a> {
 }
 
 fn call_argument<'a>(text: &'a str, expression: &[Lexeme<'a>], qualifier: &str, name: &str) -> Option<&'a str> {
+    call_argument_with_paths(text, expression, qualifier, name, QualifiedBoxPaths::default())
+}
+
+fn call_argument_with_paths<'a>(
+    text: &'a str,
+    expression: &[Lexeme<'a>],
+    qualifier: &str,
+    name: &str,
+    qualified_box: QualifiedBoxPaths,
+) -> Option<&'a str> {
     let expression = strip_parentheses(expression);
     let open = expression.iter().position(|token| token.kind == TokenKind::OpenParen)?;
     let (callee, call) = expression.split_at(open);
 
-    if !path_ends_with(callee, qualifier, name) || call.last()?.kind != TokenKind::CloseParen {
+    if !(path_ends_with(callee, qualifier, name) || standard_box_path(callee, qualifier, name, qualified_box))
+        || call.last()?.kind != TokenKind::CloseParen
+    {
         return None;
     }
 
@@ -133,12 +220,29 @@ fn call_argument<'a>(text: &'a str, expression: &[Lexeme<'a>], qualifier: &str, 
     text.get(argument.first()?.start..argument.last()?.end)
 }
 
+fn standard_box_path(path: &[Lexeme<'_>], qualifier: &str, name: &str, allowed: QualifiedBoxPaths) -> bool {
+    if qualifier != "Box" || !matches!(name, "leak" | "new") {
+        return false;
+    }
+    let Some(segments) = path_segments(path) else {
+        return false;
+    };
+    matches!(segments.as_slice(), ["std", "boxed", "Box", method] if allowed.std && *method == name)
+        || matches!(segments.as_slice(), ["alloc", "boxed", "Box", method] if allowed.alloc && *method == name)
+}
+
 fn path_ends_with(path: &[Lexeme<'_>], qualifier: &str, name: &str) -> bool {
     let Some(segments) = path_segments(path) else {
         return false;
     };
 
-    matches!(segments.as_slice(), [.., found_qualifier, found_name] if *found_qualifier == qualifier && *found_name == name)
+    // The generated constructor is bare. A qualified path may resolve to a different
+    // type with the same final names, so its payload is not proof of a no-op.
+    (if qualifier.is_empty() {
+        matches!(segments.as_slice(), [found_name] if *found_name == name)
+    } else {
+        matches!(segments.as_slice(), [found_qualifier, found_name] if *found_qualifier == qualifier && *found_name == name)
+    }) && path.first().is_some_and(|token| token.kind != TokenKind::Colon)
 }
 
 fn path_segments<'a>(path: &[Lexeme<'a>]) -> Option<Vec<&'a str>> {
@@ -343,6 +447,21 @@ const fn is_word(kind: TokenKind) -> bool {
 mod tests {
     use super::*;
 
+    fn is_noop(replacement: &str, original: &str, shape: Shape, defaults: &DefaultPaths, defaulted_types: &[String]) -> bool {
+        super::is_noop(
+            replacement,
+            original,
+            shape,
+            defaults,
+            defaulted_types,
+            QualifiedBoxPaths::default(),
+        )
+    }
+
+    fn is_same_leak(replacement: &str, original: &str, defaults: &DefaultPaths, defaulted_types: &[String]) -> bool {
+        super::is_same_leak(replacement, original, defaults, defaulted_types, QualifiedBoxPaths::default())
+    }
+
     fn defaults() -> DefaultPaths {
         DefaultPaths::of(&syn::parse_file("").expect("an empty file parses"))
     }
@@ -457,7 +576,7 @@ mod tests {
 
         let absolute = "::alloc::boxed::Box::new";
         let absolute_tokens = lexemes(absolute).expect("the absolute path tokenizes");
-        assert!(path_ends_with(&absolute_tokens, "Box", "new"));
+        assert!(!path_ends_with(&absolute_tokens, "Box", "new"));
         assert!(!path_ends_with(&absolute_tokens, "Vec", "new"));
 
         let interrupted_leading_colon = ": + Box::new";

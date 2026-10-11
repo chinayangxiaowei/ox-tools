@@ -33,6 +33,7 @@ mod error;
 pub mod model;
 pub mod ops;
 pub mod parse;
+pub mod reference_leak;
 pub mod schema;
 pub mod text;
 

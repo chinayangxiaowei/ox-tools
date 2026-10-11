@@ -120,6 +120,7 @@ const fn outcome_style(outcome: Outcome) -> (&'static str, Style) {
         // wrong with the run rather than with the code: a ceiling too tight convicts healthy
         // mutants, and that has to be noticeable rather than blend into the killed ones.
         Outcome::OutOfMemory => ("OUTOFMEM", Style::new().magenta().bold()),
+        Outcome::LeakLimit => ("LEAKLIMIT", Style::new().magenta().bold()),
         // Bold for the same reason again, and pointing at the suite rather than the mutant: a
         // flake is the one outcome whose remedy is to go and fix a test that is already there.
         Outcome::Flaky => ("FLAKY", Style::new().yellow().bold()),
@@ -143,6 +144,7 @@ mod tests {
             Outcome::Survived,
             Outcome::Timeout,
             Outcome::OutOfMemory,
+            Outcome::LeakLimit,
             Outcome::CompileError,
             Outcome::NoCoverage,
             Outcome::Ignored,

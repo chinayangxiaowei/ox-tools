@@ -395,8 +395,9 @@ outcome is established again: unchanged inputs cannot prove that a test result i
 Set it below where you are today and ratchet upwards. A gate set above the current score turns every
 build red on the day it lands, and a gate that is red by default gets switched off within a week.
 Only mutants rejected by a failing test assertion enter the score's numerator. Survivors,
-uncovered mutants, timeouts, and out-of-memory mutants remain in its denominator, so
-`min-score = 100.0` fails closed on any of those outcomes.
+uncovered mutants, timeouts, out-of-memory mutants, and reference-leak-limit
+mutants remain in its denominator, so `min-score = 100.0` fails closed on any of
+those outcomes.
 If any selected mutant remains pending, either gate fails as incomplete rather than evaluating a
 score or flaky count over only the completed subset.
 `max-flaky` is independent of the score because flaky outcomes are inconclusive and excluded from

@@ -13,6 +13,8 @@ pub struct Summary {
     pub survived: u32,
     pub timeout: u32,
     pub out_of_memory: u32,
+    #[serde(default)]
+    pub leak_limit: u32,
 
     /// Mutants whose judging test failed with no mutant active as well as with one.
     pub flaky: u32,
@@ -36,6 +38,7 @@ impl Summary {
                 Outcome::Survived => &mut summary.survived,
                 Outcome::Timeout => &mut summary.timeout,
                 Outcome::OutOfMemory => &mut summary.out_of_memory,
+                Outcome::LeakLimit => &mut summary.leak_limit,
                 Outcome::Flaky => &mut summary.flaky,
                 Outcome::CompileError => &mut summary.unviable,
                 Outcome::Ignored => &mut summary.ignored,
@@ -63,6 +66,7 @@ impl Summary {
             Outcome::Survived => self.survived,
             Outcome::Timeout => self.timeout,
             Outcome::OutOfMemory => self.out_of_memory,
+            Outcome::LeakLimit => self.leak_limit,
             Outcome::Flaky => self.flaky,
             Outcome::CompileError => self.unviable,
             Outcome::Ignored => self.ignored,
@@ -75,7 +79,7 @@ impl Summary {
     /// Number of mutants that count toward the score.
     #[must_use]
     pub const fn valid(self) -> u32 {
-        self.killed + self.survived + self.timeout + self.out_of_memory + self.uncovered
+        self.killed + self.survived + self.timeout + self.out_of_memory + self.leak_limit + self.uncovered
     }
 
     /// Number of mutants a failing test assertion detected.
@@ -93,9 +97,9 @@ impl Summary {
     /// tests that run it did not notice", so the two are never merged in a report. *How much* of
     /// the code is defended is a single number, and code no test reaches is undefended.
     ///
-    /// Timeout and out-of-memory verdicts remain in the denominator because no assertion rejected
-    /// them. Reports export those outcomes as schema `Survived` with a reason preserving the
-    /// distinction, so the standard report UI computes the same score.
+    /// Timeout, out-of-memory, and reference leak limit verdicts remain in the denominator
+    /// because no assertion rejected them. Reports export those outcomes as schema `Survived`
+    /// with a reason preserving the distinction, so the standard report UI computes the same score.
     #[must_use]
     pub fn score(self) -> f64 {
         let valid = self.valid();

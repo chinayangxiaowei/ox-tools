@@ -92,10 +92,23 @@ configuration and therefore audits the whole file.
   cannot be borrowed as evidence for the local shadow.
   Unsized standard wrappers use shape-specific constructors, opaque iterators
   retain iterator-shaped replacements, and tuple/collection products require
-  evidence for every member. Shared empty slices may use `&[]`; arbitrary shared or mutable
-  references are not fabricated with `Box::leak`, and mutable string slices
-  receive no automatic replacement because the only source-independent
-  construction would leak once per invocation.
+  evidence for every member. Shared reference returns borrow literals and their
+  name-independent tuple or array compositions directly; empty mutable slices
+  and mutable zero-length arrays use `&mut []`. Enum variants and other constructible
+  referents use `Box::leak`, with an explicit shared
+  reborrow when needed. Instrumentation watches every generated reference leak
+  in its active guard arm, counting calls and sampling repeated RSS growth on
+  macOS. Candidate names and replacements retain their original text for
+  listing and no-op comparison.
+  Local type aliases are instantiated before recognizing reference and referent
+  shapes, including default type arguments; const-parameterized aliases are
+  withheld because const substitution is unsupported. Unknown referents remain
+  optimistic and are checked by compilation. Direct `&impl Trait` returns are
+  withheld because their concrete referent type is fixed by the original body.
+  No-op detection compares tokens and a narrow boxed-default form. Standard-qualified
+  `Box` paths are treated as equivalent to bare `Box` only when the in-scope
+  bindings establish that neither name is shadowed. Other qualified paths and
+  macro meanings remain unknown.
 - Statement and loop deletion is gated only for concrete intra-procedural
   compile hazards: deferred-binding initialization, explicit `drop` calls, and
   branch/loop type transitions already proven by local syntax. The divergent

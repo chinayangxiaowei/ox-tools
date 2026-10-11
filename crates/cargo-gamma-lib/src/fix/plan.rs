@@ -259,24 +259,26 @@ mod tests {
 
     /// Coalescing stops at the tag, because the tag is a claim about why the mutant was stopped.
     ///
-    /// One site can hold a mutant that hung and a mutant that ran the machine out of memory, and
-    /// both are eligible by default. Folding them into one directive would file one of them under a
+    /// One site can hold mutants stopped by time, memory, and reference leak limits, and all
+    /// are eligible by default. Folding them into one directive would file one of them under a
     /// verdict it never had, and the tag is the whole basis on which a report groups suppressions.
     #[test]
-    fn one_site_stopped_for_two_reasons_gets_one_directive_for_each() {
+    fn one_site_stopped_for_three_reasons_gets_one_directive_for_each() {
         let mutants = vec![
             mutant("aaa", "src/lib.rs", 9, "stmt.delete", Outcome::Timeout),
             mutant("bbb", "src/lib.rs", 9, "arith.add_to_sub", Outcome::OutOfMemory),
+            mutant("ccc", "src/lib.rs", 9, "fn_value.default", Outcome::LeakLimit),
         ];
 
-        let edits = plan(&mutants, &[Eligible::Timeout, Eligible::OutOfMemory]);
+        let edits = plan(&mutants, &[Eligible::Timeout, Eligible::OutOfMemory, Eligible::LeakLimit]);
 
-        assert_eq!(edits.len(), 2, "one directive per reason");
+        assert_eq!(edits.len(), 3, "one directive per reason");
 
         let tags: Vec<&str> = edits.iter().map(|edit| edit.tag).collect();
 
         assert!(tags.contains(&"timeout"), "{tags:?}");
         assert!(tags.contains(&"outofmem"), "{tags:?}");
+        assert!(tags.contains(&"leaklimit"), "{tags:?}");
 
         for edit in &edits {
             assert_eq!(edit.line, 9);

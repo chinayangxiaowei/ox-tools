@@ -315,6 +315,177 @@ fn selection_from(census: CensusRequest, active: impl FnOnce() -> Result<u32, ()
 /// status. It is public because the vendored runtime and its parent must share one protocol value.
 pub const ENVIRONMENT_ERROR_MARKER: &[u8] = b"cargo-gamma: startup environment acquisition failed\n";
 
+/// Diagnostic emitted when a generated reference mutant exhausts its per-process leak allowance.
+/// The coordinator uses the reach-file receipt below to classify the verdict.
+pub const REFERENCE_LEAK_LIMIT_MARKER: &[u8] = b"cargo-gamma: generated reference leak allowance exhausted\n";
+
+/// Diagnostic emitted when the runtime cannot record why a generated reference test stopped.
+/// The coordinator leaves the mutant pending instead of crediting a test failure.
+pub const REFERENCE_LEAK_RECEIPT_ERROR_MARKER: &[u8] = b"cargo-gamma: generated reference leak receipt failed\n";
+
+/// Maximum number of generated reference leaks admitted in one test process.
+pub const REFERENCE_LEAK_LIMIT: u32 = 8192;
+
+/// Record written to the reach file immediately before a generated reference leak stops a test.
+/// It is outside the range of site ordinals and distinct from the census integrity markers.
+pub const REFERENCE_LEAK_LIMIT_RECORD: u32 = u32::MAX - 4;
+
+static REFERENCE_LEAK_COUNT: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_os = "macos")]
+static REFERENCE_LEAK_FIRST_RSS: AtomicUsize = AtomicUsize::new(0);
+
+/// Constructs one generated reference replacement under a process-local resource allowance.
+///
+/// The first call is allowed to construct its value before establishing an RSS baseline: one
+/// construction may be normal, and a one-call OOM is a separate resource problem. Later calls
+/// are sampled on macOS, where the coordinator has no enforced process-tree memory limit.
+/// The sample is only a growth signal; an exhausted allowance is a resource outcome, not a test
+/// assertion against the mutant. One constructor or a descendant can still exhaust memory before
+/// this process-local sample runs.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn watch_reference_leak<R>(construct: impl FnOnce() -> R) -> R {
+    charge_reference_leak();
+    let value = construct();
+    #[cfg(target_os = "macos")]
+    if current_resident_bytes().is_some_and(|rss| reference_leak_rss_exhausted(&REFERENCE_LEAK_FIRST_RSS, rss)) {
+        reference_leak_exhausted();
+    }
+    value
+}
+
+#[cfg(target_os = "macos")]
+fn reference_leak_rss_exhausted(baseline: &AtomicUsize, rss: usize) -> bool {
+    let first = baseline.load(Ordering::Relaxed);
+    let first = if first == 0 {
+        // A concurrent first call may have set the baseline after our load. Judge this sample
+        // against the winner rather than treating the failed installation as an admitted first call.
+        match baseline.compare_exchange(0, rss, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return false,
+            Err(established) => established,
+        }
+    } else {
+        first
+    };
+
+    matches!(reference_leak_rss_decision(first, rss), ReferenceLeakRssDecision::Exhausted)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+enum ReferenceLeakRssDecision {
+    EstablishBaseline,
+    Continue,
+    Exhausted,
+}
+
+#[cfg(target_os = "macos")]
+fn reference_leak_rss_decision(first: usize, current: usize) -> ReferenceLeakRssDecision {
+    if first == 0 {
+        ReferenceLeakRssDecision::EstablishBaseline
+    } else if current.saturating_sub(first) >= 64 * 1024 * 1024 {
+        ReferenceLeakRssDecision::Exhausted
+    } else {
+        ReferenceLeakRssDecision::Continue
+    }
+}
+
+/// Current process RSS in bytes from Darwin's `proc_pid_rusage` v0 structure.
+#[cfg(target_os = "macos")]
+fn current_resident_bytes() -> Option<usize> {
+    #[repr(C)]
+    struct RusageInfoV0 {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        proc_start_abstime: u64,
+        proc_exit_abstime: u64,
+    }
+
+    let mut usage = core::mem::MaybeUninit::<RusageInfoV0>::uninit();
+    // SAFETY: `getpid` needs no arguments and reads only the current process identity.
+    let pid = unsafe { getpid() };
+    // SAFETY: `usage` points to a writable Darwin v0 structure. The structure is read only when
+    // `proc_pid_rusage` reports success.
+    let status = unsafe { proc_pid_rusage(pid, 0, usage.as_mut_ptr().cast()) };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: a successful `proc_pid_rusage` filled the entire v0 structure.
+    usize::try_from(unsafe { usage.assume_init() }.resident_size).ok()
+}
+
+/// Charges one generated reference leak before it allocates.
+///
+/// At most 8192 such calls can be admitted in one process, including concurrent test threads.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn charge_reference_leak() {
+    charge_reference_leak_with(&REFERENCE_LEAK_COUNT, |_| {
+        #[cfg(any(unix, windows))]
+        reference_leak_exhausted();
+
+        #[cfg(not(any(unix, windows)))]
+        panic!("generated reference leak allowance exhausted");
+    });
+}
+
+/// A reach-file receipt distinguishes the runtime's termination from text printed by a test.
+/// The coordinator supplies a fresh file for every active mutant run, including nextest runs
+/// whose outer process does not expose the test child's exit status.
+#[cfg(any(unix, windows))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn reference_leak_exhausted() -> ! {
+    let stream = open();
+    reference_leak_exhausted_with(
+        (!stream.is_null()).then_some(stream),
+        |stream| write_record(REFERENCE_LEAK_LIMIT_RECORD, *stream),
+        |stream| {
+            // SAFETY: `open` returned a live stream owned by this call. `fclose` flushes pending
+            // writes and closes the stream; its result includes failure of that final flush.
+            unsafe { fclose(stream) == 0 }
+        },
+        |marker| terminate_with_marker(marker),
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn reference_leak_exhausted_with<S, R>(
+    stream: Option<S>,
+    write: impl FnOnce(&S) -> bool,
+    close: impl FnOnce(S) -> bool,
+    terminate: impl FnOnce(&'static [u8]) -> R,
+) -> R {
+    let recorded = stream.is_some_and(|stream| {
+        let written = write(&stream);
+        // Close even after a failed write, and observe errors from the final flush.
+        let closed = close(stream);
+        written && closed
+    });
+    terminate(if recorded {
+        REFERENCE_LEAK_LIMIT_MARKER
+    } else {
+        REFERENCE_LEAK_RECEIPT_ERROR_MARKER
+    })
+}
+
+fn charge_reference_leak_with(count: &AtomicU32, on_exhausted: impl FnOnce(&'static [u8])) {
+    if count
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, next_reference_leak_count)
+        .is_err()
+    {
+        on_exhausted(REFERENCE_LEAK_LIMIT_MARKER);
+    }
+}
+
+fn next_reference_leak_count(count: u32) -> Option<u32> {
+    (count < REFERENCE_LEAK_LIMIT).then(|| count + 1)
+}
+
 /// The diagnostic emitted when instrumented code runs before this runtime's constructor.
 pub const PRE_INSTALL_ERROR_MARKER: &[u8] =
     b"gamma_rt: a guard executed before this crate's own constructor installed the runtime selection\n";
@@ -1149,6 +1320,13 @@ unsafe extern "C" {
     fn exit_immediately(status: c_int) -> !;
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn getpid() -> c_int;
+
+    fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
+}
+
 #[cfg(all(unix, any(test, not(target_os = "linux"))))]
 unsafe extern "C" {
     /// The C library's `getenv`, whose signature is fixed by POSIX. Declared here rather than
@@ -1292,7 +1470,7 @@ unsafe extern "C" {
     #[cfg(test)]
     fn tmpfile() -> *mut c_void;
 
-    #[cfg(test)]
+    /// Closes the separate append stream used for a reference-leak termination receipt.
     fn fclose(stream: *mut c_void) -> c_int;
 }
 
@@ -2229,6 +2407,101 @@ mod tests {
     #[test]
     fn none_is_zero_so_unset_means_baseline() {
         assert_eq!(NONE, 0);
+    }
+
+    #[test]
+    fn reference_leak_admission_stops_at_the_limit_with_a_resource_marker() {
+        let count = AtomicU32::new(REFERENCE_LEAK_LIMIT - 1);
+        charge_reference_leak_with(&count, |_| core::panic!("the last admitted call cannot exhaust the allowance"));
+        assert_eq!(count.load(Ordering::Relaxed), REFERENCE_LEAK_LIMIT);
+
+        let mut marker = None;
+        charge_reference_leak_with(&count, |value| marker = Some(value));
+        assert_eq!(count.load(Ordering::Relaxed), REFERENCE_LEAK_LIMIT);
+        assert_eq!(
+            marker,
+            Some(b"cargo-gamma: generated reference leak allowance exhausted\n".as_slice())
+        );
+
+        let saturated = AtomicU32::new(u32::MAX);
+        charge_reference_leak_with(&saturated, |value| marker = Some(value));
+        assert_eq!(saturated.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(
+            marker,
+            Some(b"cargo-gamma: generated reference leak allowance exhausted\n".as_slice())
+        );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn reference_leak_receipt_errors_are_reported_after_closing_the_stream() {
+        use core::cell::RefCell;
+
+        for (stream, written, closed, expected) in [
+            (None, false, false, REFERENCE_LEAK_RECEIPT_ERROR_MARKER),
+            (Some(()), false, true, REFERENCE_LEAK_RECEIPT_ERROR_MARKER),
+            (Some(()), true, false, REFERENCE_LEAK_RECEIPT_ERROR_MARKER),
+            (Some(()), false, false, REFERENCE_LEAK_RECEIPT_ERROR_MARKER),
+            (Some(()), true, true, REFERENCE_LEAK_LIMIT_MARKER),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let marker = reference_leak_exhausted_with(
+                stream,
+                |()| {
+                    calls.borrow_mut().push("write");
+                    written
+                },
+                |()| {
+                    calls.borrow_mut().push("close");
+                    closed
+                },
+                |marker| {
+                    calls.borrow_mut().push("terminate");
+                    marker
+                },
+            );
+            assert_eq!(marker, expected);
+            let expected_calls: &[&str] = if stream.is_some() {
+                &["write", "close", "terminate"]
+            } else {
+                &["terminate"]
+            };
+            assert_eq!(calls.into_inner(), expected_calls);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn first_reference_construction_sets_a_baseline_before_growth_is_judged() {
+        use super::{ReferenceLeakRssDecision, reference_leak_rss_decision};
+
+        let mib = 1024 * 1024;
+        assert_eq!(
+            reference_leak_rss_decision(0, 1024 * mib),
+            ReferenceLeakRssDecision::EstablishBaseline
+        );
+        assert_eq!(
+            reference_leak_rss_decision(1024 * mib, 1088 * mib - 1),
+            ReferenceLeakRssDecision::Continue
+        );
+        assert_eq!(
+            reference_leak_rss_decision(1024 * mib, 1088 * mib),
+            ReferenceLeakRssDecision::Exhausted
+        );
+        assert_eq!(
+            reference_leak_rss_decision(1024 * mib, 512 * mib),
+            ReferenceLeakRssDecision::Continue
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_established_reference_baseline_checks_the_current_sample() {
+        let mib = 1024 * 1024;
+        let baseline = AtomicUsize::new(1024 * mib);
+
+        assert!(reference_leak_rss_exhausted(&baseline, 1088 * mib));
+        assert_eq!(baseline.load(Ordering::Relaxed), 1024 * mib);
     }
 
     #[test]

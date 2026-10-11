@@ -52,6 +52,7 @@ enum WaffleState {
     Survived,
     Timeout,
     OutOfMemory,
+    LeakLimit,
     Flaky,
     Uncovered,
 }
@@ -65,6 +66,7 @@ impl WaffleState {
             Self::Survived => "Survived",
             Self::Timeout => "Timed out",
             Self::OutOfMemory => "Out of mem",
+            Self::LeakLimit => "Leak limit",
             Self::Flaky => "Flaky",
             Self::Uncovered => "Uncovered",
         }
@@ -78,6 +80,7 @@ impl WaffleState {
             Self::Survived => "SS",
             Self::Timeout => "TT",
             Self::OutOfMemory => "OO",
+            Self::LeakLimit => "LL",
             Self::Flaky => "FF",
             Self::Uncovered => "CC",
         }
@@ -91,6 +94,7 @@ impl WaffleState {
             Self::Survived => Style::new().red().bold(),
             Self::Timeout => Style::new().yellow(),
             Self::OutOfMemory => Style::new().magenta().bold(),
+            Self::LeakLimit => Style::new().magenta(),
             Self::Flaky => Style::new().bright_yellow(),
             Self::Uncovered => Style::new().blue(),
         }
@@ -358,6 +362,7 @@ impl Dashboard {
             Outcome::Survived => self.summary.survived = self.summary.survived.saturating_add(1),
             Outcome::Timeout => self.summary.timeout = self.summary.timeout.saturating_add(1),
             Outcome::OutOfMemory => self.summary.out_of_memory = self.summary.out_of_memory.saturating_add(1),
+            Outcome::LeakLimit => self.summary.leak_limit = self.summary.leak_limit.saturating_add(1),
             Outcome::Flaky => self.summary.flaky = self.summary.flaky.saturating_add(1),
             Outcome::CompileError => self.summary.unviable = self.summary.unviable.saturating_add(1),
             Outcome::Ignored => self.summary.ignored = self.summary.ignored.saturating_add(1),
@@ -516,11 +521,12 @@ impl Dashboard {
             self.labelled(
                 "Mutants",
                 &format!(
-                    "K {} · S {} · T {} · OOM {} · F {} · U {} · P {}",
+                    "K {} · S {} · T {} · OOM {} · LL {} · F {} · U {} · P {}",
                     self.summary.killed,
                     self.summary.survived,
                     self.summary.timeout,
                     self.summary.out_of_memory,
+                    self.summary.leak_limit,
                     self.summary.flaky,
                     self.summary.uncovered,
                     self.summary.pending
@@ -552,11 +558,12 @@ impl Dashboard {
             self.labelled(
                 "Mutants",
                 &format!(
-                    "killed {} · survived {} · timeout {} · OOM {} · flaky {} · uncovered {} · pending {}",
+                    "killed {} · survived {} · timeout {} · OOM {} · leak limit {} · flaky {} · uncovered {} · pending {}",
                     self.summary.killed,
                     self.summary.survived,
                     self.summary.timeout,
                     self.summary.out_of_memory,
+                    self.summary.leak_limit,
                     self.summary.flaky,
                     self.summary.uncovered,
                     self.summary.pending
@@ -682,7 +689,7 @@ impl Dashboard {
         panel("TEST EXECUTION", &content, self.styler)
     }
 
-    fn classifications(&self) -> [(WaffleState, usize); 8] {
+    fn classifications(&self) -> [(WaffleState, usize); 9] {
         [
             (WaffleState::Unviable, self.summary.unviable as usize),
             (WaffleState::Pending, self.summary.pending as usize),
@@ -690,6 +697,7 @@ impl Dashboard {
             (WaffleState::Survived, self.summary.survived as usize),
             (WaffleState::Timeout, self.summary.timeout as usize),
             (WaffleState::OutOfMemory, self.summary.out_of_memory as usize),
+            (WaffleState::LeakLimit, self.summary.leak_limit as usize),
             (WaffleState::Flaky, self.summary.flaky as usize),
             (WaffleState::Uncovered, self.summary.uncovered as usize),
         ]
@@ -748,6 +756,7 @@ impl Dashboard {
             self.summary.survived,
             self.summary.timeout,
             self.summary.out_of_memory,
+            self.summary.leak_limit,
             self.summary.flaky,
             self.summary.uncovered,
             self.summary.pending,
@@ -937,6 +946,7 @@ mod tests {
             survived: 4,
             timeout: 2,
             out_of_memory: 1,
+            leak_limit: 0,
             flaky: 1,
             unviable: 10,
             ignored: 2,
@@ -1347,8 +1357,8 @@ mod tests {
     #[test]
     fn recording_each_outcome_updates_the_matching_counter() {
         let mut dashboard = Dashboard::new(true, None, Styler::new(false));
-        dashboard.summary.pending = 9;
-        for _ in 0..9 {
+        dashboard.summary.pending = 10;
+        for _ in 0..10 {
             dashboard.mutant_started();
         }
         dashboard.testing_status("running".to_owned());
@@ -1357,6 +1367,7 @@ mod tests {
             Outcome::Survived,
             Outcome::Timeout,
             Outcome::OutOfMemory,
+            Outcome::LeakLimit,
             Outcome::Flaky,
             Outcome::CompileError,
             Outcome::Ignored,
@@ -1371,13 +1382,14 @@ mod tests {
         assert_eq!(dashboard.summary.survived, 1);
         assert_eq!(dashboard.summary.timeout, 1);
         assert_eq!(dashboard.summary.out_of_memory, 1);
+        assert_eq!(dashboard.summary.leak_limit, 1);
         assert_eq!(dashboard.summary.flaky, 1);
         assert_eq!(dashboard.summary.unviable, 1);
         assert_eq!(dashboard.summary.ignored, 1);
         assert_eq!(dashboard.summary.uncovered, 1);
         assert_eq!(dashboard.summary.not_built, 1);
         assert_eq!(dashboard.summary.pending, 1);
-        assert_eq!(dashboard.completed_runs, 10);
+        assert_eq!(dashboard.completed_runs, 11);
         assert_eq!(dashboard.active_workers, 0);
         assert_eq!(dashboard.status, "running");
     }

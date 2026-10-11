@@ -528,7 +528,7 @@ cargo gamma suppress [OPTIONS]
 | --- | --- | --- |
 | `-d`, `--dir` | `<PATH>` | Path to the workspace or package whose completed campaign should be used. Defaults to `.`. |
 | `--apply` |  | Write and verify the generated directives instead of printing the proposed diff. |
-| `--eligible` | `<LIST>` | Which verdicts may be suppressed. Defaults to `timeout,outofmem`. |
+| `--eligible` | `<LIST>` | Which verdicts may be suppressed. Defaults to `timeout,outofmem,leaklimit`. |
 | `--allow-dirty` |  | Edit source files that have uncommitted changes. |
 
 **Cache**

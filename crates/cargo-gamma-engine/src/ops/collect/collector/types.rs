@@ -17,6 +17,8 @@ use crate::{HashMap, HashSet};
 #[derive(Clone, PartialEq)]
 pub(super) struct Alias {
     pub(super) parameters: Vec<String>,
+    pub(super) defaults: Vec<Option<Type>>,
+    pub(super) has_const_parameters: bool,
     pub(super) target: Type,
 }
 
@@ -116,7 +118,7 @@ impl Types<'_> {
         self.package_type_name(ty).is_some_and(|name| self.defaults.defines(&name))
     }
 
-    fn instantiate_alias(&self, ty: &Type) -> Option<Type> {
+    pub(super) fn instantiate_alias(&self, ty: &Type) -> Option<Type> {
         let aliases = self.aliases?;
         let mut resolved = ty.clone();
         let mut visited = HashSet::default();
@@ -137,16 +139,38 @@ impl Types<'_> {
             let Some(alias) = aliases.get(&name).and_then(Option::as_ref) else {
                 return changed.then_some(resolved);
             };
+            // Substituting only type arguments would leave an array length such as `N`
+            // unresolved. Do not claim to know the shape of this alias.
+            if alias.has_const_parameters {
+                return None;
+            }
             let arguments = super::values::type_argument_values(&resolved);
-            let substitutions = alias
-                .parameters
-                .iter()
-                .zip(arguments)
-                .map(|(parameter, argument)| (parameter.clone(), argument.clone()))
-                .collect();
+            let mut substitutions = HashMap::default();
+            for (index, parameter) in alias.parameters.iter().enumerate() {
+                let argument = arguments.get(index).map(|argument| (*argument).clone()).or_else(|| {
+                    alias
+                        .defaults
+                        .get(index)
+                        .and_then(Clone::clone)
+                        .map(|default| substitute_type(&default, &substitutions))
+                });
+                if let Some(argument) = argument {
+                    let _previous = substitutions.insert(parameter.clone(), argument);
+                }
+            }
             resolved = substitute_type(&alias.target, &substitutions);
             changed = true;
         }
+    }
+
+    pub(super) fn is_local_alias(&self, ty: &Type) -> bool {
+        let Type::Path(path) = strip(ty) else {
+            return false;
+        };
+        let Some(segment) = path.path.segments.first().filter(|_| path.path.segments.len() == 1) else {
+            return false;
+        };
+        self.aliases.is_some_and(|aliases| aliases.contains_key(&segment.ident.to_string()))
     }
 
     pub(super) fn resolve_alias<'a>(&'a self, ty: &'a Type) -> &'a Type {
@@ -1092,6 +1116,8 @@ mod tests {
                 "PayloadAlias".to_owned(),
                 Some(Alias {
                     parameters: vec!["T".to_owned()],
+                    defaults: Vec::new(),
+                    has_const_parameters: false,
                     target: parse_quote!(Option<T>),
                 }),
             ),
@@ -1099,6 +1125,8 @@ mod tests {
                 "QualifiedAlias".to_owned(),
                 Some(Alias {
                     parameters: Vec::new(),
+                    defaults: Vec::new(),
+                    has_const_parameters: false,
                     target: parse_quote!(crate::Value),
                 }),
             ),
@@ -1237,6 +1265,8 @@ mod tests {
                 "A".to_owned(),
                 Some(Alias {
                     parameters: Vec::new(),
+                    defaults: Vec::new(),
+                    has_const_parameters: false,
                     target: parse_quote!(B),
                 }),
             ),
@@ -1244,6 +1274,8 @@ mod tests {
                 "B".to_owned(),
                 Some(Alias {
                     parameters: Vec::new(),
+                    defaults: Vec::new(),
+                    has_const_parameters: false,
                     target: parse_quote!(A),
                 }),
             ),
@@ -1274,6 +1306,8 @@ mod tests {
                 "Outer".to_owned(),
                 Some(Alias {
                     parameters: vec!["T".to_owned()],
+                    defaults: Vec::new(),
+                    has_const_parameters: false,
                     target: parse_quote!(Inner<Option<T>>),
                 }),
             ),
@@ -1281,6 +1315,8 @@ mod tests {
                 "Inner".to_owned(),
                 Some(Alias {
                     parameters: vec!["U".to_owned()],
+                    defaults: Vec::new(),
+                    has_const_parameters: false,
                     target: parse_quote!(Result<U, Error>),
                 }),
             ),
@@ -1300,6 +1336,35 @@ mod tests {
             Some(&parse_quote!(Option<bool>))
         );
         assert_eq!(types.payload(&parse_quote!(Outer<bool>), 1).as_deref(), Some(&parse_quote!(Error)));
+    }
+
+    #[test]
+    fn alias_defaults_use_prior_parameters_without_rewriting_explicit_arguments() {
+        let defaults = Defaults::default();
+        let abstracts = Vec::new();
+        let defaulted = Vec::new();
+        let imports = HashMap::default();
+        let aliases = HashMap::from_iter([(
+            "Alias".to_owned(),
+            Some(Alias {
+                parameters: vec!["T".to_owned(), "U".to_owned()],
+                defaults: vec![None, Some(parse_quote!(T))],
+                has_const_parameters: false,
+                target: parse_quote!((T, U)),
+            }),
+        )]);
+        let types = Types {
+            abstracts: &abstracts,
+            defaulted: &defaulted,
+            imports: &imports,
+            defaults: &defaults,
+            aliases: Some(&aliases),
+            self_type: None,
+            self_associated: None,
+        };
+
+        assert_eq!(types.instantiate_alias(&parse_quote!(Alias<u8>)), Some(parse_quote!((u8, u8))));
+        assert_eq!(types.instantiate_alias(&parse_quote!(Alias<u8, T>)), Some(parse_quote!((u8, T))));
     }
 
     #[test]

@@ -281,6 +281,8 @@ pub struct Outcomes {
     pub survived: u32,
     pub timeout: u32,
     pub out_of_memory: u32,
+    #[serde(default)]
+    pub leak_limit: u32,
     pub flaky: u32,
     pub unviable: u32,
     pub ignored: u32,
@@ -753,6 +755,7 @@ pub fn bundle(plan: &Plan, session: Option<&Session>, context: &Context<'_>) -> 
             survived: summary.survived,
             timeout: summary.timeout,
             out_of_memory: summary.out_of_memory,
+            leak_limit: summary.leak_limit,
             flaky: summary.flaky,
             unviable: summary.unviable,
             ignored: summary.ignored,
@@ -1185,6 +1188,11 @@ mod tests {
         let mut value = serde_json::to_value(bundle(&plan(), None, &context())).expect("serialized bundle");
         let document = value.as_object_mut().expect("bundle is an object");
         let _confidence = document.remove("confidence");
+        let outcomes = document
+            .get_mut("outcomes")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("outcomes are an object");
+        let _leak_limit = outcomes.remove("leakLimit");
         for dimension in ["mutators", "packages"] {
             for row in document
                 .get_mut(dimension)
@@ -1201,6 +1209,7 @@ mod tests {
         let legacy: Bundle = serde_json::from_value(value).expect("legacy schema-5 bundle remains readable");
 
         assert!(legacy.confidence.is_empty());
+        assert_eq!(legacy.outcomes.leak_limit, 0);
         for row in legacy.mutators.iter().chain(&legacy.packages) {
             assert_eq!((row.viable, row.killed, row.unique_killers), (0, 0, 0));
         }
@@ -1601,6 +1610,21 @@ mod tests {
     #[test]
     fn the_bundle_says_which_schema_it_is() {
         assert_eq!(bundle(&plan(), None, &context()).schema_version, "5");
+    }
+
+    #[test]
+    fn the_bundle_counts_reference_leak_limits() {
+        let mut plan = plan();
+        let mut limited = mutant("subject", "fn_value.default");
+        limited.outcome = Outcome::LeakLimit;
+        plan.mutants = vec![limited];
+
+        let json = to_json(&bundle(&plan, None, &context())).expect("serialized bundle");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid bundle");
+
+        assert_eq!(value["population"]["mutants"], 1);
+        assert_eq!(value["outcomes"]["leakLimit"], 1);
+        assert_eq!(value["outcomes"]["outOfMemory"], 0);
     }
 
     #[test]

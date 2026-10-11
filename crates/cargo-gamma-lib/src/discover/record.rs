@@ -2916,6 +2916,7 @@ mod tests {
             mutant("flake", "src/lib.rs", Outcome::Flaky),
             mutant("unbuilt", "src/lib.rs", Outcome::NotBuilt),
             mutant("hungry", "src/lib.rs", Outcome::OutOfMemory),
+            mutant("leaking", "src/lib.rs", Outcome::LeakLimit),
             mutant("uncovered", "src/lib.rs", Outcome::NoCoverage),
             mutant("pending", "src/lib.rs", Outcome::Pending),
             mutant("slow", "src/lib.rs", Outcome::Timeout),

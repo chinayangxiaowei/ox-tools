@@ -293,7 +293,7 @@ fn unoptimized_execution(timing: &Timing, profile: CargoProfile<'_>) -> Option<F
 const fn ran_test_binary(outcome: Outcome) -> bool {
     matches!(
         outcome,
-        Outcome::Killed | Outcome::Survived | Outcome::Timeout | Outcome::OutOfMemory | Outcome::Flaky
+        Outcome::Killed | Outcome::Survived | Outcome::Timeout | Outcome::OutOfMemory | Outcome::LeakLimit | Outcome::Flaky
     )
 }
 

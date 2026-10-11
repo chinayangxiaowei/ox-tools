@@ -111,6 +111,7 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     /// any of them.
     fn visit_item(&mut self, node: &'ast Item) {
         if !self.cfg.skip_gate(item_attrs(node)) {
+            self.walk.on_item_box_path_shadow(node);
             visit::visit_item(self, node);
         }
     }
