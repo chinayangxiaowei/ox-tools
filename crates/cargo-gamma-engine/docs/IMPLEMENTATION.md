@@ -45,8 +45,17 @@ bindings before adding local evidence. Chained import aliases are expanded once
 per scope after the pre-pass; ambiguous bindings and alias cycles remain unknown rather
 than being repeatedly resolved at each type query. Parameter and local type
 evidence retains the import map from its declaration scope, so a body-local
-shadow cannot reinterpret a previously declared binding. Value synthesis
-therefore applies package evidence to unambiguous bare types while leaving
+shadow cannot reinterpret a previously declared binding. Assignment operator
+classification reads that map through explicit dereferences, instantiating
+generic aliases at each level. Alias targets retain their own declaration
+imports; substituted type arguments retain the imports at the alias use site.
+Leading imported module segments in those arguments are resolved before the
+scope switch. A file-wide alias name is expanded for temporal assignment
+screening only when its declaration is in the lexical scope chain and no import
+with that name shadows it; uncertain alias identity stays unresolved.
+When a local type declaration conflicts with an import name, argument
+classification stays conservative. Value synthesis therefore applies package
+evidence to unambiguous bare types while leaving
 qualified local paths, aliases, and dependency paths unresolved. A generic bare
 local path retains the declaration's evidence, and its concrete arguments are
 checked against derived or declared bounds. Function-local iterator bounds are

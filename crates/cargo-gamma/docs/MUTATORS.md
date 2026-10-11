@@ -88,11 +88,11 @@ cargo gamma explain relational.lt_to_le   # what one does, and how to switch it 
 | Family | Mutators | What it asks |
 | --- | ---: | --- |
 | [`fn_value`](#fn_value) | 21 | Does anything check what this function returns? |
-| [`relational`](#relational) | 10 | Is this comparison's boundary the right one? |
-| [`arith`](#arith) | 10 | Does this calculation's operator matter? |
+| [`relational`](#relational) | 14 | Is this comparison's boundary the right one? |
+| [`arith`](#arith) | 11 | Does this calculation's operator matter? |
 | [`bitwise`](#bitwise) | 4 | Is this mask or flag combination correct? |
 | [`shift`](#shift) | 2 | Is this shift's direction load-bearing? |
-| [`assign`](#assign) | 10 | Does this compound assignment's operator matter? |
+| [`assign`](#assign) | 12 | Does this compound assignment's operator matter? |
 | [`logical`](#logical) | 6 | Is this `&&` really an `&&`? |
 | [`bool_expr`](#bool_expr) | 1 | Does anything observe whether this boolean value is true or false? |
 | [`cond`](#cond) | 3 | Does anything depend on this branch being taken? |
@@ -118,7 +118,7 @@ cargo gamma explain relational.lt_to_le   # what one does, and how to switch it 
 | [`call_result`](#call_result) | 1 | Does this call's result matter independently of its side effects? |
 | [`parameter`](#parameter) | 1 | Does this function parameter contribute to behavior? |
 | [`regex`](#regex) | 6 | Does this pattern's matching semantics matter? |
-| **Total** | **144** | |
+| **Total** | **151** | |
 
 <!-- end generated -->
 
@@ -168,7 +168,7 @@ local paths and aliases remain unresolved rather than borrowing evidence by thei
 
 ### `relational`
 
-Targets the boundary of a comparison: `<`, `<=`, `>`, `>=`, `==`, `!=`. A surviving mutant means the suite has no test sitting exactly on that boundary — off-by-one errors in loop bounds, capacity checks, and range tests live here.
+Changes a comparison among `<`, `<=`, `>`, `>=`, `==`, and `!=` by moving its boundary, reversing its direction, or selecting equality. A surviving mutant means the tested inputs do not distinguish the original predicate from its replacement. Off-by-one errors in loop bounds, capacity checks, and range tests live here.
 
 ```rust
 // original
@@ -181,11 +181,11 @@ if index <= limit { … }
 if remaining == 0 { … }
 ```
 
-The `ROR` alias covers this whole family; a test suite that only exercises values well inside or well outside a boundary, never on it, will let all ten mutators here survive together.
+The `ROR` alias covers all fourteen replacements, including strict comparisons changed to equality and inclusive comparisons reversed to the other strict direction.
 
 ### `arith`
 
-Swaps one arithmetic operator for another: `+`/`-`/`*`/`/`/`%` interchanged in pairs. A surviving mutant means no test distinguishes the actual formula from a nearby wrong one — the inputs used never produce a different result under the substituted operator.
+Swaps one arithmetic operator for another: `+`/`-`/`*`/`/`/`%` replaced by selected alternatives. A surviving mutant means no test distinguishes the actual formula from a nearby wrong one — the inputs used never produce a different result under the substituted operator.
 
 ```rust
 // original
@@ -229,7 +229,17 @@ let packed = high_byte >> 8;
 
 ### `assign`
 
-The compound-assignment counterpart of `arith`/`bitwise`/`shift`: swaps `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` for their paired opposite. A surviving mutant means the test never observes the accumulated value after the compound assignment runs, only before, or in a case where both operators land on the same result.
+The compound-assignment counterpart of `arith`/`bitwise`/`shift`: swaps `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` for selected alternatives. A surviving mutant means the test never observes the accumulated value after the compound assignment runs, only before, or in a case where both operators land on the same result.
+
+Textual and temporal operands exclude incompatible substitutions. Their types
+are interpreted using the imports visible when each parameter or local was
+declared. Alias targets use their own declaration imports; generic alias
+arguments use the imports visible where the alias is applied.
+Imported module prefixes in those arguments are resolved before switching to
+the alias declaration scope. An unrelated imported type with the same name as
+a file-local alias does not borrow that alias's temporal classification.
+Nested concrete type declarations and unresolved glob imports also leave a
+same-named file-wide alias unproven at the assignment site.
 
 ```rust
 // original
@@ -584,12 +594,16 @@ the mutator runs when `--mutators` is not given.
 | --- | --- | --- | --- |
 | `relational.lt_to_le` | replace < with <= | `ROR` | yes |
 | `relational.lt_to_gt` | replace < with > | `ROR` | yes |
+| `relational.lt_to_eq` | replace < with == | `ROR` | yes |
 | `relational.le_to_lt` | replace <= with < | `ROR` | yes |
 | `relational.le_to_ge` | replace <= with >= | `ROR` | yes |
+| `relational.le_to_gt` | replace <= with > | `ROR` | yes |
 | `relational.gt_to_ge` | replace > with >= | `ROR` | yes |
 | `relational.gt_to_lt` | replace > with < | `ROR` | yes |
+| `relational.gt_to_eq` | replace > with == | `ROR` | yes |
 | `relational.ge_to_gt` | replace >= with > | `ROR` | yes |
 | `relational.ge_to_le` | replace >= with <= | `ROR` | yes |
+| `relational.ge_to_lt` | replace >= with < | `ROR` | yes |
 | `relational.eq_to_ne` | replace == with != | `ROR` | yes |
 | `relational.ne_to_eq` | replace != with == | `ROR` | yes |
 
@@ -607,6 +621,7 @@ the mutator runs when `--mutators` is not given.
 | `arith.div_to_rem` | replace / with % | `AOR` | yes |
 | `arith.rem_to_div` | replace % with / | `AOR` | yes |
 | `arith.rem_to_mul` | replace % with * | `AOR` | yes |
+| `arith.rem_to_add` | replace % with + | `AOR` | yes |
 
 #### `bitwise`
 
@@ -629,7 +644,9 @@ the mutator runs when `--mutators` is not given.
 | Mutator | What it does | Alias | Default |
 | --- | --- | --- | --- |
 | `assign.add_to_sub` | replace += with -= | `ASR` | yes |
+| `assign.add_to_mul` | replace += with *= | `ASR` | yes |
 | `assign.sub_to_add` | replace -= with += | `ASR` | yes |
+| `assign.sub_to_div` | replace -= with /= | `ASR` | yes |
 | `assign.mul_to_div` | replace *= with /= | `ASR` | yes |
 | `assign.div_to_mul` | replace /= with *= | `ASR` | yes |
 | `assign.rem_to_div` | replace %= with /= | `ASR` | yes |

@@ -44,12 +44,16 @@ mutators! {
     // Relational and boundary.
     "relational.lt_to_le",       true,  &["ROR"], "replace < with <=";
     "relational.lt_to_gt",       true,  &["ROR"], "replace < with >";
+    "relational.lt_to_eq",       true,  &["ROR"], "replace < with ==";
     "relational.le_to_lt",       true,  &["ROR"], "replace <= with <";
     "relational.le_to_ge",       true,  &["ROR"], "replace <= with >=";
+    "relational.le_to_gt",       true,  &["ROR"], "replace <= with >";
     "relational.gt_to_ge",       true,  &["ROR"], "replace > with >=";
     "relational.gt_to_lt",       true,  &["ROR"], "replace > with <";
+    "relational.gt_to_eq",       true,  &["ROR"], "replace > with ==";
     "relational.ge_to_gt",       true,  &["ROR"], "replace >= with >";
     "relational.ge_to_le",       true,  &["ROR"], "replace >= with <=";
+    "relational.ge_to_lt",       true,  &["ROR"], "replace >= with <";
     "relational.eq_to_ne",       true,  &["ROR"], "replace == with !=";
     "relational.ne_to_eq",       true,  &["ROR"], "replace != with ==";
 
@@ -64,6 +68,7 @@ mutators! {
     "arith.div_to_rem",          true , &["AOR"], "replace / with %";
     "arith.rem_to_div",          true,  &["AOR"], "replace % with /";
     "arith.rem_to_mul",          true , &["AOR"], "replace % with *";
+    "arith.rem_to_add",          true,  &["AOR"], "replace % with +";
 
     // Bitwise and shift.
     "bitwise.and_to_or",         true,  &["AOR"], "replace & with |";
@@ -75,7 +80,9 @@ mutators! {
 
     // Compound assignment.
     "assign.add_to_sub",         true,  &["ASR"], "replace += with -=";
+    "assign.add_to_mul",         true,  &["ASR"], "replace += with *=";
     "assign.sub_to_add",         true,  &["ASR"], "replace -= with +=";
+    "assign.sub_to_div",         true,  &["ASR"], "replace -= with /=";
     "assign.mul_to_div",         true,  &["ASR"], "replace *= with /=";
     "assign.div_to_mul",         true,  &["ASR"], "replace /= with *=";
     "assign.rem_to_div",         true , &["ASR"], "replace %= with /=";

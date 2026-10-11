@@ -445,22 +445,38 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: i32, b: i32) -> bool { a < b }",
         "relational",
-        &[("relational.lt_to_le", "(a) <= (b)"), ("relational.lt_to_gt", "(a) > (b)")],
+        &[
+            ("relational.lt_to_le", "(a) <= (b)"),
+            ("relational.lt_to_gt", "(a) > (b)"),
+            ("relational.lt_to_eq", "(a) == (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a <= b }",
         "relational",
-        &[("relational.le_to_lt", "(a) < (b)"), ("relational.le_to_ge", "(a) >= (b)")],
+        &[
+            ("relational.le_to_lt", "(a) < (b)"),
+            ("relational.le_to_ge", "(a) >= (b)"),
+            ("relational.le_to_gt", "(a) > (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a > b }",
         "relational",
-        &[("relational.gt_to_ge", "(a) >= (b)"), ("relational.gt_to_lt", "(a) < (b)")],
+        &[
+            ("relational.gt_to_ge", "(a) >= (b)"),
+            ("relational.gt_to_lt", "(a) < (b)"),
+            ("relational.gt_to_eq", "(a) == (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a >= b }",
         "relational",
-        &[("relational.ge_to_gt", "(a) > (b)"), ("relational.ge_to_le", "(a) <= (b)")],
+        &[
+            ("relational.ge_to_gt", "(a) > (b)"),
+            ("relational.ge_to_le", "(a) <= (b)"),
+            ("relational.ge_to_lt", "(a) < (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> bool { a == b }",
@@ -495,7 +511,11 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: i32, b: i32) -> i32 { a % b }",
         "arith",
-        &[("arith.rem_to_div", "(a) / (b)"), ("arith.rem_to_mul", "(a) * (b)")],
+        &[
+            ("arith.rem_to_div", "(a) / (b)"),
+            ("arith.rem_to_mul", "(a) * (b)"),
+            ("arith.rem_to_add", "(a) + (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> i32 { a & b }",
@@ -543,12 +563,12 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: &mut i32, b: i32) { *a += b; }",
         "assign",
-        &[("assign.add_to_sub", "*a -= (b)")],
+        &[("assign.add_to_sub", "*a -= (b)"), ("assign.add_to_mul", "*a *= (b)")],
     ),
     (
         "fn f(a: &mut i32, b: i32) { *a -= b; }",
         "assign",
-        &[("assign.sub_to_add", "*a += (b)")],
+        &[("assign.sub_to_add", "*a += (b)"), ("assign.sub_to_div", "*a /= (b)")],
     ),
     (
         "fn f(a: &mut i32, b: i32) { *a *= b; }",
@@ -627,7 +647,7 @@ fn the_operator_oracle_covers_every_replacement_the_tables_offer() {
     let pairs: usize = OPERATOR_ORACLE.iter().map(|(_, _, expected)| expected.len()).sum();
 
     assert_eq!(OPERATOR_ORACLE.len(), 28, "one row per binary and compound-assignment operator");
-    assert_eq!(pairs, 42, "one assertion per binary operator mutation");
+    assert_eq!(pairs, 49, "one assertion per operator substitution");
 }
 
 #[test]
@@ -2735,7 +2755,7 @@ fn booleans_flip_to_the_other_value() {
 fn compound_assignment_is_mutated() {
     let found = mutators("fn f(a: &mut i32) { *a += 1; }", "assign");
 
-    assert_eq!(found, vec!["assign.add_to_sub"]);
+    assert_eq!(found, vec!["assign.add_to_mul", "assign.add_to_sub"]);
 }
 
 #[test]
@@ -3105,8 +3125,10 @@ fn different_replacements_at_one_site_get_distinct_ids() {
     let selection = Selection::parse("relational").unwrap();
     let mutants = into_definitions(&file, collect(&file, &selection));
 
-    assert_eq!(mutants.len(), 2);
+    assert_eq!(mutants.len(), 3);
     assert_ne!(mutants[0].id, mutants[1].id);
+    assert_ne!(mutants[0].id, mutants[2].id);
+    assert_ne!(mutants[1].id, mutants[2].id);
 }
 
 #[test]
@@ -3911,6 +3933,556 @@ fn textual_and_temporal_additions_keep_only_compatible_arithmetic_replacements()
             .any(|candidate| candidate.mutator == "arith.add_to_mul" && candidate.replacement.contains("when")),
         "{found:?}"
     );
+}
+
+#[test]
+fn textual_and_temporal_compound_additions_keep_only_compatible_replacements() {
+    let source = r"
+        use std::time::{Duration, Instant};
+        fn f(deadline: &mut Instant, duration: &mut Duration, delta: Duration,
+             label: &mut String, suffix: &str, count: &mut i32, step: i32) {
+            *deadline += delta;
+            *duration -= delta;
+            *label += suffix;
+            *count += step;
+            *count -= step;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul,assign.sub_to_add,assign.sub_to_div");
+
+    assert_eq!(found.len(), 6, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .any(|candidate| candidate.mutator == "assign.add_to_sub" && candidate.replacement.contains("deadline"))
+    );
+    assert!(
+        found
+            .iter()
+            .any(|candidate| candidate.mutator == "assign.sub_to_add" && candidate.replacement.contains("duration"))
+    );
+    assert!(found.iter().all(|candidate| !candidate.replacement.contains("label")), "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|candidate| { !candidate.replacement.contains("deadline") || candidate.mutator == "assign.add_to_sub" })
+    );
+    assert!(
+        found
+            .iter()
+            .all(|candidate| { !candidate.replacement.contains("duration") || candidate.mutator == "assign.sub_to_add" })
+    );
+}
+
+#[test]
+fn body_import_shadows_do_not_reinterpret_compound_assignment_parameter_types() {
+    let source = r"
+        use std::time::{Duration, Instant as Clock};
+        use std::string::String as Text;
+        mod shadows { pub struct Clock; pub struct Duration; pub struct Text; }
+        fn target(deadline: &mut Clock, delta: Duration, label: &mut Text, suffix: &str) {
+            use crate::shadows::{Clock, Duration, Text};
+            *deadline += delta;
+            *label += std::convert::identity(suffix);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(replacements, [("assign.add_to_sub", "*deadline -= (delta)")], "{found:?}");
+}
+
+#[test]
+fn field_type_uses_its_declaration_imports_after_body_shadowing() {
+    let source = r"
+        use std::time::{Duration, Instant as Clock};
+        struct State { deadline: Clock }
+        mod shadows { pub struct Clock; }
+        fn target(state: &mut State, delta: Duration) {
+            use crate::shadows::Clock;
+            state.deadline += delta;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(replacements, [("assign.add_to_sub", "state.deadline -= (delta)")], "{found:?}");
+}
+
+#[test]
+fn explicitly_dereferenced_field_uses_its_declaration_imports() {
+    let source = r"
+        use std::time::{Duration, Instant as Clock};
+        struct State<'a> { deadline: &'a mut Clock }
+        mod shadows { pub struct Clock; }
+        fn target(state: &mut State<'_>, delta: Duration) {
+            use crate::shadows::Clock;
+            *state.deadline += delta;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(replacements, [("assign.add_to_sub", "*state.deadline -= (delta)")], "{found:?}");
+}
+
+#[test]
+fn cross_module_field_alias_uses_its_declaration_scope() {
+    let source = r"
+        mod model {
+            pub type Clock = std::time::Instant;
+            pub struct State { pub deadline: Clock }
+        }
+        fn target(state: &mut model::State) {
+            state.deadline += std::time::Duration::from_secs(1);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_sub", "state.deadline -= (std::time::Duration::from_secs(1))")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn cross_module_dereferenced_field_alias_uses_its_declaration_scope() {
+    let source = r"
+        mod model {
+            pub type Clock = std::time::Instant;
+            pub struct State<'a> { pub deadline: &'a mut Clock }
+        }
+        fn target(state: &mut model::State<'_>) {
+            *state.deadline += std::time::Duration::from_secs(1);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_sub", "*state.deadline -= (std::time::Duration::from_secs(1))")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn unrelated_imported_clock_does_not_borrow_a_file_wide_temporal_alias() {
+    let source = r"
+        mod temporal { pub type Clock = std::time::Instant; }
+        mod custom {
+            pub struct Clock;
+            impl std::ops::AddAssign<i32> for Clock { fn add_assign(&mut self, _: i32) {} }
+            impl std::ops::MulAssign<i32> for Clock { fn mul_assign(&mut self, _: i32) {} }
+        }
+        use custom::Clock;
+        fn target(value: &mut Clock) { *value += 1; }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>();
+
+    assert_eq!(replacements, ["*value *= (1)", "*value -= (1)"], "{found:?}");
+}
+
+#[test]
+fn local_concrete_types_shadow_a_file_wide_temporal_alias() {
+    for (declaration, constructor) in [
+        ("struct Clock;", "Clock"),
+        ("enum Clock { Tick }", "Clock::Tick"),
+        ("union Clock { ticks: u8 }", "Clock { ticks: 0 }"),
+    ] {
+        let source = format!(
+            "type Clock = std::time::Instant;
+             fn target() {{
+                 {declaration}
+                 impl std::ops::AddAssign<i32> for Clock {{ fn add_assign(&mut self, _: i32) {{}} }}
+                 impl std::ops::MulAssign<i32> for Clock {{ fn mul_assign(&mut self, _: i32) {{}} }}
+                 let mut value = {constructor};
+                 let value: &mut Clock = &mut value;
+                 *value += 1;
+             }}"
+        );
+        let found = candidates(&source, "assign.add_to_mul");
+        let replacements = found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>();
+
+        assert_eq!(replacements, ["*value *= (1)"], "{declaration}: {found:?}");
+    }
+}
+
+#[test]
+fn a_glob_import_does_not_prove_a_same_named_outer_alias() {
+    let source = r"
+        type Clock = std::time::Instant;
+        mod custom {
+            pub struct Clock;
+            impl std::ops::AddAssign<i32> for Clock { fn add_assign(&mut self, _: i32) {} }
+            impl std::ops::MulAssign<i32> for Clock { fn mul_assign(&mut self, _: i32) {} }
+        }
+        mod scope {
+            use super::custom::*;
+            fn target(value: &mut Clock) { *value += 1; }
+        }
+    ";
+    let found = candidates(source, "assign.add_to_mul");
+    let replacements = found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>();
+
+    assert_eq!(replacements, ["*value *= (1)"], "{found:?}");
+}
+
+#[test]
+fn a_same_scope_alias_keeps_precedence_over_a_glob_import() {
+    let source = r"
+        type Clock = std::time::Instant;
+        mod custom { pub struct Other; }
+        use custom::*;
+        fn target(value: &mut Clock, delta: std::time::Duration) { *value += delta; }
+    ";
+    let found = candidates(source, "assign.add_to_mul");
+
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn module_prefix_import_in_generic_alias_argument_keeps_its_use_scope() {
+    let source = r"
+        type Ref<'a, T> = &'a mut T;
+        fn target(delta: std::time::Duration) {
+            use std::time;
+            let mut instant = std::time::Instant::now();
+            let mut inner: &mut time::Instant = &mut instant;
+            let deadline: &mut Ref<'_, time::Instant> = &mut inner;
+            **deadline += delta;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>();
+
+    assert_eq!(replacements, ["**deadline -= (delta)"], "{found:?}");
+}
+
+#[test]
+fn generic_parameter_shadows_a_same_named_standard_import() {
+    let source = r"
+        use std::time::Instant as T;
+        fn target<T: std::ops::AddAssign<i32> + std::ops::MulAssign<i32>>(value: &mut T) {
+            *value += 1;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_mul");
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].replacement, "*value *= (1)");
+}
+
+#[test]
+fn generic_alias_argument_shadows_a_same_named_standard_import() {
+    let source = r"
+        use std::time::Instant as T;
+        type Ref<'a, U> = &'a mut U;
+        fn target<T: std::ops::AddAssign<i32> + std::ops::MulAssign<i32>>(mut value: &mut T) {
+            let deadline: &mut Ref<'_, T> = &mut value;
+            **deadline += 1;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_mul");
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].replacement, "**deadline *= (1)");
+}
+
+#[test]
+fn body_imports_do_not_turn_a_custom_numeric_assignment_into_a_temporal_one() {
+    let source = r"
+        mod custom { pub type Clock = i32; }
+        use custom::Clock;
+        fn target(value: &mut Clock, step: i32) {
+            use std::time::Instant as Clock;
+            *value += step;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_mul", "*value *= (step)"), ("assign.add_to_sub", "*value -= (step)")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn nested_dereference_resolves_an_intermediate_temporal_alias() {
+    let source = r"
+        use std::time::{Duration, Instant};
+        type InstantRef<'a> = &'a mut Instant;
+        fn target(deadline: &mut InstantRef<'_>, delta: Duration) {
+            **deadline += delta;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(replacements, [("assign.add_to_sub", "**deadline -= (delta)")], "{found:?}");
+}
+
+#[test]
+fn nested_dereference_instantiates_an_intermediate_generic_alias() {
+    let source = r"
+        use std::time::{Duration, Instant};
+        type Ref<'a, T> = &'a mut T;
+        fn target(deadline: &mut Ref<'_, Instant>, delta: Duration) {
+            **deadline += delta;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(replacements, [("assign.add_to_sub", "**deadline -= (delta)")], "{found:?}");
+}
+
+#[test]
+fn nested_generic_alias_keeps_the_outer_alias_imports_after_shadowing() {
+    let source = r"
+        use std::time::{Duration, Instant as Clock};
+        type Ref<'a, T> = &'a mut T;
+        type ClockRef<'a> = &'a mut Ref<'a, Clock>;
+        mod shadows { pub struct Clock; }
+        fn target(deadline: ClockRef<'_>, delta: Duration) {
+            use crate::shadows::Clock;
+            **deadline += delta;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(replacements, [("assign.add_to_sub", "**deadline -= (delta)")], "{found:?}");
+}
+
+#[test]
+fn alias_target_uses_its_declaration_imports_after_body_shadowing() {
+    let source = r"
+        type Moment = Clock;
+        use std::time::Instant as Clock;
+        mod shadows { pub struct Clock; }
+        fn target() {
+            use crate::shadows::Clock;
+            let mut instant = std::time::Instant::now();
+            let deadline: &mut Moment = &mut instant;
+            *deadline += std::time::Duration::from_secs(1);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_sub", "*deadline -= (std::time::Duration::from_secs(1))")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn generic_alias_argument_keeps_its_use_site_imports() {
+    let source = r"
+        type Ref<'a, T> = &'a mut T;
+        fn target() {
+            use std::time::Instant as Clock;
+            let mut instant = std::time::Instant::now();
+            let deadline: &mut Ref<'_, Clock> = &mut instant;
+            **deadline += std::time::Duration::from_secs(1);
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [("assign.add_to_sub", "**deadline -= (std::time::Duration::from_secs(1))")],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn generic_alias_argument_is_not_reinterpreted_by_the_alias_imports() {
+    let source = r"
+        use std::time::Instant as Clock;
+        type Ref<'a, T> = &'a mut T;
+        mod custom { pub type Clock = i32; }
+        fn target(value: &mut i32) {
+            use crate::custom::Clock;
+            let deadline: &mut Ref<'_, Clock> = value;
+            **deadline += 1;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn local_generic_alias_argument_is_not_reinterpreted_by_outer_imports() {
+    let source = r"
+        use std::time::Instant as Clock;
+        type Ref<'a, T> = &'a mut T;
+        fn target() {
+            struct Clock;
+            impl std::ops::AddAssign<i32> for Clock {
+                fn add_assign(&mut self, _step: i32) {}
+            }
+            let mut value = Clock;
+            let deadline: &mut Ref<'_, Clock> = &mut value;
+            **deadline += 1;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn local_generic_alias_argument_is_not_reinterpreted_by_outer_aliases() {
+    let source = r"
+        type Clock = std::time::Instant;
+        type Ref<'a, T> = &'a mut T;
+        fn target() {
+            struct Clock;
+            impl std::ops::AddAssign<i32> for Clock { fn add_assign(&mut self, _: i32) {} }
+            impl std::ops::MulAssign<i32> for Clock { fn mul_assign(&mut self, _: i32) {} }
+            let mut value = Clock;
+            let mut inner = &mut value;
+            let deadline: &mut Ref<'_, Clock> = &mut inner;
+            **deadline += 1;
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{found:?}"
+    );
+
+    let file = SourceFile::parse("test.rs", source.to_owned()).expect("the fixture parses");
+    let selection = Selection::parse("assign.add_to_sub,assign.add_to_mul").expect("the operators are registered");
+    let without_workspace_defaults = collect_with(&file, &selection, &CfgSet::unconditional(), &Defaults::default());
+    let replacements = without_workspace_defaults
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{without_workspace_defaults:?}"
+    );
+}
+
+#[test]
+fn module_local_generic_argument_keeps_alias_imports_out() {
+    let source = r"
+        use std::time::Instant as Clock;
+        type Ref<'a, T> = &'a mut T;
+        mod nested {
+            use super::Ref;
+            struct Clock;
+            impl std::ops::AddAssign<i32> for Clock {
+                fn add_assign(&mut self, _step: i32) {}
+            }
+            fn target() {
+                let mut value = Clock;
+                let deadline: &mut Ref<'_, Clock> = &mut value;
+                **deadline += 1;
+            }
+        }
+    ";
+    let found = candidates(source, "assign.add_to_sub,assign.add_to_mul");
+    let replacements = found
+        .iter()
+        .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        replacements,
+        [
+            ("assign.add_to_mul", "**deadline *= (1)"),
+            ("assign.add_to_sub", "**deadline -= (1)")
+        ],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn temporal_multiply_and_divide_assignments_remain_mutable() {
+    let source = "use std::time::Duration; fn f(duration: &mut Duration, factor: u32) { *duration *= factor; *duration /= factor; }";
+    let found = candidates(source, "assign.mul_to_div,assign.div_to_mul");
+
+    assert_eq!(found.len(), 2, "{found:?}");
 }
 
 #[test]

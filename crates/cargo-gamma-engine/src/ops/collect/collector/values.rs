@@ -922,6 +922,8 @@ mod tests {
             Some(Alias {
                 parameters: Vec::new(),
                 target: parse_quote!(HashSet<u8, NoDefault>),
+                scope_path: Vec::new(),
+                imports: HashMap::default(),
             }),
         );
         let types = Types {
@@ -1124,6 +1126,8 @@ mod tests {
             Some(Alias {
                 parameters: vec!["Error".to_owned(), "Value".to_owned()],
                 target: parse_quote!(Result<Value, Error>),
+                scope_path: Vec::new(),
+                imports: HashMap::default(),
             }),
         );
         let types = Types {

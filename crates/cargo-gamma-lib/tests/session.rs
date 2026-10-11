@@ -793,10 +793,10 @@ fn compiler_linkage_narrows_a_real_campaign_to_the_target_that_reads_the_source(
     );
 
     assert_eq!(code, EXIT_OK, "{output}");
-    assert!(output.contains("2 survived,"), "{output}");
+    assert!(output.contains("3 survived,"), "{output}");
     assert!(output.contains("selection kept"), "{output}");
     assert!(output.contains("tests     2 tests"), "{output}");
-    assert!(output.contains("2 launches"), "{output}");
+    assert!(output.contains("3 launches"), "{output}");
     assert!(!output.contains("objects_to_mutants_it_cannot_link"), "{output}");
 }
 
@@ -1411,7 +1411,7 @@ fn excluding_a_test_target_takes_it_out_of_the_oracle() {
     // which announces no tests at all, so these mutants are reported as uncovered rather than as
     // survivors: there is no test that missed them.
     assert!(output.contains("0 killed"), "{output}");
-    assert!(output.contains("2 uncovered"), "{output}");
+    assert!(output.contains("3 uncovered"), "{output}");
     assert!(output.contains("1 test target not consulted"), "{output}");
 }
 
@@ -1426,7 +1426,7 @@ fn including_only_the_unit_tests_leaves_the_integration_target_out() {
     // The unit-test binary is all that is left, and it announces no tests, so nothing here could
     // have convicted anything — uncovered rather than missed.
     assert!(output.contains("0 killed"), "{output}");
-    assert!(output.contains("2 uncovered"), "{output}");
+    assert!(output.contains("3 uncovered"), "{output}");
 }
 
 #[test]
@@ -1686,11 +1686,11 @@ fn a_test_that_outprints_the_pipe_does_not_deadlock() {
 
     assert_eq!(code, EXIT_OK, "{output}");
 
-    // Both mutants break the assertion, so libtest dumps the captured output of a failing test —
+    // All three mutants break the assertion, so libtest dumps the captured output of a failing test —
     // megabytes of it — down the pipe. The verdict has to be the real one, reached promptly, rather
     // than the timeout a blocked pipe would have produced once the budget expired.
     assert!(
-        output.contains("2 mutants (2 killed, 0 survived, 0 timed out, 0 out of memory, 0 uncovered => 100.0%)"),
+        output.contains("3 mutants (3 killed, 0 survived, 0 timed out, 0 out of memory, 0 uncovered => 100.0%)"),
         "{output}"
     );
 }
@@ -1763,7 +1763,7 @@ fn a_mutant_no_test_can_reach_is_reported_uncovered() {
 
     assert_eq!(code, EXIT_OK, "{output}");
 
-    // The same mutant exists in both packages. The one the mainland's tests compile is caught; the
+    // The same mutants exist in both packages. The ones the mainland's tests compile are caught; the
     // island's cannot be reached by any binary the build produced, which is a stronger statement
     // than "survived" and must not be reported as one.
     assert!(
@@ -1774,7 +1774,7 @@ fn a_mutant_no_test_can_reach_is_reported_uncovered() {
     // An uncovered mutant costs score without being a survivor, so it is counted on its own rather
     // than folded into the missed total a reader would go looking for an assertion for.
     assert!(
-        output.contains("4 mutants (2 killed, 0 survived, 0 timed out, 0 out of memory, 2 uncovered => 50.0%)"),
+        output.contains("6 mutants (3 killed, 0 survived, 0 timed out, 0 out of memory, 3 uncovered => 50.0%)"),
         "{output}"
     );
 
@@ -1910,7 +1910,7 @@ fn skipping_the_baseline_says_so_and_still_judges_the_mutants() {
     // Without a measured baseline there is no elapsed time to scale a timeout from, so the run
     // falls back to the configured floor and still has to reach a verdict on every mutant.
     assert_eq!(code, EXIT_OK, "{output}");
-    assert!(output.contains("2 killed"), "{output}");
+    assert!(output.contains("3 killed"), "{output}");
 }
 
 #[test]
@@ -2080,8 +2080,8 @@ fn a_census_reports_code_no_test_reaches_as_uncovered_rather_than_surviving() {
     let (censused, output) = censused_session(&dir, &["--mutators", "relational", "--incremental", "no"]);
 
     assert_eq!(censused, EXIT_OK, "{output}");
-    assert!(output.contains("2 uncovered"), "{output}");
-    assert!(!output.contains("2 survived"), "{output}");
+    assert!(output.contains("3 uncovered"), "{output}");
+    assert!(!output.contains("3 survived"), "{output}");
 
     // The same crate with case-level selection disabled, to prove the difference is the census and
     // not the crate.
@@ -2092,8 +2092,8 @@ fn a_census_reports_code_no_test_reaches_as_uncovered_rather_than_surviving() {
     );
 
     assert_eq!(code, EXIT_OK, "{output}");
-    assert!(output.contains("2 survived"), "{output}");
-    assert!(!output.contains("2 uncovered"), "{output}");
+    assert!(output.contains("3 survived"), "{output}");
+    assert!(!output.contains("3 uncovered"), "{output}");
 }
 
 /// A crate with a test that convicts every mutant while reaching none of them.

@@ -281,7 +281,7 @@ mod tests {
     fn empty_selectors_are_ignored() {
         let selection = Selection::parse("relational, , ").unwrap();
 
-        assert_eq!(selection.names.len(), 10);
+        assert_eq!(selection, Selection::parse("relational").unwrap());
     }
 
     /// `any_in_family` is the gate that builds the per-file imports index only when a `fn_value`

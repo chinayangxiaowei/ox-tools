@@ -12,7 +12,7 @@ use syn::{
 
 use crate::cfg::CfgSet;
 use crate::ops::collect::collector::predicates::{expr_attrs, is_int_literal, is_numeric_binding, is_numeric_receiver, stmt_attrs};
-use crate::ops::collect::collector::types::Alias;
+use crate::ops::collect::collector::types::{Alias, ImportMap};
 use crate::ops::collect::defaults::{impl_item_attrs, item_attrs, trait_item_attrs};
 use crate::ops::registry::Selection;
 use crate::{HashMap, HashSet};
@@ -39,6 +39,30 @@ fn merge_type(index: &mut HashMap<String, Option<Type>>, name: &str, ty: &Type) 
             }
         })
         .or_insert_with(|| Some(ty.clone()));
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct DeclaredType {
+    pub(super) ty: Type,
+    pub(super) scope_path: ScopePath,
+    pub(super) imports: ImportMap,
+}
+
+fn merge_declared_type(index: &mut HashMap<String, Option<DeclaredType>>, name: &str, ty: &Type, scope_path: &ScopePath) {
+    // A bare field or constant name cannot identify declarations in different scopes.
+    let declared = DeclaredType {
+        ty: ty.clone(),
+        scope_path: scope_path.clone(),
+        imports: ImportMap::default(),
+    };
+    let _known = index
+        .entry(name.to_owned())
+        .and_modify(|known| {
+            if known.as_ref() != Some(&declared) {
+                *known = None;
+            }
+        })
+        .or_insert(Some(declared));
 }
 
 /// The names a file uses in a way only a number can be used.
@@ -90,7 +114,7 @@ pub(in crate::ops::collect) struct Indexes {
     pub(super) constants: HashMap<String, bool>,
 
     /// Unambiguous source-written types for fields and constants.
-    pub(super) declared_types: HashMap<String, Option<Type>>,
+    pub(super) declared_types: HashMap<String, Option<DeclaredType>>,
 
     /// Return types of locally visible functions.
     pub(super) returns: HashMap<String, Option<Type>>,
@@ -149,6 +173,21 @@ impl Indexes {
                 }
             }
             let _previous = self.scope_imports.insert(scope, local);
+        }
+
+        for alias in self.aliases.values_mut().flatten() {
+            alias.imports = if alias.scope_path.is_empty() {
+                self.root_imports.clone()
+            } else {
+                self.scope_imports.get(&alias.scope_path).cloned().unwrap_or_default()
+            };
+        }
+        for declared in self.declared_types.values_mut().flatten() {
+            declared.imports = if declared.scope_path.is_empty() {
+                self.root_imports.clone()
+            } else {
+                self.scope_imports.get(&declared.scope_path).cloned().unwrap_or_default()
+            };
         }
     }
 }
@@ -262,7 +301,7 @@ impl Walk<'_> {
     /// Records one constant's declaration, demoting a name two declarations disagree about.
     pub(super) fn declared(&mut self, name: &str, ty: &Type) {
         if self.type_evidence {
-            merge_type(&mut self.indexes.declared_types, name, ty);
+            merge_declared_type(&mut self.indexes.declared_types, name, ty, &self.scope_path);
         }
 
         if self.numeric {
@@ -325,6 +364,8 @@ impl Walk<'_> {
             let alias = Alias {
                 parameters: generics.type_params().map(|parameter| parameter.ident.to_string()).collect(),
                 target: ty.clone(),
+                scope_path: self.scope_path.clone(),
+                imports: HashMap::default(),
             };
             let _known = self
                 .indexes
@@ -461,7 +502,7 @@ impl Walk<'_> {
 
             let name = name.to_string();
             if self.type_evidence {
-                merge_type(&mut self.indexes.declared_types, &name, &field.ty);
+                merge_declared_type(&mut self.indexes.declared_types, &name, &field.ty, &self.scope_path);
             }
 
             if !self.numeric {
@@ -479,6 +520,25 @@ impl Walk<'_> {
                 .and_modify(|known| *known = *known && numeric)
                 .or_insert(numeric);
         }
+    }
+
+    /// A nested concrete type takes precedence over a same-named alias from an outer scope.
+    pub(super) fn on_item_type_declaration(&mut self, node: &Item) {
+        if !self.type_evidence || self.scope_path.is_empty() {
+            return;
+        }
+        let name = match node {
+            Item::Struct(item) => &item.ident,
+            Item::Enum(item) => &item.ident,
+            Item::Union(item) => &item.ident,
+            _ => return,
+        };
+        let _previous = self
+            .indexes
+            .scope_imports
+            .entry(self.scope_path.clone())
+            .or_default()
+            .insert(name.to_string(), None);
     }
 
     pub(super) fn on_item_mod(&mut self, node: &ItemMod) {
@@ -593,6 +653,7 @@ impl<'ast> Visit<'ast> for Walk<'_> {
     /// `visit_item_static`, keeps one skipped item from reaching any of them.
     fn visit_item(&mut self, node: &'ast Item) {
         if !self.cfg.skip_gate(item_attrs(node)) {
+            self.on_item_type_declaration(node);
             if let Item::Mod(module) = node {
                 self.on_item_mod(module);
             }
@@ -783,7 +844,8 @@ impl<'cfg> Walk<'cfg> {
 
             // Several families need source-visible standard-library identities: value synthesis
             // and result mutation use them for `Default`, while integer decrement uses them to
-            // recognize fixed unsigned constructor arguments.
+            // recognize fixed unsigned constructor arguments. Additive assignments also need
+            // imported text and time types to avoid incompatible operator replacements.
             type_evidence: selection.any_in_family("fn_value")
                 || selection.contains("result.ok_to_err")
                 || selection.contains("result.err_to_ok")
@@ -795,6 +857,9 @@ impl<'cfg> Walk<'cfg> {
                 || selection.any_in_family("return_value")
                 || selection.any_in_family("bool_expr")
                 || selection.any_in_family("arith")
+                || ["assign.add_to_sub", "assign.add_to_mul", "assign.sub_to_add", "assign.sub_to_div"]
+                    .iter()
+                    .any(|mutator| selection.contains(mutator))
                 || selection.contains("iter.last_to_first")
                 || selection.contains("iter.remove_filter")
                 || selection.contains("expr.increment")
@@ -1175,6 +1240,10 @@ mod tests {
         let result = Walk::new(&Selection::parse("result.ok_to_err").expect("selector resolves"), &cfg);
         assert!(!result.numeric);
         assert!(result.type_evidence);
+
+        let assignment = Walk::new(&Selection::parse("assign.add_to_mul").expect("selector resolves"), &cfg);
+        assert!(!assignment.numeric);
+        assert!(assignment.type_evidence);
 
         let unrelated = Walk::new(&Selection::parse("literal.bool_flip").expect("selector resolves"), &cfg);
         assert!(!unrelated.numeric);
