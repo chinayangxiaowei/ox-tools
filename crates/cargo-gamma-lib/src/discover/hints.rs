@@ -2555,6 +2555,7 @@ mod tests {
             Outcome::NotBuilt,
             Outcome::NoCoverage,
             Outcome::OutOfMemory,
+            Outcome::LeakLimit,
             Outcome::Flaky,
             Outcome::Pending,
         ] {

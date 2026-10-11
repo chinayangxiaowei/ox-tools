@@ -41,6 +41,7 @@ use crate::error::Error;
 #[cfg(test)]
 use crate::model::MutantDefinition;
 use crate::ops::collect::Shape;
+use crate::reference_leak::generated_leak_call;
 use crate::{HashMap, Result};
 
 /// The crate path of the guard predicate, as it appears in instrumented source.
@@ -163,13 +164,20 @@ pub struct AssignedMutant<'a> {
     span: &'a Range<usize>,
     replacement: &'a str,
     shape: Shape,
+    monitor_reference_leak: bool,
 }
 
 impl<'a> AssignedMutant<'a> {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn new(ordinal: Ordinal, definition: &'a MutantDefinition) -> Self {
-        Self::from_parts(ordinal, definition.span(), &definition.replacement, definition.shape)
+        Self::from_parts_with_mutator(
+            ordinal,
+            definition.span(),
+            &definition.replacement,
+            definition.shape,
+            &definition.mutator,
+        )
     }
 
     #[doc(hidden)]
@@ -180,6 +188,19 @@ impl<'a> AssignedMutant<'a> {
             span,
             replacement,
             shape,
+            monitor_reference_leak: false,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_parts_with_mutator(ordinal: Ordinal, span: &'a Range<usize>, replacement: &'a str, shape: Shape, mutator: &str) -> Self {
+        Self {
+            ordinal,
+            span,
+            replacement,
+            shape,
+            monitor_reference_leak: mutator.starts_with("fn_value.") && generated_leak_call(replacement),
         }
     }
 }
@@ -303,7 +324,7 @@ struct Node<'a> {
     shape: Shape,
 
     /// Every mutant sharing exactly this span, in ordinal order.
-    mutants: Vec<(u32, &'a str)>,
+    mutants: Vec<(u32, &'a str, bool)>,
 
     /// Sites strictly contained within this one.
     children: Vec<Self>,
@@ -416,7 +437,8 @@ fn build_tree<'a>(sites: &[&'a AssignedMutant<'a>]) -> Result<Vec<Node<'a>>> {
             // spans with different shapes would be spliced with the wrong wrapper — an expression
             // guard around a statement, say — so they are kept apart and nested instead.
             if top.span == *mutant.span && top.shape == mutant.shape {
-                top.mutants.push((mutant.ordinal.get(), mutant.replacement));
+                top.mutants
+                    .push((mutant.ordinal.get(), mutant.replacement, mutant.monitor_reference_leak));
                 continue;
             }
 
@@ -433,7 +455,7 @@ fn build_tree<'a>(sites: &[&'a AssignedMutant<'a>]) -> Result<Vec<Node<'a>>> {
         stack.push(Node {
             span: (*mutant.span).clone(),
             shape: mutant.shape,
-            mutants: vec![(mutant.ordinal.get(), mutant.replacement)],
+            mutants: vec![(mutant.ordinal.get(), mutant.replacement, mutant.monitor_reference_leak)],
             children: Vec::new(),
         });
     }
@@ -461,7 +483,7 @@ fn render(text: &str, node: &Node<'_>, out: &mut String, spans: &mut HashMap<u32
     let start = out.len();
     let mut mutated = Vec::with_capacity(node.mutants.len());
 
-    for (ordinal, replacement) in &node.mutants {
+    for (ordinal, replacement, monitor_reference_leak) in &node.mutants {
         match node.shape {
             Shape::Expr | Shape::Block | Shape::IterBlock | Shape::IterExpr => {
                 let opening = if matches!(node.shape, Shape::Expr | Shape::IterExpr) {
@@ -480,7 +502,15 @@ fn render(text: &str, node: &Node<'_>, out: &mut String, spans: &mut HashMap<u32
 
                 let from = out.len();
 
+                // The active arm measures repeated growth around the generated leak. The listed
+                // replacement remains unchanged for no-op comparison and reporting.
+                if *monitor_reference_leak {
+                    out.push_str("::gamma_rt::watch_reference_leak(|| { ");
+                }
                 out.push_str(replacement);
+                if *monitor_reference_leak {
+                    out.push_str(" })");
+                }
                 mutated.push((*ordinal, from..out.len()));
 
                 if matches!(node.shape, Shape::IterBlock | Shape::IterExpr) {
@@ -527,7 +557,7 @@ fn render(text: &str, node: &Node<'_>, out: &mut String, spans: &mut HashMap<u32
     // An arm is disabled by a guard trailing its pattern. Several mutants on one arm chain with
     // `&&`, which is correct however many there are, though only one can ever be active at once.
     if node.shape == Shape::Arm {
-        for (index, (ordinal, _replacement)) in node.mutants.iter().enumerate() {
+        for (index, (ordinal, _replacement, _monitor_reference_leak)) in node.mutants.iter().enumerate() {
             let joiner = if index == 0 { " if" } else { " &&" };
 
             let _ = write!(out, "{joiner} !{GUARD_PATH}({ordinal}u32)");
@@ -595,6 +625,40 @@ mod tests {
             .iter()
             .map(|mutant| AssignedMutant::from_parts(Ordinal::new(mutant.ordinal), &mutant.span, &mutant.replacement, mutant.shape))
             .collect()
+    }
+
+    #[test]
+    fn generated_reference_leaks_are_watched_in_the_active_arm() {
+        let text = "fn f() -> &'static u8 { value() }";
+        let span = span_of(text, "{ value() }");
+        let bounded =
+            AssignedMutant::from_parts_with_mutator(Ordinal::new(1), &span, "&*Box::leak(Box::new(0))", Shape::Block, "fn_value.zero");
+        let instrumented = super::instrument(text, &[bounded]).expect("the source and span describe one function body");
+        assert_eq!(
+            instrumented,
+            "fn f() -> &'static u8 { if ::gamma_rt::a(1u32) { ::gamma_rt::watch_reference_leak(|| { &*Box::leak(Box::new(0)) }) } else { { value() } } }"
+        );
+
+        let unbounded = AssignedMutant::from_parts_with_mutator(
+            Ordinal::new(1),
+            &span,
+            "&*Box::leak(Box::new(Default::default()))",
+            Shape::Block,
+            "fn_value.default",
+        );
+        let instrumented = super::instrument(text, &[unbounded]).expect("the source and span describe one function body");
+        assert_eq!(
+            instrumented,
+            "fn f() -> &'static u8 { if ::gamma_rt::a(1u32) { ::gamma_rt::watch_reference_leak(|| { &*Box::leak(Box::new(Default::default())) }) } else { { value() } } }"
+        );
+
+        let unrelated =
+            AssignedMutant::from_parts_with_mutator(Ordinal::new(1), &span, "&*Box::leak(Box::new(0))", Shape::Block, "expr.increment");
+        let instrumented = super::instrument(text, &[unrelated]).expect("the source and span describe one function body");
+        assert_eq!(
+            instrumented,
+            "fn f() -> &'static u8 { if ::gamma_rt::a(1u32) { &*Box::leak(Box::new(0)) } else { { value() } } }"
+        );
     }
 
     /// Every `else` arm of an `IterBlock` must be wrapped, not only the one holding the original.

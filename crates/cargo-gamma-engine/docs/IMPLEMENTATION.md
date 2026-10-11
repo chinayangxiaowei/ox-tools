@@ -62,9 +62,13 @@ alias target has the standard type's inherent `new`.
 
 Return-value construction resolves local aliases without replacing their
 declared shape. Recursive products stop when any member lacks construction
-evidence. Reference construction is deliberately limited to source-independent
-promotable values such as `&[]`; the engine does not synthesize arbitrary
-borrowed values by leaking allocations.
+evidence. Reference construction uses literals for promotable values and
+`Box::leak` for sized referents, mutable strings, and array-backed slices.
+The compile oracle withdraws guesses that do not fit the signature. Local
+aliases are instantiated through type arguments and defaults; aliases with
+const parameters are withheld. Direct opaque `impl Trait` referents are also
+withheld. No-op detection stays limited to token identity and the existing
+bare boxed-default case, so a differently spelled equivalent may remain.
 
 Deletion safety remains an intra-procedural syntax analysis. The collector
 records deferred locals before examining assignments, protects explicit

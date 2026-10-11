@@ -63,6 +63,7 @@ pub struct Progress {
     survived: usize,
     timeouts: usize,
     out_of_memory: usize,
+    leak_limit: usize,
 }
 
 const _: () = {
@@ -93,6 +94,7 @@ impl Progress {
             survived: 0,
             timeouts: 0,
             out_of_memory: 0,
+            leak_limit: 0,
         }
     }
 
@@ -109,6 +111,7 @@ impl Progress {
         self.survived = 0;
         self.timeouts = 0;
         self.out_of_memory = 0;
+        self.leak_limit = 0;
         self.dirty = true;
     }
 
@@ -134,6 +137,7 @@ impl Progress {
             Outcome::Survived => self.survived += 1,
             Outcome::Timeout => self.timeouts += 1,
             Outcome::OutOfMemory => self.out_of_memory += 1,
+            Outcome::LeakLimit => self.leak_limit += 1,
             _ => {}
         }
 
@@ -583,7 +587,7 @@ impl Progress {
         }
 
         let room = self.width.saturating_sub(VERB_WIDTH + 1);
-        let mut findings = Vec::with_capacity(3);
+        let mut findings = Vec::with_capacity(4);
 
         if self.survived > 0 {
             findings.push(format!("{} survived", self.survived));
@@ -595,6 +599,9 @@ impl Progress {
 
         if self.out_of_memory > 0 {
             findings.push(format!("{} out of memory", self.out_of_memory));
+        }
+        if self.leak_limit > 0 {
+            findings.push(format!("{} reference leak limit", self.leak_limit));
         }
 
         let verdicts = if findings.is_empty() {
@@ -901,6 +908,16 @@ mod tests {
         progress.record(Outcome::OutOfMemory);
 
         assert!(progress.render().contains("(1 out of memory)"), "{}", progress.render());
+    }
+
+    #[test]
+    fn a_reference_leak_limit_is_counted_separately_from_out_of_memory() {
+        let mut progress = Progress::new(true, Styler::new(false), Some(200));
+        progress.set_total(2);
+        progress.record(Outcome::LeakLimit);
+
+        assert!(progress.render().contains("(1 reference leak limit)"), "{}", progress.render());
+        assert!(!progress.render().contains("out of memory"), "{}", progress.render());
     }
 
     #[test]

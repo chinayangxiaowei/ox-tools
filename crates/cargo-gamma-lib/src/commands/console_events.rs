@@ -172,10 +172,8 @@ impl<H: Host> crate::exec::Events for ConsoleEvents<'_, H> {
                 }
             }
 
-            // Both carry a note that says something the label cannot: which test a timeout stalled
-            // in, and what a memory kill peaked at against what ceiling. Neither is worth repeating
-            // the label for, so only the note is appended.
-            outcome @ (Outcome::Timeout | Outcome::OutOfMemory) => {
+            // Resource outcomes carry a note with the limit and the context that reached it.
+            outcome @ (Outcome::Timeout | Outcome::OutOfMemory | Outcome::LeakLimit) => {
                 let label = self.styler.outcome(outcome);
                 let detail = mutant_detail(mutant);
 
@@ -272,7 +270,7 @@ impl<H: Host> crate::exec::Events for ConsoleEvents<'_, H> {
 
 pub(super) fn mutant_detail(mutant: &crate::model::Mutant) -> String {
     let mut detail = match mutant.outcome {
-        Outcome::Timeout | Outcome::OutOfMemory | Outcome::Flaky | Outcome::CompileError => mutant
+        Outcome::Timeout | Outcome::OutOfMemory | Outcome::LeakLimit | Outcome::Flaky | Outcome::CompileError => mutant
             .note
             .as_deref()
             .map_or_else(|| mutant.describe(), |note| format!("{}: {note}", mutant.describe())),
@@ -719,6 +717,7 @@ mod tests {
             Outcome::Survived,
             Outcome::Timeout,
             Outcome::OutOfMemory,
+            Outcome::LeakLimit,
             Outcome::Flaky,
             Outcome::NoCoverage,
             Outcome::CompileError,

@@ -26,7 +26,7 @@
 //!
 //! # What a guard looks like
 //!
-//! [`a`] is the only function the instrumented source calls. Guard shape follows what Rust accepts
+//! [`a`] is the guard predicate called by instrumented source. Guard shape follows what Rust accepts
 //! at the mutation site:
 //!
 //! ```text
@@ -168,7 +168,8 @@
 //!
 //! # Runtime entry points
 //!
-//! [`a`] is what the guards call, and the only runtime entry point instrumented source contains.
+//! [`a`] is what the guards call. Generated reference leaks also call
+//! [`watch_reference_leak`] in the active arm.
 //! [`active`] and [`any`] are there for the tool's own diagnostics and for anyone inspecting a
 //! scratch tree by hand:
 //!
@@ -245,5 +246,7 @@ pub use either::Either;
 pub use runtime::run_loom_models;
 #[doc(inline)]
 pub use runtime::{
-    ACTIVE_VAR, CENSUS_VAR, ENVIRONMENT_ERROR_MARKER, MAX_CENSUS_SITES, NONE, OVERFLOW, PRE_INSTALL_ERROR_MARKER, SEAL, a, active, any,
+    ACTIVE_VAR, CENSUS_VAR, ENVIRONMENT_ERROR_MARKER, MAX_CENSUS_SITES, NONE, OVERFLOW, PRE_INSTALL_ERROR_MARKER, REFERENCE_LEAK_LIMIT,
+    REFERENCE_LEAK_LIMIT_MARKER, REFERENCE_LEAK_LIMIT_RECORD, REFERENCE_LEAK_RECEIPT_ERROR_MARKER, SEAL, a, active, any,
+    charge_reference_leak, watch_reference_leak,
 };

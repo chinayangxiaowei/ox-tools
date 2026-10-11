@@ -109,6 +109,7 @@ const fn label(outcome: Outcome) -> &'static str {
         Outcome::Killed => "Killed",
         Outcome::Timeout => "Timed out",
         Outcome::OutOfMemory => "Out of memory",
+        Outcome::LeakLimit => "Reference leak limit",
         Outcome::Survived => "Survived",
         Outcome::NoCoverage => "Uncovered",
         Outcome::Flaky => "Flaky",
@@ -363,6 +364,15 @@ mod tests {
         assert!(text.contains("**Score 50.0%**"), "{text}");
         assert!(text.contains("| Killed | 1 |"), "{text}");
         assert!(text.contains("| Survived | 1 |"), "{text}");
+    }
+
+    #[test]
+    fn reference_leak_limits_have_their_own_ci_summary_row() {
+        let mutants = vec![mutant("/w/src/a.rs", 1, "fn_value.default", Outcome::LeakLimit)];
+        let text = summary(&mutants, &root());
+
+        assert!(text.contains("| Reference leak limit | 1 |"), "{text}");
+        assert!(!text.contains("| Out of memory |"), "{text}");
     }
 
     #[test]

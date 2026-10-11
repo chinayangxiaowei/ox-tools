@@ -16,7 +16,7 @@ pub(super) fn findings(mutants: &[Mutant]) -> Vec<&Mutant> {
         .filter(|mutant| {
             matches!(
                 mutant.outcome,
-                Outcome::Survived | Outcome::Timeout | Outcome::OutOfMemory | Outcome::NoCoverage
+                Outcome::Survived | Outcome::Timeout | Outcome::OutOfMemory | Outcome::LeakLimit | Outcome::NoCoverage
             )
         })
         .collect()
@@ -57,10 +57,14 @@ pub(super) fn describe(mutant: &Mutant) -> String {
         Outcome::Timeout => format!("{} and the test run timed out before an assertion rejected it.", mutant.summary()),
         Outcome::OutOfMemory => {
             format!(
-                "{} and the test run exceeded its memory limit before an assertion rejected it.",
+                "{} and the test run reached a resource limit before an assertion rejected it.",
                 mutant.summary()
             )
         }
+        Outcome::LeakLimit => format!(
+            "{} and the generated reference leak guard stopped the test run before an assertion rejected it.",
+            mutant.summary()
+        ),
         _other => format!("{} and no test failed.", mutant.summary()),
     }
 }
@@ -80,15 +84,17 @@ mod tests {
             mutant("/w/src/a.rs", 4, "relational.gt_to_ge", Outcome::NoCoverage),
             mutant("/w/src/a.rs", 5, "relational.gt_to_ge", Outcome::CompileError),
             mutant("/w/src/a.rs", 6, "relational.gt_to_ge", Outcome::OutOfMemory),
+            mutant("/w/src/a.rs", 7, "relational.gt_to_ge", Outcome::LeakLimit),
         ];
 
         let found = findings(&mutants);
 
-        assert_eq!(found.len(), 4);
+        assert_eq!(found.len(), 5);
         assert_eq!(found[0].line, 2);
         assert_eq!(found[1].line, 3);
         assert_eq!(found[2].line, 4);
         assert_eq!(found[3].line, 6);
+        assert_eq!(found[4].line, 7);
     }
 
     #[test]
@@ -96,7 +102,8 @@ mod tests {
         for (outcome, phrase) in [
             (Outcome::NoCoverage, "No test reaches"),
             (Outcome::Timeout, "timed out"),
-            (Outcome::OutOfMemory, "memory limit"),
+            (Outcome::OutOfMemory, "resource limit"),
+            (Outcome::LeakLimit, "reference leak guard"),
             (Outcome::Survived, "no test failed"),
         ] {
             let finding = mutant("/w/src/a.rs", 1, "relational.gt_to_ge", outcome);

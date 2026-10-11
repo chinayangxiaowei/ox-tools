@@ -168,7 +168,8 @@ const fn verdict_label(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Killed => "Killed",
         Outcome::Timeout => "Timed out",
-        Outcome::OutOfMemory => "Stopped by the memory limit",
+        Outcome::OutOfMemory => "Stopped by a resource limit",
+        Outcome::LeakLimit => "Stopped by the reference leak guard",
         Outcome::Survived => "Survived",
         Outcome::NoCoverage => "Uncovered",
         Outcome::Flaky => "Flaky",
@@ -437,6 +438,7 @@ mod tests {
             survived: 1,
             timeout: 2,
             out_of_memory: 4,
+            leak_limit: 11,
             flaky: 5,
             unviable: 6,
             ignored: 7,
@@ -454,7 +456,8 @@ mod tests {
             .map(|(_, count, _)| count)
             .sum();
 
-        assert_eq!(counted, 55, "every mutant in the population must have a row: {document}");
+        assert_eq!(counted, 66, "every mutant in the population must have a row: {document}");
+        assert!(document.contains("Stopped by the reference leak guard"), "{document}");
         assert_eq!(scored, summary.valid(), "the scoring rows must sum to the denominator: {document}");
 
         // The score's numerator is on the page too: only assertion-driven kills.
@@ -484,7 +487,7 @@ mod tests {
 
         assert_eq!(
             run_table_rows(&document),
-            vec![("Stopped by the memory limit".to_owned(), 3, "100.0%".to_owned())],
+            vec![("Stopped by a resource limit".to_owned(), 3, "100.0%".to_owned())],
             "{document}"
         );
         assert!(document.contains("| **Score** | | **0.0%** |"), "{document}");
@@ -498,6 +501,7 @@ mod tests {
             survived: 0,
             timeout: 0,
             out_of_memory: 1,
+            leak_limit: 0,
             unviable: 1,
             ignored: 1,
             uncovered: 0,
@@ -511,7 +515,7 @@ mod tests {
         // table must not present them as a share of the mutation score. Memory exhaustion is in the
         // denominator and therefore still has a scored share despite earning no detection credit.
         assert_eq!(document.matches("not scored").count(), 5, "{document}");
-        assert!(document.contains("| Stopped by the memory limit | 1 | 50.0% |"), "{document}");
+        assert!(document.contains("| Stopped by a resource limit | 1 | 50.0% |"), "{document}");
     }
 
     #[test]

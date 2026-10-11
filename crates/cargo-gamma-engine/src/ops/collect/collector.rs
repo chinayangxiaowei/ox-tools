@@ -42,7 +42,7 @@ mod values;
 mod tests;
 
 use indexes::{ABSOLUTE_ROOT, Indexes, NumericUses, ScopePath, block_id, indexes_in, module_id};
-use noop::is_noop;
+use noop::{QualifiedBoxPaths, is_noop};
 use predicates::{
     binds_a_pattern, boolean_literal, callee_name, callee_type, declared_name, diverges, expr_attrs, ident_returns_float, is_assign_op,
     is_capacity_call, is_capacity_result, is_catch_all, is_default_call, is_diagnostic_message, is_int_literal, is_integer_zero_literal,
@@ -530,6 +530,11 @@ impl<'a> Collector<'a> {
         }
 
         let replacement = replacement.into();
+        let qualified_box = if replacement.contains("leak") {
+            QualifiedBoxPaths::in_scope(self.current_imports(), &self.generics, &self.defaulted)
+        } else {
+            QualifiedBoxPaths::default()
+        };
 
         // A mutant that reproduces the code it replaces cannot be caught by any test, because
         // there is nothing to catch. Reporting it would accuse the suite of a gap that does not
@@ -540,6 +545,7 @@ impl<'a> Collector<'a> {
             shape,
             &self.default_paths,
             &self.defaulted,
+            qualified_box,
         ) {
             return;
         }

@@ -24,6 +24,14 @@ pub fn instrument_with_guards(text: &str, mutants: &[&Mutant]) -> Result<(String
 fn sites<'a>(mutants: &[&'a Mutant]) -> Vec<AssignedMutant<'a>> {
     mutants
         .iter()
-        .map(|mutant| AssignedMutant::from_parts(Ordinal::new(mutant.ordinal), &mutant.span, &mutant.replacement, mutant.shape))
+        .map(|mutant| {
+            AssignedMutant::from_parts_with_mutator(
+                Ordinal::new(mutant.ordinal),
+                &mutant.span,
+                &mutant.replacement,
+                mutant.shape,
+                &mutant.mutator,
+            )
+        })
         .collect()
 }

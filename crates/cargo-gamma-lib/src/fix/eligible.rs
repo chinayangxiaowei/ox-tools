@@ -25,6 +25,11 @@ pub enum Eligible {
     /// that works on the maintainer's laptop and not in CI.
     OutOfMemory,
 
+    /// The generated reference leak guard reached its call or RSS growth allowance.
+    ///
+    /// Eligible by default for the same reason as the other resource outcomes.
+    LeakLimit,
+
     /// The mutant did not compile.
     Unviable,
 }
@@ -42,6 +47,7 @@ impl Eligible {
             match entry {
                 "timeout" => out.push(Self::Timeout),
                 "outofmem" | "oom" | "out-of-memory" => out.push(Self::OutOfMemory),
+                "leaklimit" => out.push(Self::LeakLimit),
                 "unviable" | "compile-error" => out.push(Self::Unviable),
 
                 "missed" | "survived" | "survivor" => {
@@ -52,7 +58,9 @@ impl Eligible {
                 }
 
                 other => {
-                    return Err(error!("unknown verdict `{other}`; --eligible accepts `timeout`, `outofmem` and `unviable`").usage());
+                    return Err(
+                        error!("unknown verdict `{other}`; --eligible accepts `timeout`, `outofmem`, `leaklimit` and `unviable`").usage(),
+                    );
                 }
             }
         }
@@ -69,6 +77,7 @@ impl Eligible {
         match self {
             Self::Timeout => "timeout",
             Self::OutOfMemory => "outofmem",
+            Self::LeakLimit => "leaklimit",
             Self::Unviable => "unviable",
         }
     }
@@ -79,6 +88,7 @@ impl Eligible {
         match self {
             Self::Timeout => Outcome::Timeout,
             Self::OutOfMemory => Outcome::OutOfMemory,
+            Self::LeakLimit => Outcome::LeakLimit,
             Self::Unviable => Outcome::CompileError,
         }
     }
@@ -122,13 +132,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_reference_leak_limit_has_a_distinct_suppression_tag() {
+        let parsed = Eligible::parse("leaklimit").expect("the reported verdict is suppressible");
+
+        assert_eq!(parsed, vec![Eligible::LeakLimit]);
+        assert_eq!(parsed[0].outcome(), Outcome::LeakLimit);
+        assert_eq!(parsed[0].tag(), "leaklimit");
+    }
+
     /// Every eligible verdict maps to a distinct outcome and a distinct tag.
     ///
     /// Two variants sharing an outcome would make `plan`'s first-match lookup pick arbitrarily, and
     /// two sharing a tag would merge suppressions that were written for different reasons.
     #[test]
     fn each_eligible_verdict_has_its_own_outcome_and_tag() {
-        let all = [Eligible::Timeout, Eligible::OutOfMemory, Eligible::Unviable];
+        let all = [Eligible::Timeout, Eligible::OutOfMemory, Eligible::LeakLimit, Eligible::Unviable];
 
         for (index, entry) in all.iter().enumerate() {
             for other in &all[index + 1..] {
@@ -148,5 +167,6 @@ mod tests {
             cause.to_string().contains("outofmem"),
             "the message must name every accepted verdict: {cause}"
         );
+        assert!(cause.to_string().contains("leaklimit"), "{cause}");
     }
 }

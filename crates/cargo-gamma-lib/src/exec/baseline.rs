@@ -388,6 +388,13 @@ fn baseline_failure_error_with_limit(
             Some("the test workload exceeded its configured baseline memory ceiling"),
             Some(*limit),
         ),
+        Verdict::ReferenceLeakLimit => (
+            "infrastructureFailure",
+            None,
+            None,
+            Some("a generated reference leak allowance was reported during an unmutated baseline"),
+            None,
+        ),
         Verdict::Unmetered(reason) | Verdict::Unjudged(reason) => ("infrastructureFailure", None, None, Some(reason.as_str()), None),
         Verdict::Passed => unreachable!("a passing baseline never constructs a failure"),
     };

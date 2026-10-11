@@ -59,6 +59,22 @@ coordinator excludes this infrastructure failure from mutation scoring.
 Targets without a supported constructor mechanism, and Miri
 executions that cannot run one, use the permanent unmutated fallback instead.
 
+For generated reference leaks, the runtime atomically admits at most 8192
+construction calls per test process. The charge happens in the active guard arm
+before construction, including calls from concurrent test threads. On macOS,
+the first completed construction establishes a current RSS baseline through
+`proc_pid_rusage`; subsequent calls that grow RSS by at least 64 MiB exhaust
+the allowance as well. This is a process-local growth signal, not a hard memory
+limit, and it does not reject a large first construction: one call can be part
+of normal execution, while the guard is aimed at repeated leakage. A single
+constructor that exhausts memory before returning is a separate resource
+problem. Only one mutant is active in a process, so the counter and RSS baseline
+do not combine different mutants; each new process starts with fresh state. On
+exhaustion the runtime appends a receipt to the per-run reach file, closes it,
+and exits without unwinding. The coordinator uses the receipt to report resource
+exhaustion rather than a test failure. If opening, writing, or closing the receipt
+fails, the runtime emits a distinct error diagnostic and the mutant stays pending.
+
 On non-Linux Unix targets, `getenv` is used under POSIX's precondition that no
 native environment mutation occurs concurrently. The capture runs before Rust
 `main`, so safe Rust cannot have started such a mutation; a foreign native

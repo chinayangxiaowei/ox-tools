@@ -19,6 +19,7 @@ use std::thread;
 use std::time::Instant;
 
 use camino::Utf8Path;
+use cargo_gamma_engine::reference_leak::generated_leak_call;
 use cargo_gamma_process::MemoryRequest;
 
 use super::census::{Census, CensusSelection, CensusWork};
@@ -39,6 +40,9 @@ use crate::error::error;
 use crate::model::{Mutant, Outcome};
 use crate::report::{encode_controls, encode_preserving_color};
 use crate::{Result, notes};
+
+/// A scheduler-only resource reserved by each generated reference leak mutant.
+const REFERENCE_LEAK_RESOURCE: &str = "cargo-gamma:generated-reference-leak";
 
 /// The minimum launch-cost estimate used by census admission.
 ///
@@ -1203,6 +1207,11 @@ pub(super) fn test_all(
         })
         .collect();
 
+    let generated_leaks = pending
+        .iter()
+        .map(|position| generated_reference_leak(&plan.mutants[*position]))
+        .collect::<Vec<_>>();
+
     let mut files: crate::HashMap<_, usize> = crate::HashMap::default();
     let mut item_counts: crate::HashMap<_, usize> = crate::HashMap::default();
     let file_slots: Vec<usize> = pending
@@ -1290,6 +1299,10 @@ pub(super) fn test_all(
             .collect()
         })
         .collect();
+    let mut resource_capacities = work.resource_capacities();
+    if generated_leaks.iter().any(|leak| *leak) {
+        let _previous = resource_capacities.insert(Arc::from(REFERENCE_LEAK_RESOURCE), 1);
+    }
     let scheduler = Scheduler::with_resources(
         pending
             .iter()
@@ -1302,18 +1315,21 @@ pub(super) fn test_all(
                 sibling_benefit: sibling_benefits[index],
                 hinted: hints[index].is_some(),
                 stable_order: index,
-                resources: scheduled_resources(
-                    work,
-                    planned[index],
-                    reachable[index],
-                    hints[index].as_ref(),
-                    ordinals[index].0,
-                    sweep.census,
+                resources: reference_leak_resources(
+                    scheduled_resources(
+                        work,
+                        planned[index],
+                        reachable[index],
+                        hints[index].as_ref(),
+                        ordinals[index].0,
+                        sweep.census,
+                    ),
+                    generated_leaks[index],
                 ),
             })
             .collect(),
         file_paths.len(),
-        work.resource_capacities(),
+        resource_capacities,
     );
     let notes = notes::current();
 
@@ -1327,6 +1343,7 @@ pub(super) fn test_all(
             let hints = &hints;
             let reach_hints = &reach_hints;
             let pending = &pending;
+            let generated_leaks = &generated_leaks;
             let file_slots = &file_slots;
             let item_paths = &item_paths;
             let site_identities = &site_identities;
@@ -1353,21 +1370,29 @@ pub(super) fn test_all(
                     let reachable = &reachable[index];
                     begin_selection_trace();
                     let _sent = sender.send(SweepEvent::Started);
-                    let judged = judge_learning(
-                        work,
-                        active,
-                        reachable,
-                        hints[index].as_ref(),
-                        &reach_hints[index],
-                        &file_killers[file_slots[index]],
-                        &item_paths[index],
-                        &site_identities[index],
-                        negative,
-                        deterministic_reach,
-                        timeout_multiplier,
-                        sweep,
-                        tally,
-                    );
+                    let judged = if generated_leaks[index] && defer_generated_leak_without_ceiling(reachable, active, sweep.census) {
+                        Judgement::Reached(
+                            Outcome::Pending,
+                            None,
+                            Some("generated reference leak has no fixed allocation bound and a reachable test binary has no enforced memory ceiling".to_owned()),
+                        )
+                    } else {
+                        judge_learning(
+                            work,
+                            active,
+                            reachable,
+                            hints[index].as_ref(),
+                            &reach_hints[index],
+                            &file_killers[file_slots[index]],
+                            &item_paths[index],
+                            &site_identities[index],
+                            negative,
+                            deterministic_reach,
+                            timeout_multiplier,
+                            sweep,
+                            tally,
+                        )
+                    };
                     let attempts = take_selection_trace();
 
                     let (outcome, killer, note) = match judged {
@@ -1543,6 +1568,31 @@ fn pending_positions(plan: &Plan) -> Vec<usize> {
         .filter(|(_position, mutant)| mutant.ordinal != 0 && mutant.outcome == Outcome::Pending)
         .map(|(position, _mutant)| position)
         .collect()
+}
+
+fn generated_reference_leak(mutant: &Mutant) -> bool {
+    mutant.mutator.starts_with("fn_value.") && generated_leak_call(&mutant.replacement)
+}
+
+fn unbounded_leak_without_ceiling(reachable: &[&TestBinary], ordinal: u32, census: &Census) -> bool {
+    reachable
+        .iter()
+        .any(|binary| binary.memory.is_none() && !matches!(census.selection(binary, ordinal), CensusSelection::Uncovered))
+}
+
+fn defer_generated_leak_without_ceiling(reachable: &[&TestBinary], ordinal: u32, census: &Census) -> bool {
+    // On macOS we keep reachable reference mutants even without a hard subtree memory ceiling.
+    // The injected guard counts calls and samples process RSS only after construction returns;
+    // one large construction or a descendant allocation can still exhaust the host first.
+    // Accept that residual risk here so a normal first construction does not discard the mutant.
+    !cfg!(target_os = "macos") && unbounded_leak_without_ceiling(reachable, ordinal, census)
+}
+
+fn reference_leak_resources(mut resources: Vec<Arc<str>>, generated_leak: bool) -> Vec<Arc<str>> {
+    if generated_leak && !resources.iter().any(|resource| resource.as_ref() == REFERENCE_LEAK_RESOURCE) {
+        resources.push(Arc::from(REFERENCE_LEAK_RESOURCE));
+    }
+    resources
 }
 
 // #[gamma::skip(all, reason = "this orchestration side effect crosses a process, event, cache, or synchronization boundary that cannot be isolated safely in a deterministic unit test")]
@@ -1744,6 +1794,7 @@ fn transfer_observation(verdict: &Verdict) -> Option<bool> {
         | Verdict::TimedOut
         | Verdict::Stalled(_)
         | Verdict::MemoryLimit { .. }
+        | Verdict::ReferenceLeakLimit
         | Verdict::Flaky(_)
         | Verdict::Unmetered(_)
         | Verdict::Unjudged(_) => None,
@@ -2463,6 +2514,7 @@ fn terminal_judgement(binary: &TestBinary, verdict: Verdict) -> Option<Judgement
             None,
             Some(memory_note(&binary.path, peak, limit)),
         )),
+        Verdict::ReferenceLeakLimit => Some(Judgement::Reached(Outcome::LeakLimit, None, Some(reference_leak_limit_note()))),
         Verdict::Flaky(test) => Some(Judgement::Reached(
             Outcome::Flaky,
             None,
@@ -2470,6 +2522,23 @@ fn terminal_judgement(binary: &TestBinary, verdict: Verdict) -> Option<Judgement
         )),
         Verdict::Unmetered(reason) => Some(Judgement::Abandoned(reason)),
         Verdict::Unjudged(reason) => Some(Judgement::Reached(Outcome::Pending, None, Some(reason))),
+    }
+}
+
+fn reference_leak_limit_note() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!(
+            "generated reference leak exceeded the per-process allowance of {} calls or 64 MiB RSS growth",
+            gamma_rt::REFERENCE_LEAK_LIMIT
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!(
+            "generated reference leak exceeded the per-process allowance of {} calls",
+            gamma_rt::REFERENCE_LEAK_LIMIT
+        )
     }
 }
 
@@ -3758,6 +3827,105 @@ mod tests {
         // Blaming the tests that exist for code nothing links would make the score a measure of
         // the build graph rather than of the suite.
         assert_eq!(plan.mutants[0].outcome, Outcome::NoCoverage);
+    }
+
+    #[test]
+    fn generated_reference_leak_detection_ignores_literal_and_comment_text() {
+        let mut plan = one_mutant_plan(Utf8PathBuf::from("/synthetic"));
+        let mutant = &mut plan.mutants[0];
+        mutant.mutator = "fn_value.one".into();
+        mutant.replacement = "&*Box::leak(Box::new(1))".into();
+        assert!(generated_reference_leak(mutant));
+
+        plan.mutants[0].mutator = "relational.gt_to_ge".into();
+        assert!(!generated_reference_leak(&plan.mutants[0]));
+
+        plan.mutants[0].mutator = "fn_value.stated".into();
+        plan.mutants[0].replacement = "\"Box::leak(\"".into();
+        assert!(!generated_reference_leak(&plan.mutants[0]));
+        plan.mutants[0].replacement = "\"safe\" /* Box::leak( */".into();
+        assert!(!generated_reference_leak(&plan.mutants[0]));
+        plan.mutants[0].replacement = "Some(&*Vec::leak(vec![1]))".into();
+        assert!(generated_reference_leak(&plan.mutants[0]));
+        plan.mutants[0].replacement = "wrapper!(Box::leak(Box::new(1)))".into();
+        assert!(generated_reference_leak(&plan.mutants[0]));
+        plan.mutants[0].replacement = "r#Box::r#leak(r#Box::new(1))".into();
+        assert!(generated_reference_leak(&plan.mutants[0]));
+    }
+
+    #[test]
+    fn unknown_reference_leaks_require_a_ceiling_only_where_tests_can_reach_them() {
+        let mut binary = crate::testing::test_binary("subject");
+        let ordinal = 7;
+        let blind = Census::default();
+        assert!(unbounded_leak_without_ceiling(&[&binary], ordinal, &blind));
+        #[cfg(not(target_os = "macos"))]
+        assert!(defer_generated_leak_without_ceiling(&[&binary], ordinal, &blind));
+
+        binary.memory = Some(1024);
+        assert!(!unbounded_leak_without_ceiling(&[&binary], ordinal, &blind));
+
+        binary.memory = None;
+        let uncovered = Census::examined(&binary.path, ordinal, 0, 4);
+        assert!(!unbounded_leak_without_ceiling(&[&binary], ordinal, &uncovered));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_generated_unknown_leak_without_a_ceiling_is_left_pending_without_launching_tests() {
+        let (_directory, work, mut plan, binaries) = harness("exit 97", Duration::from_secs(1));
+        plan.mutants[0].mutator = "fn_value.default".into();
+        plan.mutants[0].replacement = "&*Box::leak(Box::new(Default::default()))".into();
+        let scope = TestScope {
+            packages: &[],
+            package_local: false,
+            whole_workspace: true,
+        };
+        let reach = Reachability::build(&plan, &binaries, &scope);
+
+        let _spent = test_all(
+            &work,
+            &mut plan,
+            &reach,
+            sweep(Stall::NONE),
+            false,
+            &mut Killers::default(),
+            &mut crate::testing::Recorder::default(),
+        )
+        .expect("the sweep does not need to launch an unbounded leak");
+
+        assert_eq!(plan.mutants[0].outcome, Outcome::Pending);
+        assert!(
+            plan.mutants[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("no enforced memory ceiling"))
+        );
+
+        let census = Census::examined(&binaries[0].path, plan.mutants[0].ordinal, 0, 4);
+        let _spent = test_all(
+            &work,
+            &mut plan,
+            &reach,
+            Sweep {
+                census: &census,
+                ..sweep(Stall::NONE)
+            },
+            false,
+            &mut Killers::default(),
+            &mut crate::testing::Recorder::default(),
+        )
+        .expect("the complete census settles a site no test reaches");
+        assert_eq!(plan.mutants[0].outcome, Outcome::NoCoverage);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_unknown_reference_leaks_use_the_runtime_monitor() {
+        let binary = crate::testing::test_binary("subject");
+        let census = Census::default();
+        assert!(unbounded_leak_without_ceiling(&[&binary], 7, &census));
+        assert!(!defer_generated_leak_without_ceiling(&[&binary], 7, &census));
     }
 
     /// A package whose only test binary announced no tests is uncovered, not full of survivors.
@@ -6044,6 +6212,17 @@ mod tests {
         binary.target = "lib".to_owned();
 
         assert!(terminal_judgement(&binary, Verdict::Passed).is_none());
+        let Some(Judgement::Reached(Outcome::LeakLimit, None, Some(note))) = terminal_judgement(&binary, Verdict::ReferenceLeakLimit)
+        else {
+            panic!("reference leak exhaustion must retain its distinct resource result");
+        };
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            note,
+            "generated reference leak exceeded the per-process allowance of 8192 calls or 64 MiB RSS growth"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(note, "generated reference leak exceeded the per-process allowance of 8192 calls");
         assert!(matches!(
             terminal_judgement(&binary, Verdict::Failed(Some("tests::caught".to_owned()))),
             Some(Judgement::Reached(
@@ -6676,6 +6855,27 @@ mod tests {
             .assignment(&abandoned)
             .expect("releasing the resource admits blocked work");
         assert_eq!(blocked.index(), 1);
+    }
+
+    #[test]
+    fn concurrent_workers_admit_only_one_generated_reference_leak() {
+        let mut first = scheduled(0, "first", "a", 30, 0, false, 0);
+        first.resources = reference_leak_resources(first.resources, true);
+        let mut second = scheduled(1, "second", "b", 20, 0, false, 1);
+        second.resources = reference_leak_resources(second.resources, true);
+        let mut unrelated = scheduled(2, "ordinary", "c", 10, 0, false, 2);
+        unrelated.resources = reference_leak_resources(unrelated.resources, false);
+        let capacities = crate::HashMap::from_iter([(Arc::from(REFERENCE_LEAK_RESOURCE), 1)]);
+        let scheduler = Scheduler::with_resources(vec![first, second, unrelated], 3, capacities);
+        let abandoned = OnceLock::new();
+
+        let first = scheduler.assignment(&abandoned).expect("the first leak is admitted");
+        assert_eq!(first.index(), 0);
+        let ordinary = scheduler.assignment(&abandoned).expect("ordinary work remains available");
+        assert_eq!(ordinary.index(), 2);
+        drop(first);
+        let second = scheduler.assignment(&abandoned).expect("the second leak starts after release");
+        assert_eq!(second.index(), 1);
     }
 
     #[test]

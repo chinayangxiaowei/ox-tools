@@ -165,6 +165,17 @@ an unrelated same-named type elsewhere in the workspace cannot change the decisi
 local paths and aliases remain unresolved rather than borrowing evidence by their final segment. A
 **resolved package Default type** is a local type whose declarations establish `Default`; an
 **unresolved concrete type or alias** has no such positive evidence.
+Functions returning `&T` or `&mut T` can receive whole-body replacements.
+Gamma borrows literals and their name-independent tuple and array compositions
+without allocating; enum variants and other constructible referents use
+`Box::leak`, including type-parameterized local aliases. Const-parameterized
+aliases and direct references to `impl Trait` are withheld. Generated leaks run
+one at a time across workers. They are limited to 8192 construction calls per test
+process. On macOS, a large first construction is allowed and later calls are
+checked for 64 MiB of RSS growth. On other hosts, generated leaks need an
+enforced memory ceiling or remain pending. A
+[stated value](#stating-the-value-yourself) can supply a specific reference.
+Mutations within the body remain eligible.
 
 ### `relational`
 
@@ -942,11 +953,29 @@ standard name and matches its shape remains ambiguous only without positive work
 evidence. With that evidence it uses `Default::default()`; without it, the guessed standard
 constructor may produce an unviable mutant.
 
-A function returning a reference is not given a fabricated leaked allocation. Such a
-replacement can change ownership and lifetime behavior independently of the returned value, and
-reference payloads frequently lack enough source evidence to construct a compiling value. This
-includes `&mut str`: its only source-independent construction would leak a fresh `String` on every
-invocation. Use `#[gamma::value(...)]` where a stable reference value is available and meaningful.
+A reference return can receive a whole-body replacement. A shared reference to a
+literal or a tuple or array of such literals borrows that value directly, with
+the compiler checking whether constant promotion gives it the required
+lifetime. Other constructible referents use `Box::leak`; shared returns
+explicitly reborrow the leaked value as `&T`. A nonempty shared `&[T]`
+replacement uses a promoted array when its element is promotable, while other
+nonempty slices and nonempty `&mut [T]` replacements leak a boxed one-element
+array. Empty shared slices and zero-length arrays use `&[]`; mutable ones use
+`&mut []`. A shared unit return uses `&()`, so unchanged
+returns are not counted as mutants.
+For `&mut str`, it leaks a boxed string. A shared
+`&str`, including parenthesized and standard qualified spellings of `str`, uses
+a static literal. A guessed referent that
+cannot be constructed becomes an unviable mutant at build time. Leaked
+allocations persist for the mutant process's lifetime and may change resource
+use independently of the returned value. Exhausting the 8192-call allowance
+is reported as `leaklimit` rather than `outofmem` or a test kill. On macOS the first
+construction establishes a process RSS baseline; 64 MiB of later growth also
+produces the same verdict. A normal test may call the function once, so the
+first construction is allowed; a one-call OOM is a separate resource problem,
+not a reason to omit that candidate. The check cannot prevent a single huge
+allocation or a hang inside one constructor.
+On other hosts generated leaks need an enforced memory ceiling or remain pending.
 
 A function returning `impl Iterator` is offered `core::iter::empty()`, and `core::iter::once(v)` for
 each value its `Item` type yields. This is the one return type whose mutant cannot simply be dropped
@@ -981,7 +1010,7 @@ to the item unchanged, so it costs a normal build nothing.
 It is worth reaching for in two situations:
 
 - **A site the tool withholds a mutant from.** A bare type parameter, an unresolved associated
-  type, a reference, a `Box<dyn Trait>` or a non-iterator `impl Trait` are all types with no value
+  type, a `Box<dyn Trait>` or a non-iterator `impl Trait` are all types with no value
   the tool can conservatively name.
   Stating one creates the mutant, and the function stops being invisible to the family whose whole
   question is whether anything checks what it returns.

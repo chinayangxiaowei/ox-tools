@@ -324,6 +324,11 @@ impl Walk<'_> {
         if self.type_evidence {
             let alias = Alias {
                 parameters: generics.type_params().map(|parameter| parameter.ident.to_string()).collect(),
+                defaults: generics
+                    .type_params()
+                    .map(|parameter| parameter.default.as_ref().map(|(_, ty)| ty.clone()))
+                    .collect(),
+                has_const_parameters: generics.const_params().next().is_some(),
                 target: ty.clone(),
             };
             let _known = self
@@ -410,6 +415,22 @@ impl Walk<'_> {
             Self::merge_import(&mut self.indexes.root_imports, name, prefix);
         } else {
             Self::merge_import(self.indexes.scope_imports.entry(self.scope_path.clone()).or_default(), name, prefix);
+        }
+    }
+
+    /// Record declarations that can hide the prelude `Box` or a standard crate root.
+    pub(super) fn on_item_box_path_shadow(&mut self, item: &Item) {
+        let name = match item {
+            Item::Struct(item) => &item.ident,
+            Item::Enum(item) => &item.ident,
+            Item::Union(item) => &item.ident,
+            Item::Type(item) => &item.ident,
+            Item::ExternCrate(item) => item.rename.as_ref().map_or(&item.ident, |(_, rename)| rename),
+            _ => return,
+        };
+        if name == "Box" || name == "std" || name == "alloc" {
+            let name = name.to_string();
+            self.imported(name.clone(), &["self".to_owned(), name]);
         }
     }
 
@@ -593,6 +614,7 @@ impl<'ast> Visit<'ast> for Walk<'_> {
     /// `visit_item_static`, keeps one skipped item from reaching any of them.
     fn visit_item(&mut self, node: &'ast Item) {
         if !self.cfg.skip_gate(item_attrs(node)) {
+            self.on_item_box_path_shadow(node);
             if let Item::Mod(module) = node {
                 self.on_item_mod(module);
             }

@@ -760,7 +760,7 @@ fn postprocessing_advice(root: &Utf8Path, stored: &crate::discover::RunRecord, r
     let suppressible = stored
         .outcomes()
         .iter()
-        .any(|entry| matches!(entry.outcome, Outcome::Timeout | Outcome::OutOfMemory));
+        .any(|entry| matches!(entry.outcome, Outcome::Timeout | Outcome::OutOfMemory | Outcome::LeakLimit));
 
     (crate::discover::Hints::record_promotion_is_useful(root, stored), suppressible)
 }
@@ -2177,6 +2177,7 @@ mod tests {
             expecting(Outcome::Survived, false),
             expecting(Outcome::Timeout, false),
             expecting(Outcome::OutOfMemory, false),
+            expecting(Outcome::LeakLimit, false),
         ];
 
         assert!(broken_expectations(&mutants).is_empty());

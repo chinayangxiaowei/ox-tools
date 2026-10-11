@@ -86,7 +86,7 @@ pub fn render(plan: &Plan, session: Option<&Session>, jobs: usize, wall: Duratio
     );
 
     // Every outcome is named, including the ones that are zero: this is the dump a user sends when
-    // they cannot explain a run, and it sits beside a JSON bundle that carries all ten. A line
+    // they cannot explain a run, and it sits beside a JSON bundle that carries all eleven. A line
     // listing a hand-picked subset makes the two halves of the same dump disagree, and leaves a
     // reader unable to tell a category nobody printed from mutants that went missing.
     let counts: Vec<String> = Outcome::ALL
@@ -569,6 +569,7 @@ const fn label(outcome: Outcome) -> &'static str {
         Outcome::Survived => "survived",
         Outcome::Timeout => "timeout",
         Outcome::OutOfMemory => "outofmem",
+        Outcome::LeakLimit => "leaklimit",
         Outcome::Flaky => "flaky",
         Outcome::CompileError => "unviable",
         Outcome::Ignored => "ignored",
@@ -686,6 +687,7 @@ mod tests {
             (Outcome::Survived, "survived"),
             (Outcome::Timeout, "timeout"),
             (Outcome::OutOfMemory, "outofmem"),
+            (Outcome::LeakLimit, "leaklimit"),
             (Outcome::Flaky, "flaky"),
             (Outcome::CompileError, "unviable"),
             (Outcome::Ignored, "ignored"),
@@ -1095,7 +1097,10 @@ mod tests {
 
         // Unviable mutants are withdrawn from the score, but the diagnostic table keeps their cost
         // visible to someone improving the mutator.
-        assert!(text.contains("outcomes  0 killed, 0 timeout, 0 outofmem, 1 survived,"), "{text}");
+        assert!(
+            text.contains("outcomes  0 killed, 0 timeout, 0 outofmem, 0 leaklimit, 1 survived,"),
+            "{text}"
+        );
         assert!(text.contains(", 1 unviable, 0 ignored, 0 notbuilt, 0 pending"), "{text}");
         assert!(
             text.contains("      30ms        2          1         1  arith.add_to_sub"),
@@ -1160,6 +1165,7 @@ mod tests {
                 mutant("uncovered.rs", "m", Outcome::NoCoverage, 40),
                 mutant("pending.rs", "m", Outcome::Pending, 30),
                 mutant("outofmem.rs", "m", Outcome::OutOfMemory, 20),
+                mutant("leaklimit.rs", "m", Outcome::LeakLimit, 15),
                 mutant("notbuilt.rs", "m", Outcome::NotBuilt, 10),
             ]),
             None,
@@ -1169,7 +1175,16 @@ mod tests {
 
         // The table is intentionally unstyled, so every verdict has to be rendered as text that
         // still lines up in a plain diagnostic dump.
-        for label in ["timeout", "unviable", "ignored", "uncovered", "pending", "outofmem", "notbuilt"] {
+        for label in [
+            "timeout",
+            "unviable",
+            "ignored",
+            "uncovered",
+            "pending",
+            "outofmem",
+            "leaklimit",
+            "notbuilt",
+        ] {
             assert!(text.contains(label), "{text}");
         }
     }

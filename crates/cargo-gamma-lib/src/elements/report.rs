@@ -335,6 +335,9 @@ pub struct Position {
 /// would be an extension a strict validator could reject.
 pub(super) const OUT_OF_MEMORY_PREFIX: &str = "out of memory: ";
 
+/// Preserves a generated reference leak guard verdict exported as schema `Survived`.
+pub(super) const LEAK_LIMIT_PREFIX: &str = "reference leak limit: ";
+
 /// Marks a timed-out mutant exported as schema `Survived`.
 ///
 /// The schema treats its `Timeout` status as detected. Gamma does not: a resource limit observed
@@ -365,14 +368,14 @@ pub(crate) fn is_flaky_status(status: &str, reason: Option<&str>) -> bool {
 
 /// Maps a verdict onto the schema's closed status enum.
 ///
-/// The schema treats `Timeout` as detected, so Gamma exports both resource-exhaustion outcomes as
+/// The schema treats `Timeout` as detected, so Gamma exports resource-exhaustion outcomes as
 /// `Survived` with reason prefixes. They remain in the denominator without entering the numerator,
 /// and the prefixes preserve the verdicts the schema cannot represent directly.
 const fn status_of(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Pending => "Pending",
         Outcome::Killed => "Killed",
-        Outcome::Survived | Outcome::Timeout | Outcome::OutOfMemory => "Survived",
+        Outcome::Survived | Outcome::Timeout | Outcome::OutOfMemory | Outcome::LeakLimit => "Survived",
         Outcome::CompileError => "CompileError",
         // A mutant the build never compiled is `Ignored` rather than `NoCoverage`: both are real
         // options here, but `NoCoverage` is in the schema's denominator and would lower the score
@@ -442,6 +445,13 @@ fn reason_for(mutant: &Mutant) -> Option<String> {
                 .note
                 .clone()
                 .unwrap_or_else(|| "the test run exceeded the memory this run allowed it".to_owned())
+        )),
+        Outcome::LeakLimit => Some(format!(
+            "{LEAK_LIMIT_PREFIX}{}",
+            mutant
+                .note
+                .clone()
+                .unwrap_or_else(|| "the generated reference leak guard stopped the test process".to_owned())
         )),
         Outcome::NoCoverage => Some(
             "no selected runtime test reached this mutation site; coverage reports may exclude this code or include other configurations"
@@ -1120,7 +1130,7 @@ mod tests {
 
         // Every non-`Pending` verdict is pinned to the *exact* schema status it exports as, not
         // merely to some valid one: a membership check survives swapping `Killed`→`Survived` or
-        // `NoCoverage`→`Ignored`, because the replacement is itself valid. `OutOfMemory`, `Flaky`,
+        // `NoCoverage`→`Ignored`, because the replacement is itself valid. Resource outcomes, `Flaky`,
         // and `NotBuilt` have no status of their own and are folded onto the closest one the schema
         // does have; getting any of these wrong silently changes the score a reader sees in the
         // viewer relative to the printed one.
@@ -1129,6 +1139,7 @@ mod tests {
             (Outcome::Survived, "Survived"),
             (Outcome::Timeout, "Survived"),
             (Outcome::OutOfMemory, "Survived"),
+            (Outcome::LeakLimit, "Survived"),
             (Outcome::CompileError, "CompileError"),
             (Outcome::NoCoverage, "NoCoverage"),
             (Outcome::Ignored, "Ignored"),
@@ -1821,6 +1832,22 @@ mod tests {
             None,
             "a mutant the ceiling stopped was never judged, so a rerun could change it"
         );
+    }
+
+    #[test]
+    fn a_reference_leak_limit_keeps_its_distinct_cause_in_the_status_reason() {
+        let mut limited = mutant(Outcome::LeakLimit, 0..1);
+        let source = SourceFile::parse("src/lib.rs", "fn f() {}".to_owned()).expect("parses");
+        limited.note = Some("generated reference leak exceeded the per-process allowance of 8192 calls or 64 MiB RSS growth".to_owned());
+
+        let rendered = render(&limited, &source);
+        let read: MutantResult = serde_json::from_str(&serde_json::to_string(&rendered).expect("serializes")).expect("round-trips");
+        assert_eq!(read.status, "Survived");
+        assert_eq!(
+            read.status_reason.as_deref(),
+            Some("reference leak limit: generated reference leak exceeded the per-process allowance of 8192 calls or 64 MiB RSS growth")
+        );
+        assert_eq!(settled_verdict(&read.status, read.status_reason.as_deref()), None);
     }
 
     /// A flake keeps the test to fix in its status reason, and is told apart from a suppression.

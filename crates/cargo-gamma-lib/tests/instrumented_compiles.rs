@@ -17,6 +17,7 @@
 //! than the unit tests beside the collector, and they are the only thing that actually answers the
 //! question.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::path::{Path, PathBuf};
@@ -72,6 +73,8 @@ fn guard_crate() -> &'static Path {
             // not have.
             let stub = concat!(
                 "#[inline] pub fn a(_ordinal: u32) -> bool { std::hint::black_box(false) }\n",
+                "pub fn charge_reference_leak() {}\n",
+                "pub fn watch_reference_leak<R>(construct: impl FnOnce() -> R) -> R { construct() }\n",
                 "pub enum Either<A, B> { L(A), R(B) }\n",
                 "impl<T, A: Iterator<Item = T>, B: Iterator<Item = T>> Iterator for Either<A, B> {\n",
                 "    type Item = T;\n",
@@ -217,6 +220,26 @@ fn compiles_selection(name: &str, source: &str, selection: &Selection) -> usize 
     );
 
     mutants.len()
+}
+
+#[track_caller]
+fn assert_fn_value_counts(source: &str, expected: &[(&str, usize)]) {
+    let file = SourceFile::parse("subject.rs", source.to_owned()).expect("the subject must parse");
+    let selection = Selection::parse("fn_value").expect("the selector must resolve");
+    let defaults = collect::Defaults::of(file.ast());
+    let candidates = collect::collect_with(&file, &selection, &CfgSet::unconditional(), &defaults);
+    let mutants = collect::into_mutants(&file, "subject", candidates);
+    let mut actual = BTreeMap::<String, usize>::new();
+
+    for mutant in mutants {
+        *actual.entry(mutant.item_path.to_string()).or_default() += 1;
+    }
+
+    let expected = expected
+        .iter()
+        .map(|(name, count)| ((*name).to_owned(), *count))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(actual, expected);
 }
 
 /// Instruments `source` and returns what `rustc` said about it, insisting it was rejected.
@@ -632,6 +655,124 @@ pub fn iterator() -> impl Iterator<Item = u32> { std::iter::once(1) }
 ";
 
     assert!(compiles("returns", source, "fn_value") > 0);
+}
+
+#[test]
+fn reference_return_values_still_compile() {
+    let source = "
+type Ref<'a> = &'a u8;
+pub struct NoDefault(pub u8);
+pub fn shared(value: &u8) -> &u8 { value }
+pub fn mutable(value: &mut u8) -> &mut u8 { value }
+pub fn shared_slice(values: &[u8]) -> &[u8] { values }
+pub fn mutable_slice(values: &mut [u8]) -> &mut [u8] { values }
+pub fn text() -> &'static str { \"original\" }
+#[allow(unused_parens)]
+pub fn grouped_text() -> &'static (str) { \"original\" }
+pub fn qualified_text() -> &'static core::primitive::str { \"original\" }
+pub fn mutable_text(value: &mut str) -> &mut str { value }
+pub fn qualified_mutable_text(value: &mut core::primitive::str) -> &mut core::primitive::str { value }
+pub fn aliased(value: Ref<'_>) -> Ref<'_> { value }
+pub fn borrowed_unit(value: &()) -> &() { value }
+pub fn empty_array(value: &[u8; 0]) -> &[u8; 0] { value }
+pub fn empty_custom_array(value: &[NoDefault; 0]) -> &[NoDefault; 0] { value }
+pub fn mutable_empty_custom_array(value: &mut [NoDefault; 0]) -> &mut [NoDefault; 0] { value }
+";
+
+    assert_fn_value_counts(
+        source,
+        &[
+            ("aliased", 2),
+            ("borrowed_unit", 1),
+            ("empty_array", 1),
+            ("empty_custom_array", 1),
+            ("grouped_text", 2),
+            ("mutable", 2),
+            ("mutable_empty_custom_array", 1),
+            ("mutable_slice", 3),
+            ("mutable_text", 2),
+            ("qualified_mutable_text", 2),
+            ("qualified_text", 2),
+            ("shared", 2),
+            ("shared_slice", 3),
+            ("text", 2),
+        ],
+    );
+    assert_eq!(compiles("reference_returns", source, "fn_value"), 26);
+}
+
+#[test]
+fn diverse_reference_return_values_still_compile() {
+    let source = "
+pub fn boolean(value: &bool) -> &bool { value }
+pub fn floating(value: &f64) -> &f64 { value }
+pub fn string_slice(value: &[String]) -> &[String] { value }
+pub fn map(value: &std::collections::HashMap<u8, u8>) -> &std::collections::HashMap<u8, u8> { value }
+pub fn arc_str(value: &std::sync::Arc<str>) -> &std::sync::Arc<str> { value }
+pub fn rc_str(value: &std::rc::Rc<str>) -> &std::rc::Rc<str> { value }
+pub fn nested_option<'a>(value: &'a Option<&'static str>) -> &'a Option<&'static str> { value }
+pub fn nested_result(value: &Result<Option<u8>, String>) -> &Result<Option<u8>, String> { value }
+pub fn option(value: &Option<u8>) -> &Option<u8> { value }
+pub fn option_slice(value: &[Option<u8>]) -> &[Option<u8>] { value }
+pub fn tuple(value: &(u8, bool)) -> &(u8, bool) { value }
+";
+
+    assert_fn_value_counts(
+        source,
+        &[
+            ("arc_str", 2),
+            ("boolean", 2),
+            ("floating", 3),
+            ("map", 2),
+            ("nested_option", 3),
+            ("nested_result", 3),
+            ("option", 3),
+            ("option_slice", 4),
+            ("rc_str", 2),
+            ("string_slice", 3),
+            ("tuple", 4),
+        ],
+    );
+    assert_eq!(compiles("diverse_reference_returns", source, "fn_value"), 31);
+}
+
+#[test]
+fn aliased_reference_referents_use_their_concrete_shapes() {
+    let source = "
+type Bytes = [u8];
+type Text = str;
+type Unit = ();
+type Zero = [u8; 0];
+type Identity<T> = T;
+type Chain<T> = Identity<T>;
+pub fn shared_bytes(value: &Bytes) -> &Bytes { value }
+pub fn mutable_bytes(value: &mut Bytes) -> &mut Bytes { value }
+pub fn shared_text(value: &Text) -> &Text { value }
+pub fn mutable_text(value: &mut Text) -> &mut Text { value }
+pub fn shared_unit(value: &Unit) -> &Unit { value }
+pub fn shared_zero(value: &Zero) -> &Zero { value }
+pub fn generic_text(value: &Identity<str>) -> &Identity<str> { value }
+pub fn chained_text(value: &Chain<str>) -> &Chain<str> { value }
+pub fn generic_bytes(value: &Identity<[u8]>) -> &Identity<[u8]> { value }
+pub fn chained_bytes(value: &Chain<[u8]>) -> &Chain<[u8]> { value }
+";
+
+    assert_fn_value_counts(
+        source,
+        &[
+            ("chained_bytes", 3),
+            ("chained_text", 2),
+            ("generic_bytes", 3),
+            ("generic_text", 2),
+            ("mutable_bytes", 3),
+            ("mutable_text", 2),
+            ("shared_bytes", 3),
+            ("shared_text", 2),
+            ("shared_unit", 1),
+            ("shared_zero", 1),
+        ],
+    );
+    assert_eq!(compiles("aliased_reference_referents", source, "fn_value"), 22);
 }
 
 #[test]

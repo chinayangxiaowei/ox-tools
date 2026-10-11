@@ -87,7 +87,7 @@ fn outcome_blocks(plan: &Plan, styler: Styler, listings: Listings) -> Vec<(Strin
         ));
     }
 
-    for outcome in [Outcome::Timeout, Outcome::OutOfMemory, Outcome::Flaky] {
+    for outcome in [Outcome::Timeout, Outcome::OutOfMemory, Outcome::LeakLimit, Outcome::Flaky] {
         if listings.announced && outcome != Outcome::Flaky {
             continue;
         }
@@ -249,18 +249,19 @@ pub fn summarize<H: Host>(host: &mut H, plan: &Plan, styler: Styler, listings: L
     // to be read before it can be scanned, and these are the numbers a reader is looking for. They
     // sum to the population in front of them, so the line can be checked at a glance.
     //
-    // Timeout and out-of-memory are named separately from survived because they ask the reader to
-    // do different things. All three count against the score, but a timeout is worth confirming is
-    // a real hang, and memory exhaustion usually means the ceiling or mutant needs investigation.
+    // Resource outcomes are named separately from survived because they ask the reader to do
+    // different things. All count against the score, but a timeout is worth confirming is a real
+    // hang, and memory or leak guard exhaustion needs investigation.
     if summary.valid() > 0 {
         writeln!(
             stream,
-            "{heading} {} ({} killed, {} survived, {} timed out, {} out of memory, {} uncovered => {}%){}{}",
+            "{heading} {} ({} killed, {} survived, {} timed out, {} out of memory, {} leak limited, {} uncovered => {}%){}{}",
             quantity(summary.valid() as usize, "mutant"),
             summary.killed,
             summary.survived,
             summary.timeout,
             summary.out_of_memory,
+            summary.leak_limit,
             summary.uncovered,
             crate::report::score(summary.score(), summary.detected() as usize, summary.valid() as usize),
             excluded(plan),
@@ -303,11 +304,13 @@ pub fn summarize<H: Host>(host: &mut H, plan: &Plan, styler: Styler, listings: L
         }
     }
 
-    let suppressible = listings.suppressible.unwrap_or(summary.timeout > 0 || summary.out_of_memory > 0);
+    let suppressible = listings
+        .suppressible
+        .unwrap_or(summary.timeout > 0 || summary.out_of_memory > 0 || summary.leak_limit > 0);
     if suppressible {
         writeln!(
             stream,
-            "{note} Run `cargo gamma suppress` to preview automatic suppression of timed-out and out-of-memory mutants"
+            "{note} Run `cargo gamma suppress` to preview automatic suppression of resource-limited mutants"
         )?;
     }
 
@@ -503,7 +506,7 @@ mod tests {
                 "\n",
                 "    SURVIVED src/a.rs:2:5: replace a > b with a >= b [relational.gt_to_ge]\n",
                 "\n",
-                "Summary: 1 mutant (0 killed, 1 survived, 0 timed out, 0 out of memory, 0 uncovered => 0.0%)\n",
+                "Summary: 1 mutant (0 killed, 1 survived, 0 timed out, 0 out of memory, 0 leak limited, 0 uncovered => 0.0%)\n",
             )
         );
     }
@@ -532,7 +535,7 @@ mod tests {
             text,
             concat!(
                 "\n",
-                "Summary: 1 mutant (1 killed, 0 survived, 0 timed out, 0 out of memory, 0 uncovered => 100.0%)\n",
+                "Summary: 1 mutant (1 killed, 0 survived, 0 timed out, 0 out of memory, 0 leak limited, 0 uncovered => 100.0%)\n",
                 "Stats  : 42m elapsed, 12 test binaries, 821 test processes launched, 386 successful hints\n",
             )
         );
@@ -632,10 +635,10 @@ mod tests {
         assert_eq!(
             format!("Summary:{footer}"),
             concat!(
-                "Summary: 2 mutants (1 killed, 0 survived, 1 timed out, 0 out of memory, 0 uncovered => 50.0%)\n",
+                "Summary: 2 mutants (1 killed, 0 survived, 1 timed out, 0 out of memory, 0 leak limited, 0 uncovered => 50.0%)\n",
                 "Note   : 1 superfluous skip directive could be removed with `cargo gamma unsuppress --apply`\n",
                 "  src/a.rs:9: skip(relational) — the site no longer produces a mutant\n",
-                "Note   : Run `cargo gamma suppress` to preview automatic suppression of timed-out and out-of-memory mutants\n",
+                "Note   : Run `cargo gamma suppress` to preview automatic suppression of resource-limited mutants\n",
                 "Note   : Run `cargo gamma hints` to update your hint file and accelerate subsequent cargo-gamma runs\n",
             )
         );
@@ -756,9 +759,7 @@ mod tests {
 
         let text = rendered_with(&population, Listings::default());
 
-        assert!(
-            text.ends_with("Note   : Run `cargo gamma suppress` to preview automatic suppression of timed-out and out-of-memory mutants\n")
-        );
+        assert!(text.ends_with("Note   : Run `cargo gamma suppress` to preview automatic suppression of resource-limited mutants\n"));
     }
 
     #[test]
@@ -794,7 +795,7 @@ mod tests {
 
         // The counts still have to be there; only the per-mutant lines are dropped.
         assert!(
-            text.contains("3 mutants (1 killed, 1 survived, 1 timed out, 0 out of memory, 0 uncovered => 33.3%)"),
+            text.contains("3 mutants (1 killed, 1 survived, 1 timed out, 0 out of memory, 0 leak limited, 0 uncovered => 33.3%)"),
             "{text}"
         );
     }
