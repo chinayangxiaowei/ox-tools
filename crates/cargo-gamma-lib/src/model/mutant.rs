@@ -180,14 +180,35 @@ impl Mutant {
         }
     }
 
-    /// Renders a one-line human description, in the form used by `list` and the console reporter.
+    /// Renders a one-line human description for the console reporter.
     ///
     /// A mutated construct can span many lines. Emitting it verbatim would break the one-line
     /// contract that makes this output greppable, so it is flattened and elided in the middle: the
     /// two ends are what identify the construct, and the middle is what is least informative.
+    /// The plain mutant listing uses `selection_name` to include the item path.
     #[must_use]
     pub fn describe(&self) -> String {
         format!("{}:{}:{}: {} [{}]", self.file, self.line, self.column, self.summary(), self.mutator)
+    }
+
+    /// The complete line used by `list mutants` and `--re`, before control encoding.
+    /// Suppressed mutants include the visible suppression marker.
+    #[must_use]
+    pub(crate) fn selection_name(&self) -> String {
+        let name = format!(
+            "{}:{}:{}: {}: {} [{}]",
+            self.file,
+            self.line,
+            self.column,
+            self.item_path,
+            self.summary(),
+            self.mutator
+        );
+
+        match self.suppression.as_ref().filter(|_| self.outcome == Outcome::Ignored) {
+            Some(suppression) => format!("{name} [suppressed: {}]", suppression.channel.as_str()),
+            None => name,
+        }
     }
 
     /// How long the run spent deciding this mutant.

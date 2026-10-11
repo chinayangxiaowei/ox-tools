@@ -60,9 +60,9 @@ impl Killers {
         // both name a mutant: a probe is checked either way, but the fresher guess is likelier to
         // convict, and paying for the stale one first would be paying for a test twice.
         entries.extend(record.probes().iter().map(|(id, killer)| (id.clone(), killer.clone())));
-        Self::merge_generalized(&mut generalized, record.generalized());
+        generalized.merge_from(record.generalized());
         entries.extend(incomplete.probes().iter().map(|(id, killer)| (id.clone(), killer.clone())));
-        Self::merge_generalized(&mut generalized, incomplete.generalized());
+        generalized.merge_from(incomplete.generalized());
 
         Self { entries, generalized }
     }
@@ -126,27 +126,6 @@ impl Killers {
             .filter(|(id, _killer)| current.contains(id))
             .map(|(id, killer)| (id.clone(), killer.clone()))
             .collect()
-    }
-
-    fn merge_generalized(target: &mut GeneralizedHints, newer: GeneralizedHints) {
-        if newer.supported().is_none() {
-            return;
-        }
-        for item in newer.items {
-            target
-                .items
-                .retain(|current| current.file != item.file || current.item != item.item);
-            target.items.push(item);
-        }
-        for binary in newer.binaries {
-            target.binaries.retain(|current| current.file != binary.file);
-            target.binaries.push(binary);
-        }
-        // #[gamma::skip(all, reason = "the branch handles process, filesystem, platform, or synchronization state that cannot be forced safely and deterministically in unit tests")]
-        if !newer.reach.is_empty() {
-            target.test_sets = newer.test_sets;
-            target.reach = newer.reach;
-        }
     }
 
     /// How many mutants this map has a killer for.
@@ -368,7 +347,7 @@ mod tests {
             }],
         };
 
-        Killers::merge_generalized(&mut target, newer.clone());
+        target.merge_from(newer.clone());
 
         assert_eq!(target.items.len(), 2);
         assert_eq!(target.items[0].file, Utf8Path::new("src/keep.rs"));
@@ -388,18 +367,15 @@ mod tests {
         });
         let original = target.clone();
 
-        Killers::merge_generalized(
-            &mut target,
-            GeneralizedHints {
-                version: GENERALIZED_HINTS_VERSION + 1,
-                items: vec![ItemHints {
-                    file: "src/new.rs".into(),
-                    item: "new".to_owned(),
-                    candidates: vec![ranked(killer("tests::new"))],
-                }],
-                ..GeneralizedHints::default()
-            },
-        );
+        target.merge_from(GeneralizedHints {
+            version: GENERALIZED_HINTS_VERSION + 1,
+            items: vec![ItemHints {
+                file: "src/new.rs".into(),
+                item: "new".to_owned(),
+                candidates: vec![ranked(killer("tests::new"))],
+            }],
+            ..GeneralizedHints::default()
+        });
 
         assert_eq!(target, original);
     }
