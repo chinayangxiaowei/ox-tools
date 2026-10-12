@@ -148,24 +148,49 @@ impl Sample {
 
     fn read(
         &mut self,
-        members: impl FnOnce() -> io::Result<Vec<i32>>,
+        mut members: impl FnMut() -> io::Result<Vec<i32>>,
         mut footprint: impl FnMut(i32) -> io::Result<Option<Footprint>>,
         kill: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
         if self.usage.exhausted {
             return Ok(());
         }
-        let mut current = 0_u64;
-        let mut lifetime_max = 0_u64;
-        for pid in members()? {
-            if let Some(reading) = footprint(pid)? {
-                current = current.saturating_add(reading.current);
-                lifetime_max = lifetime_max.saturating_add(reading.lifetime_max);
+        let mut pass = || {
+            let mut aggregate = Footprint {
+                current: 0,
+                lifetime_max: 0,
+            };
+            for pid in members()? {
+                if let Some(reading) = footprint(pid)? {
+                    aggregate.current = aggregate.current.saturating_add(reading.current);
+                    aggregate.lifetime_max = aggregate.lifetime_max.saturating_add(reading.lifetime_max);
+                }
             }
-        }
+            Ok::<_, io::Error>(aggregate)
+        };
         // Baseline calibration conservatively includes each listed member's lifetime maximum.
         // Enforcement uses only current aggregate footprint, never a sum of historical peaks.
-        let peak = if self.calibrating { current.max(lifetime_max) } else { current };
+        let peak_of = |reading: Footprint| {
+            if self.calibrating {
+                reading.current.max(reading.lifetime_max)
+            } else {
+                reading.current
+            }
+        };
+        let first = pass()?;
+        let mut current = first.current;
+        let mut peak = peak_of(first);
+        if self.limit.is_some_and(|limit| current > limit) {
+            // Per-member reads are not simultaneous: memory shifting between members can sum
+            // above the ceiling. Confirm with an immediate full pass before declaring a breach.
+            let confirming = pass()?;
+            current = confirming.current;
+            peak = if self.limit.is_some_and(|limit| current > limit) {
+                peak.max(peak_of(confirming))
+            } else {
+                peak_of(confirming)
+            };
+        }
         self.usage.peak = Some(self.usage.peak.unwrap_or(0).max(peak));
         if self.limit.is_some_and(|limit| current > limit) {
             self.usage.exhausted = true;
@@ -186,10 +211,15 @@ mod tests {
     }
 
     fn sample(state: &mut Sample, readings: &[(i32, Option<Footprint>)], kills: &mut usize) {
-        let mut expected = readings.iter();
+        sample_passes(state, &[readings], kills);
+    }
+
+    fn sample_passes(state: &mut Sample, passes: &[&[(i32, Option<Footprint>)]], kills: &mut usize) {
+        let mut groups = passes.iter();
+        let mut expected = passes.iter().flat_map(|readings| readings.iter());
         state
             .read(
-                || Ok(readings.iter().map(|(pid, _)| *pid).collect()),
+                || Ok(groups.next().unwrap().iter().map(|(pid, _)| *pid).collect()),
                 |pid| {
                     let (expected_pid, usage) = expected.next().unwrap();
                     assert_eq!(pid, *expected_pid);
@@ -202,6 +232,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expected.next(), None);
+        assert_eq!(groups.next(), None);
     }
 
     fn gated_members(
@@ -237,8 +268,8 @@ mod tests {
     #[test]
     fn sampler_thread_exits_on_the_first_breach_and_sweeps_once() {
         let (killed, kills) = mpsc::channel();
-        let mut groups = core::iter::once(vec![11]);
-        let mut readings = core::iter::once(reading(101, 200));
+        let mut groups = [vec![11], vec![11]].into_iter();
+        let mut readings = [reading(101, 200), reading(102, 200)].into_iter();
         let mut sampler = Sampler::start_with(
             MemoryRequest {
                 calibrating: false,
@@ -262,7 +293,7 @@ mod tests {
         assert_eq!(
             sampler.usage(),
             MemoryUsage {
-                peak: Some(101),
+                peak: Some(102),
                 exhausted: true,
             }
         );
@@ -435,9 +466,12 @@ mod tests {
                 exhausted: false
             }
         );
-        sample(
+        sample_passes(
             &mut state,
-            &[(11, Some(reading(60, 200))), (12, Some(reading(41, 100)))],
+            &[
+                &[(11, Some(reading(60, 200))), (12, Some(reading(41, 100)))],
+                &[(11, Some(reading(60, 200))), (12, Some(reading(42, 100)))],
+            ],
             &mut kills,
         );
         assert_eq!(kills, 1);
@@ -445,7 +479,7 @@ mod tests {
         assert_eq!(
             state.usage,
             MemoryUsage {
-                peak: Some(101),
+                peak: Some(102),
                 exhausted: true
             }
         );
@@ -459,10 +493,123 @@ mod tests {
         assert_eq!(
             state.usage,
             MemoryUsage {
-                peak: Some(101),
+                peak: Some(102),
                 exhausted: true
             }
         );
+    }
+
+    #[test]
+    fn a_confirmed_breach_retains_the_larger_peak_from_either_pass() {
+        for (first, confirming) in [(120, 130), (130, 120)] {
+            let mut state = Sample::new(Some(100), false);
+            let mut kills = 0;
+            sample_passes(
+                &mut state,
+                &[&[(11, Some(reading(first, first)))], &[(12, Some(reading(confirming, confirming)))]],
+                &mut kills,
+            );
+            assert_eq!(
+                state.usage,
+                MemoryUsage {
+                    peak: Some(130),
+                    exhausted: true
+                }
+            );
+            assert!(state.swept);
+            assert_eq!(kills, 1);
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_spike_is_discarded_and_sampling_continues_until_a_confirmed_breach() {
+        for previous in [20, 90] {
+            let mut state = Sample::new(Some(100), false);
+            let mut kills = 0;
+            sample(&mut state, &[(11, Some(reading(previous, previous)))], &mut kills);
+            sample_passes(
+                &mut state,
+                &[
+                    &[(11, Some(reading(60, 60))), (12, Some(reading(60, 60)))],
+                    &[(13, Some(reading(60, 60)))],
+                ],
+                &mut kills,
+            );
+            assert_eq!(
+                state.usage,
+                MemoryUsage {
+                    peak: Some(previous.max(60)),
+                    exhausted: false
+                }
+            );
+            assert!(!state.swept);
+            assert_eq!(kills, 0);
+            sample(&mut state, &[(13, Some(reading(80, 80)))], &mut kills);
+            assert_eq!(
+                state.usage,
+                MemoryUsage {
+                    peak: Some(previous.max(80)),
+                    exhausted: false
+                }
+            );
+            assert_eq!(kills, 0);
+            sample_passes(
+                &mut state,
+                &[
+                    &[(11, Some(reading(60, 60))), (12, Some(reading(60, 60)))],
+                    &[(11, Some(reading(70, 70))), (12, Some(reading(60, 60)))],
+                ],
+                &mut kills,
+            );
+            assert_eq!(
+                state.usage,
+                MemoryUsage {
+                    peak: Some(130),
+                    exhausted: true
+                }
+            );
+            assert!(state.swept);
+            assert_eq!(kills, 1);
+        }
+    }
+
+    #[test]
+    fn a_confirming_reading_error_preserves_state_just_like_a_normal_reading_error() {
+        for script in [
+            vec![Err(io::Error::from_raw_os_error(libc::EIO))],
+            vec![Ok(Some(reading(120, 120))), Err(io::Error::from_raw_os_error(libc::EIO))],
+        ] {
+            let mut state = Sample::new(Some(100), false);
+            let mut kills = 0;
+            sample(&mut state, &[(11, Some(reading(40, 40)))], &mut kills);
+            let mut groups = (0..script.len()).map(|_| vec![11]);
+            let mut readings = script.into_iter();
+            let error = state
+                .read(
+                    || Ok(groups.next().unwrap()),
+                    |pid| {
+                        assert_eq!(pid, 11);
+                        readings.next().unwrap()
+                    },
+                    || {
+                        kills += 1;
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            assert_eq!(
+                state.usage,
+                MemoryUsage {
+                    peak: Some(40),
+                    exhausted: false
+                }
+            );
+            assert!(!state.swept);
+            assert_eq!(kills, 0);
+            assert_eq!(groups.next(), None);
+            assert!(readings.next().is_none());
+        }
     }
 
     #[test]
@@ -521,9 +668,12 @@ mod tests {
         assert_eq!(kills, 0);
         assert!(!state.swept);
 
-        sample(
+        sample_passes(
             &mut state,
-            &[(11, Some(reading(60, 60))), (12, None), (13, Some(reading(41, 41)))],
+            &[
+                &[(11, Some(reading(60, 60))), (12, None), (13, Some(reading(41, 41)))],
+                &[(11, Some(reading(60, 60))), (12, None), (13, Some(reading(41, 41)))],
+            ],
             &mut kills,
         );
         assert_eq!(
@@ -567,7 +717,11 @@ mod tests {
             }
         );
         assert_eq!(kills, 0);
-        sample(&mut state, &[(11, Some(reading(51, 200)))], &mut kills);
+        sample_passes(
+            &mut state,
+            &[&[(11, Some(reading(51, 200)))], &[(11, Some(reading(52, 200)))]],
+            &mut kills,
+        );
         assert_eq!(
             state.usage,
             MemoryUsage {
@@ -597,16 +751,20 @@ mod tests {
     fn a_failed_breach_sweep_does_not_claim_completed_cleanup_or_repeat_the_kill() {
         let mut state = Sample::new(Some(100), false);
         let mut kills = 0;
+        let mut groups = [vec![11], vec![11]].into_iter();
+        let mut readings = [reading(101, 101), reading(101, 101)].into_iter();
         let error = state
             .read(
-                || Ok(vec![11]),
-                |_| Ok(Some(reading(101, 101))),
+                || Ok(groups.next().unwrap()),
+                |_| Ok(Some(readings.next().unwrap())),
                 || {
                     kills += 1;
                     Err(io::Error::from(io::ErrorKind::PermissionDenied))
                 },
             )
             .unwrap_err();
+        assert_eq!(groups.next(), None);
+        assert_eq!(readings.next(), None);
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(
             state.usage,

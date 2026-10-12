@@ -203,8 +203,17 @@ the launch's boundary does the following every `SAMPLE_INTERVAL`:
 1. Lists the members of the launch's process group.
 2. Sums their `ri_phys_footprint`.
 3. Records the sum as the running peak.
-4. If enforcing and the sum exceeds the ceiling, kills the group and records
-   the reading that crossed it.
+4. If enforcing and the sum exceeds the ceiling, immediately takes a second
+   pass, with no wait. Only if that pass also exceeds the ceiling does it kill
+   the group and record the reading that crossed it.
+
+The confirming pass exists because the members are read one after another, not
+at the same instant, so a pass's sum is not a true point-in-time total. If one
+member releases memory just as another allocates it, a single pass can count
+the same memory twice and sum above the ceiling, although the group never held
+that much at once. A false breach would report a healthy mutant as `outofmem`.
+A real runaway is still over the ceiling on the second pass, which costs only
+the time of one more pass.
 
 The kill reuses the existing process-group sweep, including the macOS
 zombie-leader handling. The verdict reuses `outofmem` and its note: the binary,
@@ -234,6 +243,15 @@ member, which is negligible next to running a test binary.
 
 - **Soft bound.** The overshoot above is inherent. The `outofmem` note reports
   the reading that crossed the ceiling, which can exceed the ceiling.
+- **Startup window.** The child is already running when its sampler starts,
+  because the sampler needs the child's process group, which exists only after
+  the spawn. The first reading therefore comes as soon as the sampler thread
+  is running, normally well under one interval after launch. That is longer
+  under heavy host load. A runaway that starts allocating at once can overshoot
+  by its growth rate times that delay as well. Holding the child suspended
+  until the sampler is ready would close the window. That would change the
+  launch path for every macOS launch, and it is not done for a gap normally
+  shorter than the interval itself.
 - **Group escape.** A descendant that calls `setsid` or `setpgid` leaves the
   group and is neither counted nor killed. This is the same best-effort
   containment macOS already has for termination. It does not newly weaken
