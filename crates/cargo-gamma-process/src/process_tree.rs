@@ -2559,9 +2559,17 @@ mod tests {
     #[test]
     fn a_request_that_asks_for_nothing_is_recognized_as_such() {
         assert!(!MemoryRequest::default().wanted());
-        assert!(MemoryRequest { meter: true, limit: None }.wanted());
         assert!(
             MemoryRequest {
+                calibrating: false,
+                meter: true,
+                limit: None
+            }
+            .wanted()
+        );
+        assert!(
+            MemoryRequest {
+                calibrating: false,
                 meter: false,
                 limit: Some(1)
             }
@@ -2579,10 +2587,25 @@ mod tests {
         // and finds out when the machine runs out of memory.
         #[cfg(windows)]
         {
-            prepare(command, MemoryRequest { meter: true, limit: None }).expect("Windows always supplies job-object accounting");
+            prepare(
+                command,
+                MemoryRequest {
+                    calibrating: false,
+                    meter: true,
+                    limit: None,
+                },
+            )
+            .expect("Windows always supplies job-object accounting");
         }
         #[cfg(not(windows))]
-        match prepare(command, MemoryRequest { meter: true, limit: None }) {
+        match prepare(
+            command,
+            MemoryRequest {
+                calibrating: false,
+                meter: true,
+                limit: None,
+            },
+        ) {
             Ok(_guard) => crate::support().expect("metering succeeded, so it is supported"),
             Err(reason) => assert!(!reason.to_string().is_empty(), "a refusal has to say why"),
         }
@@ -2637,7 +2660,15 @@ mod tests {
         let mut command = Command::new(testing::helper_binary_path().as_std_path());
         let _ = command.args([testing::directive("eat:32"), testing::directive("exit:0")]);
 
-        let prepared = prepare(command, MemoryRequest { meter: true, limit: None }).expect("containment");
+        let prepared = prepare(
+            command,
+            MemoryRequest {
+                calibrating: false,
+                meter: true,
+                limit: None,
+            },
+        )
+        .expect("containment");
         let spawned = prepared.spawn().expect("spawn");
         let mut subtree = ProcessTree::adopt(spawned).expect("adoption");
 
@@ -3567,8 +3598,15 @@ mod tests {
         let window = faults::arm(faults::Fault::Window);
 
         let command = Command::new("true");
-        let reason = prepare(command, MemoryRequest { meter: true, limit: None })
-            .expect_err("both steps were asked to fail, so containment cannot have succeeded");
+        let reason = prepare(
+            command,
+            MemoryRequest {
+                calibrating: false,
+                meter: true,
+                limit: None,
+            },
+        )
+        .expect_err("both steps were asked to fail, so containment cannot have succeeded");
 
         assert!(
             reason.to_string().contains("accounting boundary"),

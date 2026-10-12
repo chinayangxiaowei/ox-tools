@@ -58,6 +58,7 @@ fn macos_runaway_allocator_crosses_sampled_ceiling() {
     let prepared = prepare(
         child_command("leader").unwrap(),
         MemoryRequest {
+            calibrating: false,
             meter: true,
             limit: Some(ceiling),
         },

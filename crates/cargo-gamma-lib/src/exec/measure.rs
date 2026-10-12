@@ -851,8 +851,17 @@ fn measure_with_locks(
 ) -> Result<Measured> {
     let started = Instant::now();
 
-    let (memory, unbounded) = settle_memory_control(config, memory::support().map_err(|reason| reason.to_string()))?;
+    let support = runner_memory_support(
+        config.nextest,
+        cfg!(target_os = "macos"),
+        memory::support().map_err(|reason| reason.to_string()),
+    );
+    let (memory, unbounded) = settle_memory_control(config, support)?;
 
+    // Resource discovery also uses the baseline limit, even with --no-baseline, so those
+    // launches still need the soft-bound warning. Enforcement reaches here only with a
+    // baseline or an explicit ceiling: settling above disables it otherwise, or refuses
+    // the run when the user insisted.
     #[cfg(target_os = "macos")]
     if memory.enforcing() || memory.baseline_limit.is_some() {
         events.warn(&format!(
@@ -1017,6 +1026,7 @@ fn measure_with_locks(
         &build.binaries,
         &config.resources,
         MemoryRequest {
+            calibrating: false,
             meter: memory.measuring(),
             limit: memory.baseline_limit,
         },
@@ -1524,6 +1534,7 @@ fn take_baseline_retaining(
     }
 
     let request = MemoryRequest {
+        calibrating: true,
         meter: memory.measuring(),
         limit: memory.baseline_limit,
     };
@@ -1605,6 +1616,17 @@ fn settle_memory_control(config: &Config, support: Result<(), String>) -> Result
     }
 
     Ok((policy, None))
+}
+
+fn runner_memory_support(nextest: bool, macos: bool, support: Result<(), String>) -> Result<(), String> {
+    if macos && nextest {
+        Err(
+            "nextest puts each test in its own process group, outside macOS sampled memory control; drop `--nextest` to use memory control"
+                .to_owned(),
+        )
+    } else {
+        support
+    }
 }
 
 /// Describes what the baseline measured, for the line that replaces its announcement.
@@ -2559,6 +2581,98 @@ mod tests {
             Some("no cgroup here"),
             "a degraded policy must say why, not merely that it degraded"
         );
+    }
+
+    #[test]
+    fn macos_nextest_disables_inherited_memory_control_with_a_reason() {
+        let config = Config {
+            nextest: true,
+            ..Config::default()
+        };
+        let support = runner_memory_support(config.nextest, true, Ok(()));
+        let (settled, note) = settle_memory_control(&config, support).unwrap();
+        assert_eq!(settled, config.memory.disabled());
+        assert!(!settled.enforcing());
+        assert_eq!(settled.baseline_limit, None);
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "nextest puts each test in its own process group, outside macOS sampled memory control; drop `--nextest` to use memory control"
+            )
+        );
+    }
+
+    #[test]
+    fn macos_nextest_refuses_stated_memory_control_and_limits() {
+        for memory in [
+            MemoryPolicy {
+                control: MemoryControl::Measure,
+                demand: Demand::Stated,
+                ..MemoryPolicy::default()
+            },
+            MemoryPolicy {
+                demand: Demand::Stated,
+                ..MemoryPolicy::default()
+            },
+            MemoryPolicy {
+                demand: Demand::Stated,
+                limit: Some(100),
+                ..MemoryPolicy::default()
+            },
+            MemoryPolicy {
+                control: MemoryControl::Measure,
+                demand: Demand::Stated,
+                baseline_limit: Some(100),
+                ..MemoryPolicy::default()
+            },
+        ] {
+            let config = Config {
+                nextest: true,
+                memory,
+                ..Config::default()
+            };
+            let support = runner_memory_support(config.nextest, true, Ok(()));
+            let error = settle_memory_control(&config, support).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "memory control was asked for, but it is not available here: nextest puts each test in its own process group, outside macOS sampled memory control; drop `--nextest` to use memory control.\nRun with `--memory off` to continue without it."
+            );
+        }
+    }
+
+    #[test]
+    fn runner_memory_support_preserves_supported_combinations_and_host_failures() {
+        for (macos, nextest) in [(true, false), (false, true), (false, false)] {
+            let config = Config {
+                nextest,
+                ..Config::default()
+            };
+            let support = runner_memory_support(config.nextest, macos, Ok(()));
+            let (settled, note) = settle_memory_control(&config, support).unwrap();
+            assert_eq!(settled, config.memory);
+            assert_eq!(note, None);
+            assert_eq!(
+                runner_memory_support(nextest, macos, Err("host unavailable".to_owned())),
+                Err("host unavailable".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn macos_nextest_allows_explicitly_disabled_memory_control() {
+        let config = Config {
+            nextest: true,
+            memory: MemoryPolicy {
+                control: MemoryControl::Off,
+                demand: Demand::Stated,
+                ..MemoryPolicy::default()
+            },
+            ..Config::default()
+        };
+        let support = runner_memory_support(config.nextest, true, Ok(()));
+        let (settled, note) = settle_memory_control(&config, support).unwrap();
+        assert_eq!(settled, config.memory);
+        assert_eq!(note, None);
     }
 
     /// A stated policy this host *can* deliver still errors when there is no baseline to derive a

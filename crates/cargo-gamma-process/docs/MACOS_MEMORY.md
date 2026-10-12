@@ -1,65 +1,130 @@
 # cargo-gamma-process — Sampled memory control on macOS
 
-> Status: **Proposed**.
+> Status: **Implemented**.
 > Companion to the [crate design](DESIGN.md).
 
 ## Summary
 
 Linux and Windows bound a test subtree's memory with a kernel boundary (a
-cgroup leaf, a job object). macOS has no unprivileged equivalent, so today
-`--memory enforce` silently degrades to `off` there, and a mutant that turns
-bounded allocation into unbounded allocation runs until the wall-clock timeout.
-On a developer machine that is long enough to exhaust physical and compressed
-memory and take every other application down with it.
+cgroup leaf, a job object). macOS has no unprivileged equivalent. Before this
+design, `--memory enforce` silently degraded to `off` there, and a mutant that
+turned bounded allocation into unbounded allocation ran until the wall-clock
+timeout. On a developer machine, that is long enough to exhaust physical and
+compressed memory and take every other application down with it.
 
-This document proposes closing that gap with **sampled enforcement**: on
-macOS, cargo-gamma samples the physical footprint of every process in the
-launch's process group at a short fixed interval, and kills the group when the
-sum passes the ceiling the run already computes. Everything above the
-mechanism is reused unchanged: the baseline-derived ceiling, the
-`MemoryPolicy` arithmetic, the `outofmem` outcome, its note and its
-suppression eligibility.
+cargo-gamma closes that gap with **sampled enforcement**. On macOS, it samples
+the physical footprint of every process in the launch's process group at a
+short fixed interval. It kills the group when the sum passes the ceiling the
+run already computes. Everything above the mechanism is reused unchanged: the
+baseline-derived ceiling, the `MemoryPolicy` arithmetic, the `outofmem`
+outcome, its note, and its suppression eligibility.
 
-The bound is soft: a runaway can overshoot the ceiling by roughly its growth
-rate times the sampling interval, and a descendant that leaves the process
-group is not counted. Both limits are stated to the user rather than hidden.
+The bound is soft. A runaway can overshoot the ceiling by roughly its growth
+rate times the sampling interval. A descendant that leaves the process group
+is not counted. Both limits are stated to the user rather than hidden.
 
-## Motivating incident
+## Motivating example
 
-The incident below happened in a downstream workspace with a different
-mutation tool (cargo-mutants 27.1.0), before cargo-gamma was in use there.
-It is recorded here because cargo-gamma on macOS has exactly the same
-exposure: its timeout is the only guard.
+cargo-gamma generates mutants that allocate without bound from ordinary code.
+The example below shows which mutants do that and why. The incident after it
+shows what one such mutant did to a machine when the only guard was a timeout.
 
-### The code and the mutants
+### The code
 
-A tree type walks from a node to the root. Reduced from the original:
+A tree stores `(child, parent)` edges. One method looks up a node's parent,
+and another walks from a node up to the root. The following complete crate is
+reduced from the original, keeps its shape, and compiles and passes as shown.
+It is `src/lib.rs`, and the line numbers below refer to it:
 
 ```rust
-fn ancestor_chain(&self, id: &str) -> Vec<String> {
-    let mut chain = Vec::new();
-    let mut cur = id.to_owned();
-    while let Some(p) = self.parent_of(&cur) {
-        chain.push(p.clone());
-        cur = p;
+pub struct Tree {
+    /// `(child, parent)` edges.
+    pub edges: Vec<(String, String)>,
+}
+
+impl Tree {
+    pub fn parent_of(&self, id: &str) -> Option<String> {                                    // line 7
+        self.edges.iter().find(|(child, _)| child == id).map(|(_, parent)| parent.clone())   // line 8
     }
-    chain
+
+    pub fn ancestor_chain(&self, id: &str) -> Vec<String> {                                  // line 11
+        let mut chain = Vec::new();
+        let mut cur = id.to_owned();
+        while let Some(p) = self.parent_of(&cur) {
+            chain.push(p.clone());                                                           // line 15
+            cur = p;                                                                         // line 16
+        }
+        chain
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walks_to_the_root() {
+        let tree = Tree { edges: vec![("b".into(), "a".into()), ("c".into(), "b".into())] };
+        assert_eq!(tree.ancestor_chain("c"), ["b", "a"]);
+    }
 }
 ```
 
-The loop terminates only because `parent_of` eventually returns `None` at the
-root. Three mutants removed that guarantee:
+The `while let` loop in `ancestor_chain` has no bound of its own. It ends only
+because `parent_of` eventually returns `None`. On this data, the walk from
+`"c"` visits `"b"`, then `"a"`, and stops because no edge has `"a"` as a child.
+Any mutation that makes `parent_of` keep returning `Some`, or stops `cur` from
+moving toward the root, turns the loop into an unbounded `push`.
 
-| Mutant | Effect |
-|---|---|
-| `parent_of` → `Some(String::new())` | every node, including `""`, has a parent |
-| `parent_of` → `Some("xyzzy".into())` | every node, including `"xyzzy"`, has a parent |
-| `==` → `!=` in the parent lookup | the lookup finds some non-matching node as parent, forever |
+### The mutants cargo-gamma generates for it
 
-Each turns the loop into an unbounded `push`. The vector doubles its capacity
-as it grows, so the process touches new memory as fast as it can copy. Seven
-tests exercised the walk and ran in parallel in one test binary; together they
-grew at roughly 5–9 GB/s.
+`cargo gamma list` on this crate, with the default mutators:
+
+```text
+src/lib.rs:7:57: replace { self.edges.iter(...| parent.clone()) } with None [fn_value.none]
+src/lib.rs:8:45: replace child == id with (child) != (id) [relational.eq_to_ne]
+src/lib.rs:11:59: replace { let mut chain = ... cur = p; } chain } with Vec::new() [fn_value.empty_collection]
+src/lib.rs:11:59: replace { let mut chain = ... cur = p; } chain } with core::iter::on...ew()).collect() [fn_value.one_element]
+src/lib.rs:11:59: replace { let mut chain = ... cur = p; } chain } with core::iter::on...ed()).collect() [fn_value.one_element]
+src/lib.rs:15:13: delete chain.push(p.clone()); [stmt.delete_call]
+src/lib.rs:16:13: delete cur = p; [stmt.delete_assign]
+```
+
+With `--mutators @pedantic`, the following are also generated:
+
+```text
+src/lib.rs:7:57: replace { self.edges.iter(...| parent.clone()) } with Some(String::new()) [fn_value.some]
+src/lib.rs:7:57: replace { self.edges.iter(...| parent.clone()) } with Some("xyzzy".to_owned()) [fn_value.some]
+```
+
+What each mutant does to `walks_to_the_root`:
+
+| Mutant | What the mutated code does | Terminates? | Memory |
+|---|---|---|---|
+| `7:57` → `None` | `parent_of` always says "no parent"; the chain is empty | yes, assertion fails | bounded |
+| **`8:45` `==` → `!=`** | `parent_of("c")` returns the parent of the first edge whose child is *not* `"c"`. That is edge `(b, a)`, so it returns `"a"`. `parent_of("a")` again picks `(b, a)` and returns `"a"`, forever. | **no** | **unbounded**: pushes `"a"` forever |
+| `11:59` → `Vec::new()` / one-element vectors | `ancestor_chain` returns a constant | yes, assertion fails | bounded |
+| `15:13` delete `chain.push(..)` | `cur` still walks `c → b → a`, so the loop ends; the chain is empty | yes, assertion fails | bounded |
+| **`16:13` delete `cur = p`** | `cur` stays `"c"`, so `parent_of("c")` returns `"b"` on every iteration | **no** | **unbounded**: pushes `"b"` forever |
+| **`7:57` → `Some(String::new())`** (`@pedantic`) | every node, including `""`, has the parent `""` | **no** | **unbounded**: pushes `""` forever |
+| **`7:57` → `Some("xyzzy".to_owned())`** (`@pedantic`) | every node, including `"xyzzy"`, has the parent `"xyzzy"` | **no** | **unbounded**: one heap string plus one vector slot per iteration |
+
+So with default mutators, cargo-gamma generates two mutants of this code that
+allocate without bound. With `@pedantic`, it generates four. None of them
+depends on anything unusual. A loop whose termination depends on a lookup
+eventually failing, and whose body allocates, is common in ordinary code.
+
+A `Vec` doubles its capacity as it grows, so a runaway like these touches new
+memory about as fast as the process can copy it. In the incident below, the
+test binary grew at roughly 5–9 GB/s.
+
+### The incident
+
+The incident happened in a downstream workspace with a different mutation tool
+(cargo-mutants 27.1.0), before cargo-gamma was in use there. Its tree code had
+the shape above. The tool generated three of these runaways: `!=` in the
+lookup, `Some(String::new())`, and `Some("xyzzy".into())`. Seven tests that
+exercised the walk ran in parallel in one test binary.
 
 ### What happened to the machine
 
@@ -185,10 +250,12 @@ member, which is negligible next to running a test binary.
   not seen. This is acceptable for runaway detection, because a runaway is by
   definition still alive and still growing. It matters only for baseline
   calibration, where an underestimated peak would tighten the ceiling.
-  The headroom and multiplier absorb it. When measuring without a ceiling, as
-  the baseline does, each sample also sums the members'
-  `ri_lifetime_max_phys_footprint`, with one final reading taken after the
-  leader exits and before it is reaped. On macOS 15.7.2, an exited, unreaped
+  The headroom and multiplier absorb it. A baseline launch is marked as
+  calibrating in its memory request. When it is, each sample also sums the
+  members' `ri_lifetime_max_phys_footprint`, and one final reading is taken
+  after the leader exits and before it is reaped. This depends on the
+  calibrating mark, not on whether a ceiling is present, so
+  `--baseline-memory-limit` does not turn the recovery off. On macOS 15.7.2, an exited, unreaped
   process still reports its lifetime maximum, while its current footprint reads
   zero. This sum can exceed the true simultaneous peak, which errs toward a
   looser ceiling. Enforcement compares only the current footprint, never
@@ -205,6 +272,22 @@ form, instead of reporting unsupported. Consequences:
 - A stated `--memory enforce` or `--memory-limit` is honored on macOS instead of
   failing the run.
 - `--memory off` remains the user's explicit choice of no control.
+
+**Not with nextest.** With `--nextest`, cargo-gamma launches `cargo-nextest`,
+which puts every test process in a process group of its own (on cargo-nextest
+0.9.138, a test's pid equals its pgid, distinct from the runner's group). A
+group sampler would then measure the runner, not the tests, and would neither
+count nor stop a runaway test. So macOS with nextest is treated as a host
+without memory control, through the existing degrade-or-refuse path:
+
+- Inherited control degrades to `off`, and the run states that the reason is
+  nextest's per-test process groups. The sampled-enforcement note is not shown.
+- Stated control or a stated ceiling is refused, with advice to drop
+  `--nextest` or pass `--memory off`.
+
+Linux and Windows are unaffected, because the cgroup or job contains nextest's
+test processes too. Covering nextest on macOS would require walking the process
+tree by parentage instead of by group. That is left to a later change.
 
 The existing contract says that support is claimed only where it exists. It is
 kept by naming the kind of support: kernel-enforced, or sampled.
