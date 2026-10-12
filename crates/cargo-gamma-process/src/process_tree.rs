@@ -23,6 +23,8 @@ use cargo_gamma_unsafe::{PlatformError, Situation};
 
 #[cfg(any(test, feature = "fault-injection"))]
 use crate::faults;
+#[cfg(target_os = "macos")]
+use crate::sampled_memory::Sampler;
 use crate::{MemoryRequest, MemoryUsage};
 
 /// How many concurrent child subtrees can be watched for terminal interruption.
@@ -148,6 +150,10 @@ pub fn containment() -> Result<(), PlatformError> {
 #[cfg_attr(not(unix), derive(Default))]
 #[derive(Debug)]
 pub(crate) struct SpawnGuard {
+    /// The sampled accounting to start once the launch owns its process group.
+    #[cfg(target_os = "macos")]
+    memory: MemoryRequest,
+
     /// The interrupt handler's promise not to finish this process until the child is watched.
     ///
     /// Held across the spawn. A signal arriving in that window would otherwise kill this process and
@@ -246,12 +252,20 @@ impl SpawnGuard {
 
         #[cfg(all(unix, not(target_os = "linux")))]
         {
-            let Self { spawning } = self;
+            let Self {
+                spawning,
+                #[cfg(target_os = "macos")]
+                memory,
+            } = self;
 
             drop(spawning);
             std::thread::sleep(duration);
 
-            Ok(Self { spawning: window()? })
+            Ok(Self {
+                spawning: window()?,
+                #[cfg(target_os = "macos")]
+                memory,
+            })
         }
 
         #[cfg(not(unix))]
@@ -726,26 +740,18 @@ pub fn prepare(command: Command, request: MemoryRequest) -> Result<PreparedComma
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         if request.wanted() {
-            // `support` cannot say yes on this platform, but its signature is shared with the two
-            // that can, so the success case still needs an answer. Saying it plainly beats
-            // `unwrap_or_else`, which reads as if it handled the error and in fact discards the
-            // reason and yields `()` — this line did not compile at all until a macOS build was
-            // first attempted.
-            let Err(reason) = crate::support() else {
-                return Err(PlatformError::new_static(
-                    Situation::Unsupported,
-                    "this platform cannot bound a test subtree's memory",
-                ));
-            };
-
-            return Err(reason);
+            crate::support()?;
         }
 
         #[cfg(unix)]
         {
             Ok(PreparedCommand {
                 command,
-                guard: SpawnGuard { spawning: window()? },
+                guard: SpawnGuard {
+                    spawning: window()?,
+                    #[cfg(target_os = "macos")]
+                    memory: request,
+                },
             })
         }
 
@@ -799,6 +805,10 @@ fn interrupted() -> PlatformError {
 /// and cleanup. A completed external reap is detected by the next observation.
 #[derive(Debug)]
 pub struct ProcessTree {
+    /// Stopped and joined before releasing or reaping the numeric group identity.
+    #[cfg(target_os = "macos")]
+    sampler: Option<Sampler>,
+
     /// The leader retained until this subtree is observed or terminated.
     child: Option<Child>,
 
@@ -936,11 +946,16 @@ impl ProcessTree {
 
             #[cfg(not(target_os = "linux"))]
             {
+                #[cfg(target_os = "macos")]
+                let sampler = start_sampler(&mut child, &guard, group, slot)?;
+
                 Ok(Self {
                     child: Some(child),
                     output_cleanup_unproven: false,
                     group: Some(group),
                     slot: Some(slot),
+                    #[cfg(target_os = "macos")]
+                    sampler,
                 })
             }
         }
@@ -1096,7 +1111,7 @@ impl ProcessTree {
     /// measurement.
     #[must_use]
     #[cfg_attr(
-        not(any(target_os = "linux", windows)),
+        not(any(target_os = "linux", target_os = "macos", windows)),
         expect(
             clippy::unused_self,
             reason = "only the cgroup and job paths have anything to read, and the signature is shared"
@@ -1117,7 +1132,12 @@ impl ProcessTree {
             })
         }
 
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(target_os = "macos")]
+        {
+            self.sampler.as_ref().map_or_else(MemoryUsage::default, Sampler::usage)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             MemoryUsage::default()
         }
@@ -1144,6 +1164,13 @@ impl ProcessTree {
     )]
     // #[gamma::skip(fn_value.unit, reason = "the shared method is necessarily empty on non-Unix targets; Unix tests assert that it removes the exact watched slot")]
     fn release(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(sampler) = self.sampler.as_mut() {
+            // Normal observation/termination already collected any sampler error. Revocation
+            // and drop still have to join before a group id can be reused.
+            let _stopped = sampler.finish(false);
+        }
+
         #[cfg(unix)]
         if let Some((slot, group)) = self.slot.take().zip(self.group) {
             // Named as well as numbered, so that a slot an interrupt already emptied and some
@@ -1203,6 +1230,11 @@ impl ProcessTree {
     // #[gamma::skip(fn_value.ok, reason = "returning without observing and cleaning the process tree leaves descendants running and their output readers blocked")]
     #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn observe(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(target_os = "macos")]
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.check()?;
+        }
+
         let mut child = self
             .child
             .take()
@@ -1231,6 +1263,15 @@ impl ProcessTree {
                     return Err(cause);
                 }
             };
+
+            #[cfg(target_os = "macos")]
+            if observed
+                && let Some(sampler) = self.sampler.as_mut()
+                && let Err(cause) = sampler.finish(true)
+            {
+                self.child = Some(child);
+                return Err(cause);
+            }
 
             match cleanup_after_observation(
                 observed,
@@ -1332,6 +1373,11 @@ impl ProcessTree {
     /// failure takes precedence over the sweep failure after both cleanup attempts complete.
     fn kill(&self, child: &mut Child) -> io::Result<()> {
         #[cfg(target_os = "macos")]
+        if self.sampler.as_ref().is_some_and(Sampler::swept) {
+            return Ok(());
+        }
+
+        #[cfg(target_os = "macos")]
         {
             let pid = child.id();
             kill_with_observation(
@@ -1365,6 +1411,9 @@ impl ProcessTree {
     /// still returns an error. Other errors report the operating system's reason when cleanup or
     /// reaping fails. A reap failure takes precedence when both operations fail.
     pub fn terminate(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(target_os = "macos")]
+        let sampled = self.sampler.as_mut().map_or(Ok(()), |sampler| sampler.finish(true));
+
         let Some(mut child) = self.child.take() else {
             #[cfg(target_os = "macos")]
             if !self.output_cleanup_unproven {
@@ -1385,6 +1434,8 @@ impl ProcessTree {
                 revoked,
             ));
         }
+        #[cfg(target_os = "macos")]
+        let killed = killed.and(sampled);
         let reaped = self.finish_termination(killed, || child.wait())?;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -1416,6 +1467,13 @@ impl ProcessTree {
         expect(unused_variables, reason = "only Unix process groups use the leader's observed exit")
     )]
     fn sweep(&self, leader_exited: bool) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        if self.sampler.as_ref().is_some_and(Sampler::swept) {
+            // A successful sampler sweep already signalled every member. Repeating it can
+            // encounter only zombies, which macOS reports as EPERM, obscuring the breach.
+            return Ok(());
+        }
+
         #[cfg(any(test, feature = "fault-injection"))]
         if faults::fired(faults::Fault::Sweep) {
             return Err(io::Error::other("subtree sweep failed as requested by a test"));
@@ -1430,13 +1488,7 @@ impl ProcessTree {
         // Signalling the group has to come first: killing the leader on its own leaves the group
         // without one, and the descendants are then reparented and unreachable.
         #[cfg(unix)]
-        let killed = self.group.map_or(Ok(()), |group| {
-            if leader_exited {
-                group::kill_after_exit(group)
-            } else {
-                group::kill(group)
-            }
-        });
+        let killed = sweep_group(self.group, leader_exited);
 
         #[cfg(windows)]
         let boundary_killed = self.job.as_ref().map_or(Ok(()), Job::terminate);
@@ -1652,6 +1704,37 @@ fn abandon(child: &mut Child, guard: &SpawnGuard) -> io::Result<()> {
     }
 }
 
+/// Starts requested sampling while the spawn guard still protects a failed adoption's cleanup.
+#[cfg(target_os = "macos")]
+fn start_sampler(child: &mut Child, guard: &SpawnGuard, group: i32, slot: usize) -> Result<Option<Sampler>, PlatformError> {
+    if !guard.memory.wanted() {
+        return Ok(None);
+    }
+    let pid = child.id();
+    Sampler::start(group, guard.memory, move || {
+        kill_with_observation(|| group::exited(pid), |exited| sweep_group(Some(group), exited), || Ok(()))
+    })
+    .map(Some)
+    .map_err(|refusal| {
+        // No worker exists on failure. Revoke the watch before abandonment can reap the leader;
+        // the spawn window is still held, so an interrupt cannot leave this child behind.
+        interrupt::forget(slot, group);
+        abandoning(refusal, child, guard)
+    })
+}
+
+/// Signals the retained group using the existing exited-leader handling.
+#[cfg(unix)]
+fn sweep_group(group: Option<i32>, leader_exited: bool) -> io::Result<()> {
+    group.map_or(Ok(()), |group| {
+        if leader_exited {
+            group::kill_after_exit(group)
+        } else {
+            group::kill(group)
+        }
+    })
+}
+
 /// Selects the macOS group sweep while the leader remains unreaped.
 ///
 /// A pending first observation can race with the leader's exit before `killpg`. When that sweep
@@ -1772,6 +1855,10 @@ fn cleanup_after_observation<T>(
 
 impl Drop for ProcessTree {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(sampler) = self.sampler.as_mut() {
+            let _stopped = sampler.finish(false);
+        }
         let mut child = self.child.take();
 
         if let Some(child) = child.as_mut() {
@@ -2006,6 +2093,8 @@ mod tests {
     #[test]
     fn a_failed_group_kill_marks_termination_cleanup_as_unproven() {
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             #[cfg(unix)]
@@ -2034,6 +2123,8 @@ mod tests {
     #[test]
     fn terminating_an_already_cleaned_subtree_is_idempotent() {
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: None,
@@ -2182,6 +2273,8 @@ mod tests {
     #[test]
     fn observing_an_already_reaped_subtree_reports_the_exact_reason() {
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             #[cfg(unix)]
@@ -2571,6 +2664,8 @@ mod tests {
         let mut child = command.spawn().expect("spawn");
 
         let subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: None,
@@ -2728,6 +2823,8 @@ mod tests {
     #[test]
     fn a_subtree_with_no_watched_slot_drops_without_touching_the_registry() {
         let subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: None,
@@ -2748,6 +2845,8 @@ mod tests {
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
         let subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: Some(group),
@@ -2776,6 +2875,8 @@ mod tests {
         let slot = spawning.watch(group).expect("a free slot");
 
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: Some(group),
@@ -2817,6 +2918,8 @@ mod tests {
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: Some(group),
@@ -3728,6 +3831,7 @@ mod tests {
         let request = MemoryRequest {
             meter: true,
             limit: Some(1234),
+            calibrating: false,
         };
         let reason = output_with(no_op_command(), request, |command, forwarded| {
             drop(command);
@@ -4037,6 +4141,8 @@ mod tests {
     #[test]
     fn termination_marks_a_failed_sweep_as_unproven_after_reaping() {
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: None,
             output_cleanup_unproven: false,
             group: None,
@@ -4383,6 +4489,8 @@ mod tests {
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
         let mut subtree = ProcessTree {
+            #[cfg(target_os = "macos")]
+            sampler: None,
             child: Some(child),
             output_cleanup_unproven: false,
             group: Some(group),

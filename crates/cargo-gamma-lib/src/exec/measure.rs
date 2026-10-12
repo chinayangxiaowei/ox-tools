@@ -853,6 +853,16 @@ fn measure_with_locks(
 
     let (memory, unbounded) = settle_memory_control(config, memory::support().map_err(|reason| reason.to_string()))?;
 
+    #[cfg(target_os = "macos")]
+    if memory.enforcing() || memory.baseline_limit.is_some() {
+        events.warn(&format!(
+            "memory enforcement on macOS samples the process group's physical footprint every {} ms: \
+             the bound is soft, allocation can overshoot between samples, and descendants that leave \
+             the process group are neither counted nor stopped",
+            cargo_gamma_process::SAMPLE_INTERVAL.as_millis(),
+        ));
+    }
+
     // Checked against what the workspace declares, before anything is copied or compiled. A typo
     // here changes which tests get to convict a mutant, so it should cost a second rather than a
     // full instrumented build.
