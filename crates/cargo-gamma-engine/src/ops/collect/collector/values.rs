@@ -951,7 +951,7 @@ mod tests {
         for width in 1..=5 {
             let tuple = format!("({},)", vec!["bool"; width].join(","));
             let values = tuple_values(&syn::parse_str(&tuple).unwrap(), RETURN_DEPTH, &types);
-            let expected = (0..(1_usize << width).min(RETURN_WIDTH))
+            let expected = (0..(1_usize << width).min(TUPLE_RETURN_WIDTH))
                 .map(|index| {
                     let parts = (0..width)
                         .map(|position| {
@@ -970,7 +970,14 @@ mod tests {
                     ("fn_value.tuple", CompactString::from(text), Confidence::Proven)
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(values, expected, "{tuple}");
+            if 1_usize << width <= TUPLE_RETURN_WIDTH {
+                assert_eq!(values, expected, "{tuple}");
+            } else {
+                // Past the tuple budget only the legacy lexicographic prefix keeps its order; the
+                // remaining slots are chosen for member coverage instead.
+                assert_eq!(values.len(), TUPLE_RETURN_WIDTH, "{tuple}");
+                assert_eq!(values[..RETURN_WIDTH], expected[..RETURN_WIDTH], "{tuple}");
+            }
         }
         for left in [Confidence::Proven, Confidence::Optimistic] {
             for right in [Confidence::Proven, Confidence::Optimistic] {
