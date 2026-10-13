@@ -866,8 +866,9 @@ fn measure_with_locks(
     if memory.enforcing() || memory.baseline_limit.is_some() {
         events.warn(&format!(
             "memory enforcement on macOS samples the process group's physical footprint every {} ms: \
-             the bound is soft, allocation can overshoot between samples, and descendants that leave \
-             the process group are neither counted nor stopped",
+             the bound is soft, allocation can overshoot between samples, descendants that leave \
+             the process group are neither counted nor stopped, and members owned by another user \
+             cannot be read and are not counted",
             cargo_gamma_process::SAMPLE_INTERVAL.as_millis(),
         ));
     }
