@@ -1410,6 +1410,8 @@ impl ProcessTree {
     /// repeated macOS call after proven cleanup. An external reap leaves cleanup unproven and
     /// still returns an error. Other errors report the operating system's reason when cleanup or
     /// reaping fails. A reap failure takes precedence when both operations fail.
+    /// On macOS, a memory sampler failure is reported after successful cleanup and reaping,
+    /// preserving its error kind without marking cleanup as unproven.
     pub fn terminate(&mut self) -> io::Result<Option<ExitStatus>> {
         #[cfg(target_os = "macos")]
         let sampled = self.sampler.as_mut().map_or(Ok(()), |sampler| sampler.finish(true));
@@ -1435,7 +1437,8 @@ impl ProcessTree {
             ));
         }
         #[cfg(target_os = "macos")]
-        let killed = killed.and(sampled);
+        let reaped = self.finish_sampled_termination(killed, sampled, || child.wait())?;
+        #[cfg(not(target_os = "macos"))]
         let reaped = self.finish_termination(killed, || child.wait())?;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -1444,6 +1447,19 @@ impl ProcessTree {
         }
 
         Ok(Some(reaped))
+    }
+
+    /// Reports accounting failure only after termination has proved cleanup and reaped the leader.
+    #[cfg(target_os = "macos")]
+    fn finish_sampled_termination<T>(
+        &mut self,
+        killed: io::Result<()>,
+        sampled: io::Result<()>,
+        reap: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let reaped = self.finish_termination(killed, reap)?;
+        sampled.map_err(|cause| io::Error::new(cause.kind(), format!("the memory sampler failed: {cause}")))?;
+        Ok(reaped)
     }
 
     /// Releases the watch before reaping and records whether termination proved cleanup.
@@ -2117,6 +2133,69 @@ mod tests {
 
         assert_eq!(reason.to_string(), "group kill failed");
         assert!(subtree.output_cleanup_unproven, "failed cleanup was recorded as proven");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sampler_read_failure_does_not_mark_successful_termination_cleanup_as_unproven() {
+        let mut subtree = ProcessTree {
+            sampler: None,
+            child: None,
+            output_cleanup_unproven: false,
+            group: None,
+            slot: None,
+        };
+        let cause = io::Error::from_raw_os_error(libc::EIO);
+        let kind = cause.kind();
+        let message = format!("the memory sampler failed: {cause}");
+        let error = subtree
+            .finish_sampled_termination(Ok(()), Err(cause), || Ok(42))
+            .expect_err("the sampler failure must be reported after successful cleanup");
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), message);
+        assert!(
+            !subtree.output_cleanup_unproven,
+            "an accounting failure was recorded as failed cleanup"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_kill_failure_takes_precedence_over_a_sampler_failure() {
+        let mut subtree = ProcessTree {
+            sampler: None,
+            child: None,
+            output_cleanup_unproven: false,
+            group: None,
+            slot: None,
+        };
+        let error = subtree
+            .finish_sampled_termination(
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "group kill failed")),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                || Ok(42),
+            )
+            .expect_err("a failed kill must win over an accounting failure");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "group kill failed");
+        assert!(subtree.output_cleanup_unproven, "failed cleanup was recorded as proven");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn successful_sampled_termination_returns_the_reaped_value() {
+        let mut subtree = ProcessTree {
+            sampler: None,
+            child: None,
+            output_cleanup_unproven: false,
+            group: None,
+            slot: None,
+        };
+        let reaped = subtree
+            .finish_sampled_termination(Ok(()), Ok(()), || Ok(42))
+            .expect("successful cleanup and accounting must return the reaped value");
+        assert_eq!(reaped, 42);
+        assert!(!subtree.output_cleanup_unproven, "proven cleanup was recorded as unproven");
     }
 
     #[cfg(target_os = "macos")]
