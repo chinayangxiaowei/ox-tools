@@ -57,8 +57,9 @@ therefore covers the complete descendant tree.
   failure because the cgroup is the boundary that also reaches descendants
   that called `setsid`. On macOS, both observation and direct termination check
   the leader's exit without reaping it before sweeping the group. If a running
-  leader exits during a failed sweep, termination rechecks the exit before
-  retrying the exited-leader path. That path accepts `EPERM` only after checking
+  leader exits during a failed sweep, termination briefly rechecks the exit a
+  bounded number of times before retrying the exited-leader path. That path
+  accepts `EPERM` only after checking
   that the observed, unreaped leader is the group's sole remaining member. The
   kernel can return this error for that zombie-only group, but an inaccessible
   live member or an inconclusive group query leaves cleanup unproven. A sweep
