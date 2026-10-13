@@ -1754,25 +1754,54 @@ fn sweep_group(group: Option<i32>, leader_exited: bool) -> io::Result<()> {
 /// Selects the macOS group sweep while the leader remains unreaped.
 ///
 /// A pending first observation can race with the leader's exit before `killpg`. When that sweep
-/// reports `EPERM`, observe once more and retry the exited-leader path only if the new observation
-/// proves the exit. An `ECHILD` means another waiter released the numeric identifier, so no
-/// further signal is sent through it. The caller must be the sole waiter during this sequence;
+/// reports `EPERM`, briefly re-observe a bounded number of times and retry the exited-leader path
+/// only if an observation proves the exit. An `ECHILD` means another waiter released the numeric
+/// identifier, so no further signal is sent through it. The caller must be the sole waiter during this sequence;
 /// a concurrent external reap could free the identifier after observation and before the sweep.
 #[cfg(target_os = "macos")]
 fn kill_with_observation(
+    observe_exit: impl FnMut() -> io::Result<bool>,
+    sweep: impl FnMut(bool) -> io::Result<()>,
+    kill_child: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    kill_with_observation_and_pause(observe_exit, sweep, kill_child, || thread::sleep(EXIT_OBSERVATION_PAUSE))
+}
+
+// An exiting leader can disappear from killpg before waitid reports its exit.
+// Allow that brief transition to settle, with at most about 50 ms of pauses.
+#[cfg(target_os = "macos")]
+const EXIT_OBSERVATION_ATTEMPTS: usize = 50;
+#[cfg(target_os = "macos")]
+const EXIT_OBSERVATION_PAUSE: Duration = Duration::from_millis(1);
+
+#[cfg(target_os = "macos")]
+fn kill_with_observation_and_pause(
     mut observe_exit: impl FnMut() -> io::Result<bool>,
     mut sweep: impl FnMut(bool) -> io::Result<()>,
     kill_child: impl FnOnce() -> io::Result<()>,
+    mut pause: impl FnMut(),
 ) -> io::Result<()> {
     let swept = match observe_exit() {
         Ok(leader_exited) => {
             let first = sweep(leader_exited);
             if !leader_exited && first.as_ref().is_err_and(|cause| cause.raw_os_error() == Some(libc::EPERM)) {
-                match observe_exit() {
-                    Ok(true) => sweep(true),
-                    Err(cause) if group::is_no_child_to_wait_for(&cause) => Err(cause),
-                    Ok(false) | Err(_) => first,
+                let mut retry = first;
+                for _ in 0..EXIT_OBSERVATION_ATTEMPTS {
+                    pause();
+                    match observe_exit() {
+                        Ok(true) => {
+                            retry = sweep(true);
+                            break;
+                        }
+                        Err(cause) if group::is_no_child_to_wait_for(&cause) => {
+                            retry = Err(cause);
+                            break;
+                        }
+                        Err(_) => break,
+                        Ok(false) => {}
+                    }
                 }
+                retry
             } else {
                 first
             }
@@ -2243,7 +2272,7 @@ mod tests {
         let actions = RefCell::new(Vec::new());
         let mut observations = [false, true].into_iter();
 
-        kill_with_observation(
+        kill_with_observation_and_pause(
             || {
                 actions.borrow_mut().push("observe");
                 Ok(observations.next().expect("only two exit observations are needed"))
@@ -2260,6 +2289,7 @@ mod tests {
                 actions.borrow_mut().push("kill child");
                 Ok(())
             },
+            || {},
         )
         .expect("the second observation allows the exited-leader cleanup path");
 
@@ -2272,18 +2302,125 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn termination_preserves_permission_denial_while_the_leader_is_running() {
-        let mut observations = [false, false].into_iter();
-        let error = kill_with_observation(
-            || Ok(observations.next().expect("the permission failure requires two observations")),
+        let error = kill_with_observation_and_pause(
+            || Ok(false),
             |exited| {
                 assert!(!exited, "the leader never exited");
                 Err(io::Error::from_raw_os_error(libc::EPERM))
             },
             || Ok(()),
+            || {},
         )
         .expect_err("a live group's permission error cannot be accepted as cleanup");
 
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn termination_waits_for_an_exiting_leader() {
+        let mut observations = [Ok(false), Ok(false), Ok(false), Ok(true)].into_iter();
+        let mut observation_count = 0;
+        let mut sweeps = Vec::new();
+        let mut pauses = 0;
+        let mut child_kills = 0;
+        let result = kill_with_observation_and_pause(
+            || {
+                observation_count += 1;
+                observations
+                    .next()
+                    .expect("the scripted sequence covers every expected observation")
+            },
+            |exited| {
+                sweeps.push(exited);
+                if exited {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EPERM))
+                }
+            },
+            || {
+                child_kills += 1;
+                Ok(())
+            },
+            || pauses += 1,
+        );
+        result.expect("the observed exit allows the exited-leader sweep to prove cleanup");
+        assert_eq!(sweeps, [false, true]);
+        assert_eq!(observation_count, 4);
+        assert_eq!(pauses, 3);
+        assert_eq!(child_kills, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn termination_bounds_exit_reobservation() {
+        let mut observation_count = 0;
+        let mut sweeps = Vec::new();
+        let mut pauses = 0;
+        let mut child_kills = 0;
+        let result = kill_with_observation_and_pause(
+            || {
+                observation_count += 1;
+                Ok(false)
+            },
+            |exited| {
+                sweeps.push(exited);
+                if exited {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EPERM))
+                }
+            },
+            || {
+                child_kills += 1;
+                Ok(())
+            },
+            || pauses += 1,
+        );
+        let error = result.expect_err("the bounded observations never prove the leader exited");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        assert_eq!(sweeps, [false]);
+        assert_eq!(observation_count, EXIT_OBSERVATION_ATTEMPTS + 1);
+        assert_eq!(pauses, EXIT_OBSERVATION_ATTEMPTS);
+        assert_eq!(child_kills, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn termination_stops_reobservation_after_external_reap() {
+        let mut observations = [Ok(false), Ok(false), Err(io::Error::from_raw_os_error(libc::ECHILD))].into_iter();
+        let mut observation_count = 0;
+        let mut sweeps = Vec::new();
+        let mut pauses = 0;
+        let mut child_kills = 0;
+        let result = kill_with_observation_and_pause(
+            || {
+                observation_count += 1;
+                observations
+                    .next()
+                    .expect("the scripted sequence covers every expected observation")
+            },
+            |exited| {
+                sweeps.push(exited);
+                if exited {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EPERM))
+                }
+            },
+            || {
+                child_kills += 1;
+                Ok(())
+            },
+            || pauses += 1,
+        );
+        let error = result.expect_err("an external reap revokes the identifiers");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(sweeps, [false]);
+        assert_eq!(observation_count, 3);
+        assert_eq!(pauses, 2);
+        assert_eq!(child_kills, 0);
     }
 
     #[cfg(target_os = "macos")]
@@ -2328,7 +2465,7 @@ mod tests {
     #[test]
     fn termination_stops_signalling_when_a_retry_finds_an_external_reap() {
         let mut calls = 0;
-        let error = kill_with_observation(
+        let error = kill_with_observation_and_pause(
             || {
                 calls += 1;
                 if calls == 1 {
@@ -2342,6 +2479,7 @@ mod tests {
                 Err(io::Error::from_raw_os_error(libc::EPERM))
             },
             || panic!("the externally reaped child identifier may have been reused"),
+            || {},
         )
         .expect_err("an external reap prevents a direct child signal");
 
