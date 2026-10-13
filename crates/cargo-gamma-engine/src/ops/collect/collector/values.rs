@@ -17,12 +17,14 @@ use crate::ops::collect::Confidence;
 /// population of the whole file.
 pub(super) const RETURN_DEPTH: usize = 3;
 
-/// The most replacement values any single return type may contribute.
+/// The most replacement values a non-tuple return type may contribute.
 ///
-/// The bound is on the product, not on any one level, because it is the product that decides how
-/// many mutants a function costs. A tuple of four booleans is sixteen combinations, and every one
-/// of them is a separate build round's worth of test time.
+/// Nested options, collections, and wrappers use this bound to keep one return type from
+/// dominating the mutant population. Tuple products have a separate bound below.
 pub(super) const RETURN_WIDTH: usize = 8;
+
+/// Tuple products get enough room for two three-choice members or four booleans.
+const TUPLE_RETURN_WIDTH: usize = 16;
 
 type ReplacementValue = (&'static str, CompactString, Confidence);
 
@@ -450,6 +452,7 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
 
             cap(values)
         }
+        // #[gamma::skip(expr.increment, expr.decrement, reason = "reference_values deliberately ignores its depth parameter and constructs only the shared empty slice")]
         Kind::Reference => reference_values(resolved, depth, types),
         Kind::Array => {
             if types.has_proven_default(resolved) {
@@ -473,57 +476,103 @@ pub(super) fn values_for(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<Repl
     }
 }
 
-/// Every combination of a tuple's element values, which is where the width bound earns its keep:
-/// three fields with three values each is twenty-seven mutants for a single function, and the
-/// user has to read every one of them.
+/// Every combination of a small tuple's element values, or a bounded selection from a large one.
 pub(super) fn tuple_values(ty: &Type, depth: usize, types: &Types<'_>) -> Vec<ReplacementValue> {
     let Type::Tuple(tuple) = strip(ty) else {
         return vec![optimistic("fn_value.default", "Default::default()")];
     };
 
-    let mut combinations: Vec<(Vec<CompactString>, Confidence)> = vec![(Vec::new(), Confidence::Proven)];
+    let choices: Vec<Vec<ReplacementValue>> = tuple
+        .elems
+        .iter()
+        .map(|element| values_for(element, depth.saturating_sub(1), types))
+        .collect();
+    let lengths: Vec<usize> = choices.iter().map(Vec::len).collect();
 
-    for element in &tuple.elems {
-        let choices = values_for(element, depth.saturating_sub(1), types);
-        let mut next = Vec::new();
-
-        'combinations: for (existing, existing_confidence) in &combinations {
-            for (_name, text, choice_confidence) in &choices {
-                if next.len() >= RETURN_WIDTH {
-                    break 'combinations;
-                }
-
-                let mut combination = existing.clone();
-
-                combination.push(text.clone());
-                let confidence = if *existing_confidence == Confidence::Optimistic || *choice_confidence == Confidence::Optimistic {
-                    Confidence::Optimistic
-                } else {
-                    Confidence::Proven
-                };
-                next.push((combination, confidence));
-            }
-        }
-
-        combinations = next;
-
-        if combinations.is_empty() {
-            break;
-        }
-    }
-
-    combinations
+    tuple_indices(&lengths)
         .into_iter()
-        .map(|(parts, confidence)| {
+        .map(|indices| {
+            let mut parts = Vec::with_capacity(indices.len());
+            let mut confidence = Confidence::Proven;
+            for (member, index) in choices.iter().zip(indices) {
+                let (_name, text, member_confidence) = &member[index];
+                parts.push(text.as_str());
+                confidence = combined_confidence(confidence, *member_confidence);
+            }
             let text = if parts.len() == 1 {
                 format_compact!("({},)", parts[0])
             } else {
                 format_compact!("({})", parts.join(", "))
             };
-
             ("fn_value.tuple", text, confidence)
         })
         .collect()
+}
+
+/// Selects all small products, preserving the legacy prefix before sampling larger products.
+fn tuple_indices(lengths: &[usize]) -> Vec<Vec<usize>> {
+    if lengths.contains(&0) {
+        return Vec::new();
+    }
+
+    let product = lengths.iter().fold(1usize, |count, length| count.saturating_mul(*length));
+    let mut selected = Vec::new();
+    let mut indices = vec![0; lengths.len()];
+
+    // Mutant IDs use a replacement's position in this list. The first eight lexicographic
+    // combinations existed before tuple products gained a larger budget, so moving one would
+    // attach an old cached verdict to a different replacement.
+    loop {
+        if selected.len() >= product.min(RETURN_WIDTH) {
+            break;
+        }
+        selected.push(indices.clone());
+        if !advance_tuple_indices(&mut indices, lengths) {
+            return selected;
+        }
+    }
+
+    if product > TUPLE_RETURN_WIDTH {
+        let coverage_slots = TUPLE_RETURN_WIDTH - RETURN_WIDTH;
+        let mut slots = vec![vec![0; lengths.len()]; coverage_slots];
+        for (member, length) in lengths.iter().copied().enumerate() {
+            let missing = (0..length).filter(|value| !selected.iter().any(|indices| indices[member] == *value));
+            for (offset, value) in missing.take(coverage_slots).enumerate() {
+                let slot = (member + offset) % coverage_slots;
+                slots[slot][member] = value;
+            }
+        }
+        for indices in slots {
+            if !selected.contains(&indices) {
+                selected.push(indices);
+            }
+        }
+    }
+
+    loop {
+        if selected.len() >= TUPLE_RETURN_WIDTH {
+            break;
+        }
+        if !selected.contains(&indices) {
+            selected.push(indices.clone());
+        }
+        if !advance_tuple_indices(&mut indices, lengths) {
+            break;
+        }
+    }
+
+    selected
+}
+
+fn advance_tuple_indices(indices: &mut [usize], lengths: &[usize]) -> bool {
+    for (index, length) in indices.iter_mut().zip(lengths).rev() {
+        *index += 1;
+        if *index < *length {
+            return true;
+        }
+        *index = 0;
+    }
+    false
 }
 
 /// The replacement values for a type that has a fixed list of them.
@@ -578,6 +627,7 @@ pub(super) fn literal_values(kind: Kind, ty: &Type) -> Vec<ReplacementValue> {
 /// can change mutability, inference, lifetime bounds, and runtime behavior. The only current
 /// reference value is the shared empty slice, whose literal promotion supplies the declared
 /// lifetime without allocation. Mutable and other shared references contribute no candidate.
+// #[gamma::skip(parameter.default_shadow, reason = "_depth is deliberately unused and defaulting it cannot affect any reference replacement")]
 pub(super) fn reference_values(ty: &Type, _depth: usize, _types: &Types<'_>) -> Vec<ReplacementValue> {
     let Some(elem) = reference_elem(ty) else {
         return Vec::new();
@@ -894,6 +944,283 @@ mod tests {
     }
 
     #[test]
+    fn tuple_product_order_and_width_match_an_independent_boolean_oracle() {
+        let imports = HashMap::default();
+        let defaults = Defaults::default();
+        let types = test_types(&[], &imports, &defaults);
+        for width in 1..=5 {
+            let tuple = format!("({},)", vec!["bool"; width].join(","));
+            let values = tuple_values(&syn::parse_str(&tuple).unwrap(), RETURN_DEPTH, &types);
+            let expected = (0..(1_usize << width).min(TUPLE_RETURN_WIDTH))
+                .map(|index| {
+                    let parts = (0..width)
+                        .map(|position| {
+                            if index & (1 << (width - position - 1)) == 0 {
+                                "true"
+                            } else {
+                                "false"
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let text = if width == 1 {
+                        format!("({},)", parts[0])
+                    } else {
+                        format!("({})", parts.join(", "))
+                    };
+                    ("fn_value.tuple", CompactString::from(text), Confidence::Proven)
+                })
+                .collect::<Vec<_>>();
+            if 1_usize << width <= TUPLE_RETURN_WIDTH {
+                assert_eq!(values, expected, "{tuple}");
+            } else {
+                // Past the tuple budget only the legacy lexicographic prefix keeps its order; the
+                // remaining slots are chosen for member coverage instead.
+                assert_eq!(values.len(), TUPLE_RETURN_WIDTH, "{tuple}");
+                assert_eq!(values[..RETURN_WIDTH], expected[..RETURN_WIDTH], "{tuple}");
+            }
+        }
+        for left in [Confidence::Proven, Confidence::Optimistic] {
+            for right in [Confidence::Proven, Confidence::Optimistic] {
+                let expected = if left == Confidence::Proven && right == Confidence::Proven {
+                    Confidence::Proven
+                } else {
+                    Confidence::Optimistic
+                };
+                assert_eq!(combined_confidence(left, right), expected);
+                assert_eq!(
+                    some_value(("fn_value.default", "Default::default()".into(), left), right),
+                    ("fn_value.some_default", "Some(Default::default())".into(), expected)
+                );
+            }
+        }
+        assert_eq!(
+            some_value(proven("fn_value.bool_true", "true"), Confidence::Proven),
+            proven("fn_value.some", "Some(true)")
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the constructor matrix keeps ordered payload and confidence oracles together"
+    )]
+    fn composed_values_preserve_constructor_order_payloads_and_evidence() {
+        let imports = HashMap::default();
+        let defaults = Defaults::of(&syn::parse_file("struct Missing; #[derive(Default)] struct Present;").unwrap());
+        let types = test_types(&[], &imports, &defaults);
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            (
+                "Option<bool>",
+                &[
+                    ("fn_value.none", "None"),
+                    ("fn_value.some", "Some(true)"),
+                    ("fn_value.some", "Some(false)"),
+                ],
+            ),
+            ("Option<Missing>", &[("fn_value.none", "None")]),
+            (
+                "Result<bool,u8>",
+                &[
+                    ("fn_value.ok", "Ok(true)"),
+                    ("fn_value.ok", "Ok(false)"),
+                    ("fn_value.err_default", "Err(Default::default())"),
+                ],
+            ),
+            ("Result<Missing,u8>", &[("fn_value.err_default", "Err(Default::default())")]),
+            ("Result<bool,Missing>", &[("fn_value.ok", "Ok(true)"), ("fn_value.ok", "Ok(false)")]),
+            (
+                "Vec<bool>",
+                &[
+                    ("fn_value.empty_collection", "Vec::new()"),
+                    ("fn_value.one_element", "core::iter::once(true).collect()"),
+                    ("fn_value.one_element", "core::iter::once(false).collect()"),
+                ],
+            ),
+            (
+                "std::collections::HashMap<bool,u8>",
+                &[
+                    ("fn_value.empty_collection", "std::collections::HashMap::new()"),
+                    ("fn_value.one_element", "core::iter::once((true, 0)).collect()"),
+                ],
+            ),
+            (
+                "std::collections::HashMap<Missing,u8>",
+                &[("fn_value.empty_collection", "std::collections::HashMap::new()")],
+            ),
+            (
+                "std::collections::HashMap<u8,Missing>",
+                &[("fn_value.empty_collection", "std::collections::HashMap::new()")],
+            ),
+            (
+                "Box<bool>",
+                &[("fn_value.bool_true", "Box::new(true)"), ("fn_value.bool_false", "Box::new(false)")],
+            ),
+            (
+                "Box<str>",
+                &[
+                    ("fn_value.empty_string", "Box::from(\"\")"),
+                    ("fn_value.xyzzy_string", "Box::from(\"xyzzy\")"),
+                ],
+            ),
+            (
+                "String",
+                &[
+                    ("fn_value.empty_string", "String::new()"),
+                    ("fn_value.xyzzy_string", "\"xyzzy\".to_owned()"),
+                ],
+            ),
+            (
+                "f64",
+                &[("fn_value.zero", "0.0"), ("fn_value.one", "1.0"), ("fn_value.minus_one", "-1.0")],
+            ),
+            (
+                "NonZeroU8",
+                &[
+                    ("fn_value.one", "NonZeroU8::new(1).unwrap()"),
+                    ("fn_value.two", "NonZeroU8::new(2).unwrap()"),
+                ],
+            ),
+            (
+                "impl Iterator<Item = bool>",
+                &[
+                    ("fn_value.empty_collection", "core::iter::empty()"),
+                    ("fn_value.one_element", "core::iter::once(true)"),
+                    ("fn_value.one_element", "core::iter::once(false)"),
+                ],
+            ),
+            ("&[u8]", &[("fn_value.empty_collection", "&[]")]),
+            ("(&[u8])", &[("fn_value.empty_collection", "&[]")]),
+            ("&mut [u8]", &[]),
+            ("&mut str", &[]),
+            ("&u8", &[]),
+            ("Missing", &[]),
+            ("[u8; 32]", &[("fn_value.default", "Default::default()")]),
+        ];
+        for &(text, expected) in cases {
+            let values = values_for(&syn::parse_str(text).unwrap(), RETURN_DEPTH, &types);
+            assert_eq!(
+                values.iter().map(|(name, value, _)| (*name, value.as_str())).collect::<Vec<_>>(),
+                expected,
+                "{text}"
+            );
+            assert!(
+                values.iter().all(|(_, _, confidence)| *confidence == Confidence::Proven),
+                "{text}: {values:?}"
+            );
+        }
+        let cow = values_for(&syn::parse_quote!(Cow<'static, bool>), RETURN_DEPTH, &types);
+        assert_eq!(
+            cow,
+            [
+                proven("fn_value.bool_true", "Cow::Owned(true)"),
+                proven("fn_value.bool_false", "Cow::Owned(false)"),
+            ]
+        );
+        for text in ["HashMap<Unknown,u8>", "HashMap<u8,Unknown>", "HashMap<u8,u8,Unknown>"] {
+            let values = values_for(&syn::parse_str(text).unwrap(), RETURN_DEPTH, &types);
+            assert_eq!(values.len(), 2, "{text}: {values:?}");
+            assert_eq!(values[1].2, Confidence::Optimistic, "{text}");
+        }
+        for text in [
+            "other::Option<bool>",
+            "other::Result<bool,u8>",
+            "other::String",
+            "other::Box<bool>",
+            "other::NonZeroU8",
+            "other::Cow<'static,bool>",
+        ] {
+            let values = values_for(&syn::parse_str(text).unwrap(), RETURN_DEPTH, &types);
+            assert!(!values.is_empty(), "{text}");
+            assert!(
+                values.iter().all(|(_, _, confidence)| *confidence == Confidence::Optimistic),
+                "{text}: {values:?}"
+            );
+        }
+        for (text, expected) in [
+            ("bool", vec![proven("fn_value.default", "Default::default()")]),
+            ("[u8; N]", vec![optimistic("fn_value.default", "Default::default()")]),
+            ("Unknown", vec![optimistic("fn_value.default", "Default::default()")]),
+            ("Result<bool,u8>", vec![]),
+            ("&u8", vec![]),
+            ("Missing", vec![]),
+        ] {
+            assert_eq!(values_for(&syn::parse_str(text).unwrap(), 0, &types), expected, "{text}");
+        }
+    }
+    #[test]
+    fn aliased_collection_values_keep_default_spelling_and_local_negative_evidence() {
+        use super::super::types::Alias;
+        let defaults = Defaults::of(&syn::parse_file("struct Vec<T>(T);").unwrap());
+        let imports = HashMap::default();
+        let aliases = HashMap::from_iter([
+            (
+                "Foreign".into(),
+                Some(Alias {
+                    parameters: vec![],
+                    target: parse_quote!(other::Vec<u8>),
+                }),
+            ),
+            (
+                "Standard".into(),
+                Some(Alias {
+                    parameters: vec![],
+                    target: parse_quote!(std::vec::Vec<bool>),
+                }),
+            ),
+            (
+                "Local".into(),
+                Some(Alias {
+                    parameters: vec![],
+                    target: parse_quote!(Vec<u8>),
+                }),
+            ),
+            (
+                "StandardMap".into(),
+                Some(Alias {
+                    parameters: vec![],
+                    target: parse_quote!(std::collections::HashMap<bool,u8>),
+                }),
+            ),
+            (
+                "ForeignMap".into(),
+                Some(Alias {
+                    parameters: vec![],
+                    target: parse_quote!(other::HashMap<bool,u8>),
+                }),
+            ),
+        ]);
+        let types = Types {
+            abstracts: &[],
+            defaulted: &[],
+            imports: &imports,
+            defaults: &defaults,
+            aliases: Some(&aliases),
+            self_type: None,
+            self_associated: None,
+        };
+        assert_eq!(
+            values_for(&parse_quote!(Foreign), RETURN_DEPTH, &types),
+            [optimistic("fn_value.default", "Default::default()")]
+        );
+        assert_eq!(
+            values_for(&parse_quote!(ForeignMap), RETURN_DEPTH, &types),
+            [optimistic("fn_value.default", "Default::default()")]
+        );
+        let standard = values_for(&parse_quote!(Standard), RETURN_DEPTH, &types);
+        assert_eq!(standard[0], proven("fn_value.empty_collection", "Default::default()"));
+        let map = values_for(&parse_quote!(StandardMap), RETURN_DEPTH, &types);
+        assert_eq!(map[0], proven("fn_value.empty_collection", "Default::default()"));
+        let local = values_for(&parse_quote!(Local), RETURN_DEPTH, &types);
+        assert_eq!(
+            local,
+            [
+                optimistic("fn_value.one_element", "core::iter::once(0).collect()"),
+                optimistic("fn_value.one_element", "core::iter::once(1).collect()"),
+            ]
+        );
+    }
+
+    #[test]
     fn unknown_undefaultable_types_and_non_tuples_contribute_fallbacks() {
         let abstracts = Vec::new();
         let imports = HashMap::default();
@@ -908,6 +1235,43 @@ mod tests {
             ["fn_value.default:Default::default()"]
         );
         assert!(literal_values(Kind::Option, &parse_quote!(Option<bool>)).is_empty());
+    }
+
+    #[test]
+    fn type_argument_iterator_item_and_nested_tuple_depths_have_exact_boundaries() {
+        let ty: Type = syn::parse_quote!(Container<'static, u8, 3, bool>);
+        assert_eq!(type_argument(&ty, 0), Some(&syn::parse_quote!(u8)));
+        assert_eq!(type_argument(&ty, 1), Some(&syn::parse_quote!(bool)));
+        assert_eq!(type_argument(&ty, 2), None);
+        let mut iterator: Type = syn::parse_quote!(impl Iterator<Item = u8>);
+        assert_eq!(iterator_item(&iterator), Some(&syn::parse_quote!(u8)));
+        let Type::ImplTrait(implementation) = &mut iterator else {
+            unreachable!()
+        };
+        let TypeParamBound::Trait(bound) = &mut implementation.bounds[0] else {
+            unreachable!()
+        };
+        bound.path.segments.clear();
+        assert_eq!(iterator_item(&iterator), None);
+        for (text, expected) in [
+            ("NonZeroU8", Kind::NonZero),
+            ("NonZeroU8<u8>", Kind::Unknown),
+            ("NonZero", Kind::Unknown),
+            ("OtherNonZeroU8", Kind::Unknown),
+        ] {
+            assert_eq!(resolve_type(&syn::parse_str(text).unwrap()), expected, "{text}");
+        }
+        let imports = HashMap::default();
+        let defaults = Defaults::default();
+        let types = test_types(&[], &imports, &defaults);
+        for (depth, texts) in [
+            (1, vec!["(Default::default(),)"]),
+            (2, vec!["(None,)", "(Some(Default::default()),)"]),
+            (3, vec!["(None,)", "(Some(true),)", "(Some(false),)"]),
+        ] {
+            let values = values_for(&syn::parse_quote!((Option<bool>,)), depth, &types);
+            assert_eq!(values.iter().map(|(_, text, _)| text.as_str()).collect::<Vec<_>>(), texts);
+        }
     }
 
     #[test]
@@ -1321,14 +1685,14 @@ mod tests {
         let tuple: Type = parse_quote!((bool, bool, bool, bool));
         let values = tuple_values(&tuple, RETURN_DEPTH, &types);
 
-        assert_eq!(values.len(), RETURN_WIDTH);
+        assert_eq!(values.len(), TUPLE_RETURN_WIDTH);
         assert_eq!(
             values.first().map(|(_, text, _confidence)| text.as_str()),
             Some("(true, true, true, true)")
         );
         assert_eq!(
             values.last().map(|(_, text, _confidence)| text.as_str()),
-            Some("(true, false, false, false)")
+            Some("(false, false, false, false)")
         );
         assert_eq!(cap(vec![proven("x", "x"); RETURN_WIDTH + 1]).len(), RETURN_WIDTH);
 
@@ -1340,6 +1704,55 @@ mod tests {
         let array: PathSegment = parse_quote!(Array<u8, 4>);
         assert_eq!(type_arguments(&cow), 1);
         assert_eq!(type_arguments(&array), 1);
+    }
+
+    #[test]
+    fn tuple_products_complete_small_cases_and_cover_each_member_when_capped() {
+        let abstracts = Vec::new();
+        let imports = HashMap::default();
+        let defaults = Defaults::default();
+        let types = test_types(&abstracts, &imports, &defaults);
+        let pair: Type = parse_quote!((Vec<usize>, Vec<usize>));
+        let values = tuple_values(&pair, RETURN_DEPTH, &types);
+
+        assert_eq!(values.len(), 9);
+        assert!(
+            values
+                .iter()
+                .any(|(_, text, _)| { text == "(core::iter::once(1).collect(), core::iter::once(1).collect())" }),
+            "{values:?}"
+        );
+
+        for lengths in [&[3, 3, 3][..], &[2; 20][..]] {
+            let selected = tuple_indices(lengths);
+            assert_eq!(selected.len(), TUPLE_RETURN_WIDTH);
+            for (member, length) in lengths.iter().copied().enumerate() {
+                for value in 0..length {
+                    assert!(selected.iter().any(|indices| indices[member] == value), "{selected:?}");
+                }
+            }
+        }
+
+        // These replacements had indices 0 through 7 in the earlier eight-value catalog. Their IDs
+        // must continue to name the same values when a wider product is sampled.
+        let wide: Type = parse_quote!((bool, bool, bool, bool, bool));
+        let values = tuple_values(&wide, RETURN_DEPTH, &types);
+        assert_eq!(values.len(), TUPLE_RETURN_WIDTH);
+        assert_eq!(values[0].1, "(true, true, true, true, true)");
+        assert_eq!(values[1].1, "(true, true, true, true, false)");
+        assert_eq!(values[7].1, "(true, true, false, false, false)");
+
+        // An inner tuple can itself contribute sixteen choices. Only eight new slots remain
+        // after the stable prefix, so sampling covers as many missing choices as the cap permits.
+        let nested = tuple_indices(&[16, 16]);
+        assert_eq!(nested.len(), TUPLE_RETURN_WIDTH);
+        assert_eq!(
+            &nested[..RETURN_WIDTH],
+            &(0..RETURN_WIDTH).map(|value| vec![0, value]).collect::<Vec<_>>()
+        );
+        for value in 0..16 {
+            assert!(nested.iter().any(|indices| indices[1] == value), "{nested:?}");
+        }
     }
 
     #[test]

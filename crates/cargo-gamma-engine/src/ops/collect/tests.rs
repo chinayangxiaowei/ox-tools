@@ -4692,7 +4692,7 @@ fn a_wide_tuple_return_is_capped_rather_than_multiplied_out_in_full() {
     let source = "fn f() -> (bool, bool, bool, bool, bool) { (true, true, true, true, true) }";
     let found = candidates(source, "fn_value.tuple");
 
-    assert!(found.len() <= 8, "{found:?}");
+    assert!(found.len() <= 16, "{found:?}");
     assert!(!found.is_empty(), "{found:?}");
 }
 
