@@ -213,7 +213,9 @@ member releases memory just as another allocates it, a single pass can count
 the same memory twice and sum above the ceiling, although the group never held
 that much at once. A false breach would report a healthy mutant as `outofmem`.
 A real runaway is still over the ceiling on the second pass, which costs only
-the time of one more pass.
+the time of one more pass. Confirmation makes a false breach much less likely,
+but it does not rule one out; see "Non-simultaneous reads" under the stated
+limits.
 
 The kill reuses the existing process-group sweep, including the macOS
 zombie-leader handling. The verdict reuses `outofmem` and its note: the binary,
@@ -252,6 +254,15 @@ member, which is negligible next to running a test binary.
   until the sampler is ready would close the window. That would change the
   launch path for every macOS launch, and it is not done for a gap normally
   shorter than the interval itself.
+- **Non-simultaneous reads.** Members are read one after another, so a pass's
+  sum is not a point-in-time total. A breach must be seen on two consecutive
+  passes, which filters out a single transient shift between members. A group
+  that hands the same memory from one member to another between the reads of
+  both passes can still sum above the ceiling twice and be stopped as
+  `outofmem`, although it never held that much at once. That needs the
+  handoff to coincide with the reads twice in a row. Ruling it out would need
+  a stable snapshot, for example stopping the group while it is read. That
+  would pause every macOS launch at every sample, so it is not done.
 - **Group escape.** A descendant that calls `setsid` or `setpgid` leaves the
   group and is neither counted nor killed. This is the same best-effort
   containment macOS already has for termination. It does not newly weaken

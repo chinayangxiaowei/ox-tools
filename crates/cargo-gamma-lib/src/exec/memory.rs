@@ -169,11 +169,13 @@ impl MemoryPolicy {
         matches!(self.control, MemoryControl::Enforce)
     }
 
-    /// The same policy with all memory control removed, for a host that cannot provide it.
+    /// The same policy with measurement, enforcement, and both explicit ceilings removed.
     #[must_use]
     pub const fn disabled(&self) -> Self {
         Self {
             control: MemoryControl::Off,
+            limit: None,
+            baseline_limit: None,
             ..*self
         }
     }
@@ -290,9 +292,32 @@ mod tests {
 
         assert!(stated.insisted());
 
-        // Disabling preserves everything else, so a degraded run still reports the numbers it was
+        // Disabling preserves calibration settings, so a degraded run still reports the numbers it was
         // configured with rather than silently reverting them too.
         assert!((stated.disabled().multiplier - stated.multiplier).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn disabling_removes_both_limits_and_preserves_the_other_fields() {
+        let policy = MemoryPolicy {
+            control: MemoryControl::Enforce,
+            demand: Demand::Stated,
+            multiplier: 3.5,
+            headroom: 456,
+            limit: Some(100),
+            baseline_limit: Some(200),
+        };
+        assert_eq!(
+            policy.disabled(),
+            MemoryPolicy {
+                control: MemoryControl::Off,
+                demand: Demand::Stated,
+                multiplier: 3.5,
+                headroom: 456,
+                limit: None,
+                baseline_limit: None,
+            }
+        );
     }
 
     /// A small baseline peak is governed by the absolute headroom, not by the multiplier.

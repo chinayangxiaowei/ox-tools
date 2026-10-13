@@ -1581,7 +1581,7 @@ fn settle_memory_control(config: &Config, support: Result<(), String>) -> Result
     let policy = config.memory;
 
     if !policy.measuring() {
-        return Ok((policy, None));
+        return Ok((policy.disabled(), None));
     }
 
     if let Err(reason) = support {
@@ -2540,6 +2540,30 @@ mod tests {
         assert_eq!(note, None);
     }
 
+    #[test]
+    fn explicitly_disabled_memory_control_clears_both_limits_without_a_note() {
+        let config = Config {
+            memory: MemoryPolicy {
+                control: MemoryControl::Off,
+                demand: Demand::Stated,
+                limit: Some(100),
+                baseline_limit: Some(200),
+                ..MemoryPolicy::default()
+            },
+            ..Config::default()
+        };
+        let (settled, note) = settle_memory_control(&config, Ok(())).unwrap();
+        assert_eq!(
+            settled,
+            MemoryPolicy {
+                limit: None,
+                baseline_limit: None,
+                ..config.memory
+            }
+        );
+        assert_eq!(note, None);
+    }
+
     /// A stated memory policy this host cannot deliver is an error, not a silent degradation.
     ///
     /// Someone who passed `--memory` did so because an unbounded mutant would cost them something,
@@ -2666,13 +2690,22 @@ mod tests {
             memory: MemoryPolicy {
                 control: MemoryControl::Off,
                 demand: Demand::Stated,
+                limit: Some(100),
+                baseline_limit: Some(200),
                 ..MemoryPolicy::default()
             },
             ..Config::default()
         };
         let support = runner_memory_support(config.nextest, true, Ok(()));
         let (settled, note) = settle_memory_control(&config, support).unwrap();
-        assert_eq!(settled, config.memory);
+        assert_eq!(
+            settled,
+            MemoryPolicy {
+                limit: None,
+                baseline_limit: None,
+                ..config.memory
+            }
+        );
         assert_eq!(note, None);
     }
 

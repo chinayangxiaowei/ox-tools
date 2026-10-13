@@ -169,6 +169,8 @@ impl Sample {
             Ok::<_, io::Error>(aggregate)
         };
         // Baseline calibration conservatively includes each listed member's lifetime maximum.
+        // Keep those maxima even when a spike is unconfirmed: a member can disappear before
+        // confirmation, taking the only recoverable record of its baseline peak with it.
         // Enforcement uses only current aggregate footprint, never a sum of historical peaks.
         let peak_of = |reading: Footprint| {
             if self.calibrating {
@@ -187,6 +189,8 @@ impl Sample {
             current = confirming.current;
             peak = if self.limit.is_some_and(|limit| current > limit) {
                 peak.max(peak_of(confirming))
+            } else if self.calibrating {
+                peak_of(confirming).max(first.lifetime_max)
             } else {
                 peak_of(confirming)
             };
@@ -571,6 +575,29 @@ mod tests {
             assert!(state.swept);
             assert_eq!(kills, 1);
         }
+    }
+
+    #[test]
+    fn calibration_keeps_lifetime_peaks_from_members_missing_in_confirmation() {
+        let mut state = Sample::new(Some(100), true);
+        let mut kills = 0;
+        sample_passes(
+            &mut state,
+            &[
+                &[(11, Some(reading(40, 40))), (12, Some(reading(80, 300)))],
+                &[(11, Some(reading(40, 40)))],
+            ],
+            &mut kills,
+        );
+        assert_eq!(
+            state.usage,
+            MemoryUsage {
+                peak: Some(340),
+                exhausted: false
+            }
+        );
+        assert!(!state.swept);
+        assert_eq!(kills, 0);
     }
 
     #[test]
