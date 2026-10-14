@@ -1714,14 +1714,15 @@ predecessor earned — it reappears as never tested, which is also how it stays 
 denominator.
 
 Removing the *old* identity needs one more thing, because a union by itself never drops anything: at
-least one input has to be an unsharded run or listing, which states the complete population of every
-file it covers. A report narrowed by `--re` is partial even without sharding, so it cannot
-establish a withdrawal. If its source text changed, an available unfiltered source stays the
-presentation for unmatched historical mutants; include a current unfiltered listing for current
-presentations. An identity absent from the newest complete input has been withdrawn, and
-the summary
-counts it under `Withdrawn`. A sharded report describes only its own slice, so it never withdraws
-anything — merge a full `list mutants --json` alongside the rotation to keep the denominator honest:
+least one input has to be an unsharded, unfiltered run or listing, which states the complete
+population of every file it covers. An identity absent from the newest complete input has been
+withdrawn, and the summary counts it under `Withdrawn`.
+
+A report narrowed by `--re` is partial even without sharding, so it cannot establish a withdrawal.
+If its source text changed, an available unfiltered source stays the presentation for unmatched
+historical mutants; include a current unfiltered listing for current presentations. A sharded
+report describes only its own slice, so it never withdraws anything — merge a full
+`list mutants --json` alongside the rotation to keep the denominator honest:
 
 ```bash
 cargo gamma list mutants --json-report reports/current.json

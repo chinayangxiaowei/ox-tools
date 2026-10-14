@@ -32,6 +32,7 @@ pub(crate) struct RecordPreparation {
     pub(crate) inputs: WorkspaceSnapshot,
     pub(crate) killers: crate::discover::Killers,
     /// Whether `--re` narrowed the population, so publication must retain unselected evidence.
+    ///
     /// Absent from state written before name filtering existed, which was never filtered.
     #[serde(default)]
     pub(crate) name_filtered: bool,

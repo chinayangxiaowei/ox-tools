@@ -715,19 +715,23 @@ fn regex_selects_one_function_in_a_real_session() {
     assert_eq!(code, EXIT_OK, "{output}");
     let report = fs::read_to_string(dir.path().join("target/cargo-gamma/gamma-report.json"))
         .unwrap_or_else(|error| panic!("could not read the regex fixture's report: {error}"));
-    let document: serde_json::Value =
+    let report: serde_json::Value =
         serde_json::from_str(&report).unwrap_or_else(|error| panic!("the regex fixture's report is invalid JSON: {error}"));
-    let files = document["files"].as_object().expect("a completed report has a files object");
+    let files = report["files"].as_object().expect("a completed report has a files object");
     let mutants = files["src/lib.rs"]["mutants"]
         .as_array()
         .expect("the selected accepts function has mutants");
 
     assert_eq!(files.len(), 1, "the regex included another file: {files:?}");
+    // These are the relational replacements of the selected function's sole `>=` site.
     assert_eq!(
         mutants.len(),
         2,
         "the regex included another function or omitted a variant: {mutants:?}"
     );
+    for mutant in mutants {
+        assert_eq!(mutant["location"]["start"]["line"], 1, "the mutant must belong to accepts");
+    }
     assert!(
         mutants.iter().all(|mutant| mutant["status"] == "Killed"),
         "the library tests did not judge both selected mutants: {mutants:?}"

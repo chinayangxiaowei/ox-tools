@@ -112,8 +112,11 @@ Otherwise staging would discard that mutant's verdict permanently.
 Staged merges retain this per-file source property in merge provenance, so a second merge cannot
 mistake a filtered source for a complete presentation. They also retain each mutant's latest
 source sighting separately from its verdict and the rendered file source. A complete population
-can withdraw that mutant only when it is at least as recent as the sighting; merging in stages
-therefore makes the same withdrawal decision as merging the original reports directly.
+can withdraw that mutant only when it is at least as recent as the sighting. Merged outputs carry
+sightings, but not the withdrawal authority of the complete populations they absorbed: merged
+inputs never act as complete populations. Staged and direct merges make the same withdrawal
+decision only when the complete populations remain among the final merge inputs. Otherwise, a
+later filtered input can be refused or kept rather than withdrawn.
 The merged report timestamp includes the latest sighting even if it contributed only a pending
 listing, preserving its generation when a later merge chooses report metadata.
 The completed campaign record also treats a name-filtered run as partial: for unchanged files it

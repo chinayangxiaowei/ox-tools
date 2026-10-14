@@ -2052,6 +2052,7 @@ mod tests {
     #[test]
     fn an_empty_name_filter_is_named_in_the_unevaluated_gate_hint() {
         let args = RunArgs {
+            // Any valid threshold enables the gate; its value is illustrative.
             min_score: Some(80.0),
             ..RunArgs::default()
         };

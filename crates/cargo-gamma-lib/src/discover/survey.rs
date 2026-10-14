@@ -775,7 +775,12 @@ fn matches_displayed_name(patterns: &RegexSet, name: &str) -> bool {
 }
 
 fn retain_name_matches(mutants: &mut Vec<Mutant>, patterns: &RegexSet) {
-    mutants.retain(|mutant| matches_displayed_name(patterns, &mutant.selection_name()));
+    let mut name = String::new();
+    mutants.retain(|mutant| {
+        name.clear();
+        mutant.write_selection_name(&mut name);
+        matches_displayed_name(patterns, &name)
+    });
 }
 
 fn suppressed_count(mutants: &[Mutant]) -> usize {

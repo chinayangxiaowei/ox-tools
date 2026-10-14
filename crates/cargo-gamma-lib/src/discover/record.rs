@@ -2046,6 +2046,7 @@ impl RunRecord {
         }
     }
 
+    /// Retains exact killer hints outside the latest selected population and replaces selected hints.
     fn absorbed_hints(&self, earlier: &Self, retain_unselected: bool) -> HashMap<MutantId, Killer> {
         let mut hints = if !self.replace_knowledge && self.hints.is_empty() {
             earlier.hints.clone()
@@ -3831,6 +3832,7 @@ mod tests {
         assert!(!settled.contains_key("survived"));
     }
 
+    /// Builds a controlled single-file campaign with matching context and complete source inputs.
     fn memory_record(source: &str, mutants: &[Mutant]) -> RunRecord {
         let digest = digest(source.as_bytes());
         let size = u64::try_from(source.len()).expect("the short source fixture fits u64");

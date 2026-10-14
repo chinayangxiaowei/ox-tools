@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use core::ops::Range;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use camino::Utf8Path;
@@ -192,10 +193,19 @@ impl Mutant {
     }
 
     /// The complete line used by `list mutants` and `--re`, before control encoding.
+    ///
     /// Suppressed mutants include the visible suppression marker.
     #[must_use]
     pub(crate) fn selection_name(&self) -> String {
-        let name = format!(
+        let mut name = String::new();
+        self.write_selection_name(&mut name);
+        name
+    }
+
+    /// Writes the plain listing name into caller-owned storage.
+    pub(crate) fn write_selection_name(&self, name: &mut String) {
+        write!(
+            name,
             "{}:{}:{}: {}: {} [{}]",
             self.file,
             self.line,
@@ -203,11 +213,11 @@ impl Mutant {
             self.item_path,
             self.summary(),
             self.mutator
-        );
+        )
+        .expect("writing formatted text into a String cannot fail");
 
-        match self.suppression.as_ref().filter(|_| self.outcome == Outcome::Ignored) {
-            Some(suppression) => format!("{name} [suppressed: {}]", suppression.channel.as_str()),
-            None => name,
+        if let Some(suppression) = self.suppression.as_ref().filter(|_| self.outcome == Outcome::Ignored) {
+            write!(name, " [suppressed: {}]", suppression.channel.as_str()).expect("writing formatted text into a String cannot fail");
         }
     }
 

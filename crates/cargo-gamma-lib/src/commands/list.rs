@@ -26,49 +26,6 @@ pub(super) fn list<H: Host>(host: &mut H, args: &ListArgs, styler: Styler) -> cr
     list_with_cargo(host, args, &select, styler, &cargo)
 }
 
-#[cfg(test)]
-mod name_filter_tests {
-    use super::selected_files;
-    use crate::discover::{Plan, TargetFile};
-
-    #[test]
-    fn listed_name_and_selected_files_follow_the_filtered_population() {
-        let mutant = crate::model::Mutant {
-            item_path: "less".to_owned().into(),
-            ..crate::fixtures::mutant()
-        };
-        let name = mutant.selection_name();
-        assert!(name.contains(": less: "), "{name}");
-
-        let files = ["src/lib.rs", "src/other.rs"].map(|path| TargetFile {
-            path: path.into(),
-            absolute: format!("/fixture/{path}").into(),
-            package: "subject".to_owned(),
-            source: None,
-        });
-        let mut plan = Plan {
-            root: "/fixture".into(),
-            files: files.into(),
-            mutants: vec![mutant],
-            suppressed: 0,
-            idle: Vec::new(),
-            sharded_out: 0,
-            settled_out: 0,
-            digests: crate::HashMap::default(),
-            skipped: Vec::new(),
-            reach: crate::HashMap::default(),
-            specs: crate::HashMap::default(),
-        };
-
-        let selected: Vec<_> = selected_files(&plan, true).iter().map(|file| file.path.as_str()).collect();
-        assert_eq!(selected, ["src/lib.rs"]);
-        assert_eq!(selected_files(&plan, false).len(), 2);
-
-        plan.mutants.clear();
-        assert!(selected_files(&plan, true).is_empty());
-    }
-}
-
 /// Implements `list` with the configuration generation dispatch already resolved.
 fn list_with_cargo<H: Host>(
     host: &mut H,
@@ -220,7 +177,7 @@ fn list_files<H: Host>(
     let mut stream = host.results();
 
     if json {
-        let paths: Vec<&Utf8PathBuf> = files.iter().map(|file| &file.path).collect();
+        let paths: Vec<&Utf8PathBuf> = files.map(|file| &file.path).collect();
 
         write_pretty_json(&mut stream, &paths, "the file list")?;
 
@@ -235,7 +192,7 @@ fn list_files<H: Host>(
 }
 
 /// Projects a file listing from the selected mutant population.
-fn selected_files(plan: &crate::discover::Plan, name_filtered: bool) -> Vec<&crate::discover::TargetFile> {
+fn selected_files(plan: &crate::discover::Plan, name_filtered: bool) -> impl Iterator<Item = &crate::discover::TargetFile> {
     // A name filter selects mutants, so a file listing under that filter names only files that
     // actually contain one of the selected mutants.
     let selected_paths = name_filtered.then(|| {
@@ -247,8 +204,7 @@ fn selected_files(plan: &crate::discover::Plan, name_filtered: bool) -> Vec<&cra
 
     plan.files
         .iter()
-        .filter(|file| selected_paths.as_ref().is_none_or(|paths| paths.contains(file.path.as_path())))
-        .collect()
+        .filter(move |file| selected_paths.as_ref().is_none_or(|paths| paths.contains(file.path.as_path())))
 }
 
 /// Lists the mutants that would be generated.
@@ -721,5 +677,49 @@ mod tests {
 
         assert_eq!(code, EXIT_OK);
         assert_eq!((shard.index, shard.count), (2, 4));
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod name_filter_tests {
+    use super::selected_files;
+    use crate::discover::{Plan, TargetFile};
+
+    #[test]
+    fn listed_name_and_selected_files_follow_the_filtered_population() {
+        let mutant = crate::model::Mutant {
+            item_path: "less".to_owned().into(),
+            ..crate::fixtures::mutant()
+        };
+        let name = mutant.selection_name();
+        assert!(name.contains(": less: "), "{name}");
+
+        let files = ["src/lib.rs", "src/other.rs"].map(|path| TargetFile {
+            path: path.into(),
+            absolute: format!("/fixture/{path}").into(),
+            package: "subject".to_owned(),
+            source: None,
+        });
+        let mut plan = Plan {
+            root: "/fixture".into(),
+            files: files.into(),
+            mutants: vec![mutant],
+            suppressed: 0,
+            idle: Vec::new(),
+            sharded_out: 0,
+            settled_out: 0,
+            digests: crate::HashMap::default(),
+            skipped: Vec::new(),
+            reach: crate::HashMap::default(),
+            specs: crate::HashMap::default(),
+        };
+
+        let selected: Vec<_> = selected_files(&plan, true).map(|file| file.path.as_str()).collect();
+        assert_eq!(selected, ["src/lib.rs"]);
+        assert_eq!(selected_files(&plan, false).count(), 2);
+
+        plan.mutants.clear();
+        assert!(selected_files(&plan, true).next().is_none());
     }
 }
