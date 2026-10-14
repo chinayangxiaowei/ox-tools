@@ -215,6 +215,10 @@ pub struct VerdictProvenance {
     /// from their retained mutant result so they remain readable.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lineage: String,
+
+    /// Whether the verdict source was name-filtered; older merged reports omit it and were unfiltered.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub name_filtered: bool,
 }
 
 /// Identifies one shard of a rotation.

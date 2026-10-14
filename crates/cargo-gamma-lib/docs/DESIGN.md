@@ -110,8 +110,9 @@ If a filtered source introduces a mutant absent from that selected presentation,
 error and produces no staged document until a complete listing for the current source is included.
 Otherwise staging would discard that mutant's verdict permanently.
 Staged merges retain this per-file source property in merge provenance, so a second merge cannot
-mistake a filtered source for a complete presentation. They also retain each mutant's latest
-source sighting separately from its verdict and the rendered file source. A complete population
+mistake a filtered source for a complete presentation, and retain whether each verdict came from a
+name-filtered source. They also retain each mutant's latest source sighting separately from its
+verdict and the rendered file source. A complete population
 can withdraw that mutant only when it is at least as recent as the sighting. Merged outputs carry
 sightings, but not the withdrawal authority of the complete populations they absorbed: merged
 inputs never act as complete populations. Staged and direct merges make the same withdrawal

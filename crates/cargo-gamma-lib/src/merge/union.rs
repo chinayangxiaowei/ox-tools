@@ -113,7 +113,8 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
                     Entry::Occupied(_slot) => {}
                 }
 
-                let (tested_at, origin, lineage) = verdict_provenance(input_name, report, mutant, &mut lineages);
+                let (tested_at, origin, lineage, name_filtered) =
+                    verdict_provenance(input_name, report, mutant, source_name_filtered(report, path), &mut lineages);
                 let compatible = file.source == source.file.source && file.language == source.file.language;
                 retain(
                     &mut latest,
@@ -124,7 +125,7 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
                         origin,
                         lineage,
                         compatible,
-                        name_filtered: source_name_filtered(report, path),
+                        name_filtered,
                         source_rank: (source.started_at, source.origin, source.lineage.clone()),
                     },
                 );
@@ -530,8 +531,9 @@ fn verdict_provenance<'report>(
     name: &'report str,
     report: &'report Report,
     mutant: &MutantResult,
+    name_filtered: bool,
     lineages: &mut Lineages<'report>,
-) -> (u64, &'report str, String) {
+) -> (u64, &'report str, String, bool) {
     let provenance = report
         .config
         .as_ref()
@@ -545,9 +547,9 @@ fn verdict_provenance<'report>(
             provenance.lineage.clone()
         };
 
-        (provenance.started_at, provenance.origin.as_str(), lineage)
+        (provenance.started_at, provenance.origin.as_str(), lineage, provenance.name_filtered)
     } else {
-        (started_at(report), name, lineages.verdict(name, mutant))
+        (started_at(report), name, lineages.verdict(name, mutant), name_filtered)
     }
 }
 
@@ -753,6 +755,7 @@ fn rebuild(
                             started_at: verdict.tested_at,
                             origin: verdict.origin.to_owned(),
                             lineage: verdict.lineage.clone(),
+                            name_filtered: verdict.name_filtered,
                         },
                     );
                     if let Some(sighting) = sightings.get(mutant.id.as_str()) {
@@ -1525,6 +1528,7 @@ mod tests {
                     started_at: verdict_at,
                     origin: "verdict".to_owned(),
                     lineage: String::new(),
+                    name_filtered: false,
                 },
             );
             let _ = provenance.sightings.insert(
@@ -1822,6 +1826,53 @@ mod tests {
             (incomplete.unpresentable_filtered, incomplete.report.is_none()),
             (1, true),
             "an unpresentable filtered verdict must prevent staging even after an unfiltered sighting",
+        );
+    }
+
+    #[test]
+    fn staged_filtered_verdict_requires_presentation_after_a_complete_sighting() {
+        let source_b = "fn aaa() {}\nfn bbb() {}\n// B\n";
+        let source_c = "fn aaa() {}\nfn bbb() {}\n// C\n";
+        let mut filtered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        let listing = report_with_source(None, 200, source_b, vec![mutant("aaa", 1, "Pending")]);
+        let run = report_with_source(Some((1, 2)), 300, source_c, vec![mutant("bbb", 2, "Survived")]);
+        let complete = report_with_source(None, 400, source_c, vec![mutant("aaa", 1, "Pending"), mutant("bbb", 2, "Pending")]);
+        let originals = vec![("filtered".to_owned(), filtered), ("listing".to_owned(), listing)];
+        let first = merge(&originals, 400, None);
+        assert_eq!((first.incompatible, first.unpresentable_filtered), (0, 0));
+        let staged = first.report.expect("the complete B listing presents the filtered verdict");
+        assert_eq!(staged.files["src/lib.rs"].mutants[0].status, "Killed");
+        let staged = serde_json::to_value(staged).expect("the staged report serializes");
+        assert_eq!(
+            staged["config"]["mergeProvenance"]["sources"]["src/lib.rs"]["nameFiltered"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            staged["config"]["mergeProvenance"]["sightings"]["aaa"]["nameFiltered"],
+            serde_json::Value::Null
+        );
+        assert_eq!(staged["config"]["mergeProvenance"]["verdicts"]["aaa"]["nameFiltered"], true);
+        let staged = serde_json::from_value(staged).expect("the staged report deserializes");
+        let second = merge(&[("staged".to_owned(), staged), ("run".to_owned(), run.clone())], 400, None);
+        let mut originals = originals;
+        originals.push(("run".to_owned(), run));
+        originals.push(("complete".to_owned(), complete));
+        let direct = merge(&originals, 400, None);
+        let file = &direct
+            .report
+            .as_ref()
+            .expect("the complete C listing presents the retained verdict")
+            .files["src/lib.rs"];
+        assert_eq!((direct.incompatible, direct.unpresentable_filtered), (0, 0));
+        assert_eq!(file.mutants[0].id, "aaa");
+        assert_eq!(file.mutants[0].status, "Killed");
+        assert_eq!(second.incompatible, 1);
+        assert_eq!(
+            (second.unpresentable_filtered, second.report.is_none()),
+            (1, true),
+            "a staged filtered verdict must prevent staging without a compatible presentation; emitted report: {:?}",
+            second.report,
         );
     }
 
