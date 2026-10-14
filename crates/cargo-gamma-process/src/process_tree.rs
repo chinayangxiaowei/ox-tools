@@ -366,7 +366,7 @@ impl PreparedCommand {
 /// containment prepared for that exact launch, so safe code cannot reuse the preparation or pair
 /// the child with another boundary. [`ProcessTree::adopt`] consumes the bundle; dropping it before
 /// adoption terminates the contained subtree and reaps its leader. Do not independently reap the
-/// child's numeric PID concurrently with adoption or drop.
+/// child's numeric PID while this value owns the child.
 #[must_use = "a spawned child must be adopted so its process tree remains contained"]
 #[derive(Debug)]
 pub struct SpawnedCommand {
@@ -795,8 +795,8 @@ fn interrupted() -> PlatformError {
 ///
 /// Created from an already-spawned child, and used once when the run decides the mutant has hung.
 /// This handle owns the child's wait right. Callers must not independently reap its numeric PID
-/// concurrently with observation or termination: that could free the group ID between observation
-/// and cleanup. A completed external reap is detected by the next observation.
+/// concurrently with observation or termination. A completed external reap is detected by the next
+/// observation.
 #[derive(Debug)]
 pub struct ProcessTree {
     /// The leader retained until this subtree is observed or terminated.
@@ -4171,6 +4171,9 @@ mod tests {
         drop(armed);
     }
 
+    /// The childless fixture stands for the state after the leader is reaped. The scripted callbacks
+    /// drive the production failed-cleanup transition, and the repeated `terminate` call checks that
+    /// unproven cleanup is not later reported as success.
     #[cfg(target_os = "macos")]
     #[test]
     fn termination_marks_a_failed_sweep_as_unproven_after_reaping() {

@@ -1721,6 +1721,7 @@ use std::{env, process};
 use cargo_gamma_lib::run;
 use real_host::RealHost;
 
+// `rallocator` supports only Linux and Windows hosts; others use the system allocator.
 #[cfg(all(not(miri), any(target_os = "linux", windows)))]
 rallocator::rallocator!();
 

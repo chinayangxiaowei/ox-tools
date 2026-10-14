@@ -144,6 +144,7 @@ fn observing_an_exit_keeps_its_group_reserved_until_the_explicit_reap() {
         poll_until(|| exited(child.id()).expect("the child can be observed")),
         "the killed child never became observable"
     );
+    // Darwin's `getpgid` cannot query an unreaped zombie, although the group still lists it.
     #[cfg(not(target_os = "macos"))]
     assert_eq!(
         group_of(pid),
