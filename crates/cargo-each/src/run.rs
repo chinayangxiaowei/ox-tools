@@ -59,7 +59,7 @@ pub(crate) fn run(args: &EachArgs) -> Result<ExitCode, AppError> {
 
     // The `{packages}` pass-through only applies when the resolved set is the
     // untouched whole workspace: no per-package narrowing and no filters.
-    let packages = if selection.is_whole_workspace() && args.filters.is_empty() && args.exclude_filters.is_empty() {
+    let packages = if selection.is_whole_workspace() && args.filters.is_empty() {
         PackagesExpansion::Workspace
     } else {
         PackagesExpansion::Explicit
@@ -115,6 +115,13 @@ pub(crate) fn run(args: &EachArgs) -> Result<ExitCode, AppError> {
 }
 
 fn run_json(args: &EachArgs) -> Result<ExitCode, AppError> {
+    run_json_with(args, execute)
+}
+
+fn run_json_with(
+    args: &EachArgs,
+    execute_plan: impl FnOnce(&Plan, bool, NonZeroUsize, Option<Duration>) -> Result<ExitCode, AppError>,
+) -> Result<ExitCode, AppError> {
     validate_json_mode(args)?;
     let records = json_lines::load(&args.json_lines, &args.json_lines_files).into_app_err("failed to read JSON Lines input")?;
     let plan = Plan::build_json(&records, &args.command).into_app_err(PLAN_BUILD_CONTEXT)?;
@@ -129,7 +136,7 @@ fn run_json(args: &EachArgs) -> Result<ExitCode, AppError> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    execute(&plan, args.keep_going, args.jobs, args.timeout)
+    execute_plan(&plan, args.keep_going, args.jobs, args.timeout)
 }
 
 fn validate_json_mode(args: &EachArgs) -> Result<(), AppError> {
@@ -140,7 +147,6 @@ fn validate_json_mode(args: &EachArgs) -> Result<(), AppError> {
         (!args.exclude.is_empty(), "--exclude"),
         (args.none, "--none"),
         (!args.filters.is_empty(), "--filter"),
-        (!args.exclude_filters.is_empty(), "--exclude-filter"),
         (args.once, "--once"),
         (!args.each_targets.is_empty(), "--each-target"),
         (!args.target_required_feature.is_empty(), "--target-required-feature"),
@@ -158,13 +164,11 @@ fn build_selection(args: &EachArgs) -> Result<Selection, crate::error::EachError
     Selection::from_sources(&args.packages, &args.package_files, args.workspace, &args.exclude, args.none)
 }
 
-/// Narrow `members` by package keep and drop expressions. Repeated `--filter`
-/// expressions are AND-combined; repeated `--exclude-filter` expressions are
-/// OR-combined, and exclusion wins.
+/// Narrow `members` by package filter expressions. Repeated expressions are
+/// AND-combined; exclusion is expressed with the Boolean `not` operator.
 fn apply_filters(members: &mut Vec<&Member>, args: &EachArgs) -> Result<(), AppError> {
-    let keep = parse_predicates(&args.filters)?;
-    let drop = parse_predicates(&args.exclude_filters)?;
-    members.retain(|m| keep.iter().all(|p| p.matches(m)) && !drop.iter().any(|p| p.matches(m)));
+    let filters = parse_predicates(&args.filters)?;
+    members.retain(|member| filters.iter().all(|filter| filter.matches(member)));
     Ok(())
 }
 
@@ -220,6 +224,7 @@ fn execute_sequential_with(
 ) -> ExitCode {
     let mut any_failed = false;
     for invocation in &plan.invocations {
+        // #[gamma::skip(call_result.default, reason = "emit_label returns unit; label emission still executes and () is replaced with ()")]
         emit_label(invocation);
         let result = run_invocation(invocation, timeout);
         match result {
@@ -293,6 +298,7 @@ fn execute_parallel_with(
         outcomes.sort_by_key(|outcome| outcome.index);
         for indexed in &mut outcomes {
             emit(&plan.invocations[indexed.index], &mut indexed.outcome).into_app_err("failed to emit buffered command output")?;
+            // #[gamma::skip(call_result.default, reason = "record_emitted_failure returns unit; scheduler updates still execute and () is replaced with ()")]
             record_emitted_failure(
                 &indexed.outcome.result,
                 keep_going,
@@ -370,7 +376,9 @@ fn spawn_worker_with(
 
     let (sender, receiver) = mpsc::channel();
     let job = Box::new(move || {
-        complete_worker(&sender, move || run_captured(&invocation, timeout));
+        let work = move || run_captured(&invocation, timeout);
+        // #[gamma::skip(call_result.default, reason = "complete_worker returns unit; work and channel delivery still execute and () is replaced with ()")]
+        complete_worker(&sender, work);
     });
     let thread = spawn(format!("cargo-each-worker-{index}"), job)?;
     Ok(RunningWorker { index, receiver, thread })
@@ -407,6 +415,7 @@ fn wait_for_worker_with(workers: &mut Vec<RunningWorker>, mut sleep: impl FnMut(
                 Err(mpsc::TryRecvError::Empty) => None,
             });
         let Some((position, reported)) = ready else {
+            // #[gamma::skip(stmt.delete_call, tag = "timeout", reason = "removing the worker-ready polling sleep prevents the injected sleeper from delivering an outcome and makes the waiting test spin forever; campaign log 3548")]
             sleep(WORKER_READY_POLL_INTERVAL);
             continue;
         };
@@ -550,6 +559,7 @@ fn combine_captured_output(stdout: CapturedStream, stderr: CapturedStream, resul
         .collect::<Vec<_>>()
         .join("; ");
     let mut result = result;
+    // #[gamma::skip(call_result.default, reason = "add_infrastructure_failure returns unit; result updates still execute and () is replaced with ()")]
     add_infrastructure_failure(&mut result, failure);
     BufferedOutcome {
         stdout: stdout.output,
@@ -739,8 +749,11 @@ fn emit_buffered_to(
         }
         Err(OutputEmitError::Destination(error)) => return Err(error),
     }
+    // #[gamma::skip(cond.always_true, reason = "when the list is empty join produces an empty string, and add_infrastructure_failure explicitly returns without changing the result for an empty string")]
     if !source_failures.is_empty() {
-        add_infrastructure_failure(&mut outcome.result, source_failures.join("; "));
+        let failure = source_failures.join("; ");
+        // #[gamma::skip(call_result.default, reason = "add_infrastructure_failure returns unit; result updates still execute and () is replaced with ()")]
+        add_infrastructure_failure(&mut outcome.result, failure);
     }
     match &outcome.result {
         InvocationResult::TimedOut(duration) => {
@@ -932,6 +945,7 @@ fn display_arg(argument: &str) -> String {
         return argument.to_owned();
     }
 
+    // #[gamma::skip(arith.add_to_mul, literal.int_decrement, literal.int_increment, literal.int_to_zero, reason = "these nonnegative estimates change capacity only; the quoting loop appends identical bytes")]
     let mut rendered = String::with_capacity(argument.len() + 2);
     rendered.push('"');
     for character in argument.chars() {
@@ -985,14 +999,93 @@ mod tests {
         Invocation, InvocationResult, OutputEmitError, PLAN_BUILD_CONTEXT, PROCESS_POLL_INTERVAL, Plan, RunningWorker,
         SELECTION_READ_CONTEXT, SNAPSHOT_EOF_MESSAGE, STDERR_STREAM, STDOUT_STREAM, SnapshotSource, TemporarySnapshot, TreeOutcome,
         WORKER_PANIC_TEST_PROGRAM, WORKER_READY_POLL_INTERVAL, WORKER_SPAWN_ERROR_TEST_PROGRAM, WORKSPACE_RUST_VERSION_CONTEXT,
-        add_infrastructure_failure, apply_filters, combine_captured_output, create_output_capture_with, display_duration,
-        display_invocation, effective_worker_count, emit_buffered_to, emit_label_to, execute_parallel, execute_parallel_with, exit_byte,
+        add_infrastructure_failure, combine_captured_output, create_output_capture_with, display_duration, display_invocation,
+        effective_worker_count, emit_buffered_to, emit_label_to, execute_parallel, execute_parallel_with, exit_byte,
         failure_stops_launching, finish_capture, panic_description, parallel_failure_exit_code, parse_predicates, parse_target_kinds,
-        record_emitted_failure, run_captured, run_captured_with, run_streamed, run_streamed_with_timeout, run_streamed_with_timeout_with,
-        shell_join, spawn_group, spawn_worker, spawn_worker_with, terminate_child, terminate_group, wait_for_process,
-        wait_for_process_with, wait_for_worker, wait_for_worker_with, with_cleanup_failure,
+        record_emitted_failure, run, run_captured, run_captured_with, run_streamed, run_streamed_with_timeout,
+        run_streamed_with_timeout_with, shell_join, spawn_group, spawn_worker, spawn_worker_with, terminate_child, terminate_group,
+        validate_json_mode, wait_for_process, wait_for_process_with, wait_for_worker, wait_for_worker_with, with_cleanup_failure,
     };
     use crate::cli::CargoCli;
+
+    #[test]
+    fn json_mode_names_each_conflicting_option_and_preserves_precedence() {
+        let options = [
+            "--package",
+            "--package-file",
+            "--workspace",
+            "--exclude",
+            "--none",
+            "--filter",
+            "--once",
+            "--each-target",
+            "--target-required-feature",
+            "--chdir",
+            "--manifest-path",
+        ];
+        for option in options {
+            let CargoCli::Each(mut args) =
+                CargoCli::try_parse_from(["cargo", "each", "--json-lines", "{}", "--", "echo"]).expect("baseline arguments are valid");
+            match option {
+                "--package" => args.packages.push("fixture".to_owned()),
+                "--package-file" => args.package_files.push("packages.txt".into()),
+                "--workspace" => args.workspace = true,
+                "--exclude" => args.exclude.push("fixture".to_owned()),
+                "--none" => args.none = true,
+                "--filter" => args.filters.push("publishable".to_owned()),
+                "--once" => args.once = true,
+                "--each-target" => args.each_targets.push("bin".to_owned()),
+                "--target-required-feature" => args.target_required_feature.push("feature".to_owned()),
+                "--chdir" => args.chdir = true,
+                "--manifest-path" => args.manifest_path = Some("Cargo.toml".into()),
+                _ => unreachable!("options lists only the JSON-mode conflicts"),
+            }
+            let error = validate_json_mode(&args).expect_err("Cargo options conflict with JSON mode");
+            assert!(error.to_string().contains(&format!("with `{option}`")), "{error}");
+            args.packages.push("highest-priority".to_owned());
+            args.manifest_path = Some("Cargo.toml".into());
+            let error = validate_json_mode(&args).expect_err("conflict priority is deterministic");
+            assert!(error.to_string().contains("with `--package`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_execution_preserves_keep_going_jobs_timeout_and_executor_result() {
+        for keep_going in [false, true] {
+            let CargoCli::Each(mut args) = CargoCli::try_parse_from(["cargo", "each", "--json-lines", "{}\n{}", "--", "echo"])
+                .expect("JSON execution arguments are valid");
+            args.keep_going = keep_going;
+            args.jobs = NonZeroUsize::new(2).expect("two workers is nonzero");
+            args.timeout = Some(Duration::from_secs(3));
+            let result = super::run_json_with(&args, |plan, forwarded, jobs, timeout| {
+                assert_eq!(plan.invocations.len(), 2);
+                assert_eq!(forwarded, keep_going);
+                assert_eq!(jobs, args.jobs);
+                assert_eq!(timeout, args.timeout);
+                Ok(ExitCode::FAILURE)
+            })
+            .expect("the executor result is returned");
+            assert_eq!(result, ExitCode::FAILURE);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "uses filesystem paths to exercise JSON input errors")]
+    fn file_only_json_mode_returns_input_context_before_loading_cargo() {
+        let directory = tempfile::tempdir().expect("test workspace can be created");
+        let path = directory.path().join("missing.jsonl");
+        let CargoCli::Each(args) = CargoCli::try_parse_from([
+            std::ffi::OsString::from("cargo"),
+            std::ffi::OsString::from("each"),
+            std::ffi::OsString::from("--json-lines-file"),
+            path.into_os_string(),
+            std::ffi::OsString::from("--"),
+            std::ffi::OsString::from("echo"),
+        ])
+        .expect("file-only JSON arguments are valid");
+        let error = run(&args).expect_err("a missing JSON file is a usage error, not a Cargo invocation");
+        assert!(error.to_string().contains("failed to read JSON Lines input"), "{error}");
+    }
 
     fn invocation(argv: &[&str]) -> Invocation {
         Invocation {
@@ -2253,17 +2346,6 @@ mod tests {
             rendered.contains("invalid filter expression `feature:`: empty feature name"),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn invalid_exclude_filter_propagates_through_filter_application() {
-        let CargoCli::Each(args) = CargoCli::try_parse_from(["cargo", "each", "--exclude-filter", "feature:", "--", "echo"])
-            .expect("the parser leaves expression validation to execution");
-        let mut members = Vec::new();
-
-        let error = apply_filters(&mut members, &args).expect_err("invalid exclusion expression");
-
-        assert!(error.to_string().contains("empty feature name"), "{error}");
     }
 
     #[test]

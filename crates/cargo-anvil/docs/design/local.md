@@ -365,7 +365,9 @@ libclang satisfies clang-sys.
 
 On a missing dep the recipe prints per-OS install hints (apt-get / tdnf / brew /
 scoop / winget) and exits non-zero. **No auto-install** -- admin/sudo decisions and
-package-manager choice stay with the user. The cargo-spellcheck install recipe passes
+package-manager choice stay with the local or self-hosted user. GitHub-hosted Linux
+spellcheck jobs install `libclang-dev` eagerly in the generated setup action, where
+the runner's package-manager contract is known. The cargo-spellcheck install recipe passes
 `anvil-tool-cargo-spellcheck-source-deps-check` to `_install-tool` as its source prerequisite.
 The prerequisite runs for an explicit source-build `install` backend and when `binstall`
 cannot provide a binary. Anvil disables binstall's own compile strategy and performs the
@@ -657,6 +659,15 @@ The two-key cache means the expensive baseline snapshot is only retaken when the
 moves, and the working-tree snapshot only when the tree changes; an unchanged repo yields
 a full cache hit (`anvil-impact: impact set up to date`). To force a recompute, delete
 `target/anvil/impact/`.
+
+Each baseline worktree uses a fresh unique scratch path, so abandoned directories
+cannot collide with reused process IDs. Creation failures include Git's diagnostic
+output; cleanup removes only the worktree created by that invocation, including
+its registration and any partial directory left by a failed checkout. Cleanup
+failures are accumulated and reported after all cleanup steps have been attempted,
+rather than silently abandoning scratch state. If baseline creation or snapshotting
+also failed, its original error is preserved and cleanup diagnostics are added as
+warnings. A cleanup-only failure still fails the recipe.
 
 ### 4.4 Uncommitted changes widen to the full workspace
 
