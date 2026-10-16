@@ -118,7 +118,7 @@ type SubsetOracle = fn(&HashSet<u32>) -> Option<bool>;
 /// then refused, and those two together say whether the hints are worth their round: `offered`
 /// close to `confirmed` is a hint set that is paying, and `confirmed` near zero is one that is
 /// costing a build per stage and buying nothing.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OrderingHints {
     /// How many hinted mutants were put in front of the compiler in a probe round.
     pub offered: usize,
@@ -150,7 +150,7 @@ const PROBE_FLOOR: usize = 4;
 /// first round is what compiling this workspace costs at all, which no amount of mutant selection
 /// will avoid; every round after it exists only because some mutant did not compile, and its time
 /// is the price of that mutant. A total conflates the two and so points at the wrong remedy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Round {
     /// How long the round's cargo invocation took.
     pub elapsed: Duration,
@@ -163,7 +163,7 @@ pub struct Round {
 }
 
 /// Mutants withdrawn from one package during one build round.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PackageWithdrawal {
     pub package: Arc<str>,
     pub mutants: usize,
@@ -199,7 +199,7 @@ fn build_round(elapsed: Duration, plan: &Plan, ordinals: impl IntoIterator<Item 
 /// the instrumented tree contained; a mutator on its own says which mutator is expensive; together
 /// they say *which mutator emits which mistake*, which is the form a heuristic can be written
 /// against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Withdrawal {
     /// The package whose mutants were withdrawn.
     pub package: String,
@@ -400,6 +400,9 @@ pub(super) struct Converger {
     /// Cargo's successful preflight artifact stream, used only to narrow later test-target builds.
     target_discovery: Option<String>,
 
+    /// Packages with a library target in Cargo's resolved workspace metadata.
+    library_packages: Option<HashSet<String>>,
+
     /// Whether the verdict oracle is restricted to library unit-test harnesses.
     test_lib: bool,
 
@@ -492,6 +495,10 @@ impl Converger {
         self.target_discovery = Some(discovery);
     }
 
+    pub(super) fn library_packages(&mut self, packages: HashSet<String>) {
+        self.library_packages = Some(packages);
+    }
+
     /// Invalidates position-based splice indexes after the plan is sorted.
     // #[gamma::skip(all, reason = "this orchestration side effect crosses a process, event, cache, or synchronization boundary that cannot be isolated safely in a deterministic unit test")]
     pub(super) fn plan_reordered(&mut self) {
@@ -512,6 +519,7 @@ impl Converger {
     /// those additional packages still have to be restored to pristine source: filtering their
     /// diagnostics after compilation is too late, because they may already have broken or masked
     /// the build.
+    // #[gamma::skip(fn_value.empty_collection, tag = "timeout", reason = "dropping withdrawn mutants repeatedly rebuilds contexts that cannot be isolated in the campaign")]
     fn scoped_withdrawn(&self, plan: &Plan, packages: Option<&[String]>) -> HashSet<u32> {
         let mut withdrawn = self.withdrawn.clone();
         let Some(packages) = packages else {
@@ -679,12 +687,20 @@ impl Converger {
                     }
                     interactions.retain(|(excluded, _members)| !blamed.contains_key(excluded));
                     for (ordinals, _context) in &mut unresolved {
+                        // #[gamma::skip(unary.remove_not, tag = "timeout", reason = "retaining blamed ordinals prevents isolation from removing resolved work")]
                         ordinals.retain(|ordinal| !blamed.contains_key(ordinal));
                     }
+                    // #[gamma::skip(unary.remove_not, tag = "timeout", reason = "retaining empty unresolved contexts prevents build recovery from making progress")]
                     unresolved.retain(|(ordinals, _context)| !ordinals.is_empty());
                 }
 
-                if !interactions.is_empty() || !unresolved.is_empty() {
+                if
+                // #[gamma::skip(cond.always_false, cond.negate, logical.or_remove_right, logical.or_to_and, tag = "timeout", reason = "skipping withdrawal of pending isolation contexts repeatedly compiles the same failing population")]
+                !interactions.is_empty()
+                        ||
+                        // #[gamma::skip(unary.remove_not, tag = "timeout", reason = "ignoring unresolved contexts repeatedly compiles the same failing population")]
+                        !unresolved.is_empty()
+                {
                     let mut withdrawn = blamed.keys().copied().collect::<Vec<_>>();
                     withdrawn.extend(interactions.iter().map(|(excluded, _members)| *excluded));
                     withdrawn.extend(unresolved.iter().flat_map(|(ordinals, _context)| ordinals.iter().copied()));
@@ -1263,6 +1279,20 @@ impl Converger {
             );
         }
 
+        // Cargo rejects `--lib` only when every selected package lacks a library target. A mixed
+        // selection accepts the normal `--lib --bins --tests` selectors without changing manifests.
+        let only_binaries = self.library_packages.as_ref().is_some_and(|libraries| {
+            select.map_or_else(
+                || !plan.specs.is_empty() && plan.specs.keys().all(|package| !libraries.contains(package)),
+                |packages| !packages.is_empty() && packages.iter().all(|package| !libraries.contains(package)),
+            )
+        });
+        let verb: &[&str] = if only_binaries {
+            &["check", "--keep-going", "--bins", "--tests"]
+        } else {
+            &["check", "--keep-going", "--lib", "--bins", "--tests"]
+        };
+
         self.converge_scoped(
             work,
             plan,
@@ -1271,7 +1301,7 @@ impl Converger {
                 mutants: None,
                 publish_progress,
             },
-            &["check", "--keep-going", "--lib", "--bins", "--tests"],
+            verb,
             limits,
             events,
         )

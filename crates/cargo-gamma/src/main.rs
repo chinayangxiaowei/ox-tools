@@ -292,7 +292,16 @@
 //! cargo gamma run --exclude-test conformance # keep a test target out of the oracle
 //! cargo gamma run --test-workspace           # let every package's tests judge a mutant
 //! cargo gamma run --test-lib                 # use only library unit-test harnesses
+//! cargo gamma list mutants --re one_line    # preview mutants in this function
+//! cargo gamma run --re one_line             # test only matching mutants
 //! ```
+//!
+//! `--re` matches the full name shown by `cargo gamma list mutants`: workspace-relative file,
+//! line and column, qualified function path, change description, and any suppression marker. It uses a Rust regular
+//! expression, matches substrings by default, and may be repeated to include matches from any
+//! pattern. Control characters use the visible escapes printed by the listing; a regular expression
+//! needs `\\` to match a displayed backslash. Use `list mutants --re ...` to preview the exact
+//! population before a run.
 //!
 //! By default, each mutant is judged by tests from its own package. That applies both to a run inside
 //! `ledger-core` and to a whole-workspace run containing it: crates that depend on `ledger-core` are
@@ -395,7 +404,8 @@
 //! The campaign establishes a compiler-viable mutant schema before any mutant is executed.
 //! `cargo check` examines the instrumented packages together and compiler-rejected mutants are
 //! withdrawn until the schema checks; a code-generating build then produces the converged test
-//! binaries. A code-generation or linking failure uses the same bounded convergence rules.
+//! binaries. Packages without library targets work both on their own and alongside library packages
+//! in a workspace run. A code-generation or linking failure uses the same bounded convergence rules.
 //! `--build-timeout` bounds each compiler invocation, while
 //! `--build-timeout-multiplier` bounds later convergence rounds relative to the first.
 //!
@@ -416,8 +426,9 @@
 //! cache after taking the same lock as a run. It leaves published reports under
 //! `target/cargo-gamma`, checked-in hints and source suppressions untouched.
 //!
-//! As soon as a measured run acquires its campaign cache, it truncates `gamma-progress.log` and
-//! `gamma-selection.jsonl`. Every mutant verdict is appended and flushed to the progress journal as
+//! As soon as a fresh measured run acquires its campaign cache, it truncates `gamma-progress.log` and
+//! `gamma-selection.jsonl`. Testing-only resume preserves these logs without replaying their previous
+//! verdict lines. Every new mutant verdict is appended and flushed to the progress journal as
 //! it arrives, using the console's outcome-line format but without color or redraw escapes. Unlike
 //! the console, the journal includes ordinary killed mutants as well as survivors, timeouts, memory
 //! exhaustion, flakes and uncovered mutants. The JSON Lines selection journal is transient,
@@ -1398,6 +1409,25 @@
 //! uncovered mutant is evaluated again. A previous killer is tried first, but its result is checked
 //! and the ordinary suite follows when it no longer kills the mutant.
 //!
+//! ### Resuming interrupted testing
+//!
+//! Once mutant testing starts, each settled verdict is persisted before its progress is reported.
+//! After Ctrl+C or a host restart, continue that same campaign with:
+//!
+//! ```bash
+//! cargo gamma run --resume-testing
+//! ```
+//!
+//! Resume reuses the copied, instrumented workspace and compiled tests without rebuilding or
+//! repeating settled mutants. Only unfinished work runs again. The original selection and testing
+//! settings stay frozen, even if the live source, hints, or suppressions change. Missing, damaged,
+//! incompatible, completed, or pre-testing state is an error, not a request to start over.
+//! Campaigns started before this feature do not contain the required checkpoint.
+//!
+//! `cargo gamma hints`, `cargo gamma suppress`, and `cargo gamma unsuppress` also work after an
+//! interruption. Hints and suppressions use recorded partial evidence; pending mutants are not
+//! treated as verdicts. Use the same `--cache-dir` when a campaign used a redirected cache.
+//!
 //! ### What a run remembers
 //!
 //! Three things carry knowledge from one run to the next, and they differ in exactly one way that
@@ -1437,7 +1467,8 @@
 //! replacement.
 //!
 //! A run adopts only compiler unviability under a matching build context. Test outcomes are
-//! observations that can vary even when every captured input is unchanged, so they are never reused.
+//! observations that can vary even when every captured input is unchanged, so a new campaign never
+//! reuses them. Testing-only resume instead continues the same frozen campaign.
 //!
 //! **A skip directive is not a cache and must never be treated as one.**
 //! `cargo gamma suppress --apply` writes a suppression directive into the source, where it is
@@ -1674,10 +1705,15 @@
 //! denominator.
 //!
 //! Removing the *old* identity needs one more thing, because a union by itself never drops anything: at
-//! least one input has to be an unsharded run or listing, which states the complete population of every
-//! file it covers. An identity absent from the newest such input has been withdrawn, and the summary
-//! counts it under `Withdrawn`. A sharded report describes only its own slice, so it never withdraws
-//! anything — merge a full `list mutants --json` alongside the rotation to keep the denominator honest:
+//! least one input has to be an unsharded, unfiltered run or listing, which states the complete
+//! population of every file it covers. An identity absent from the newest complete input has been
+//! withdrawn, and the summary counts it under `Withdrawn`.
+//!
+//! A report narrowed by `--re` is partial even without sharding, so it cannot establish a withdrawal.
+//! If its source text changed, an available unfiltered source stays the presentation for unmatched
+//! historical mutants; include a current unfiltered listing for current presentations. A sharded
+//! report describes only its own slice, so it never withdraws anything — merge a full
+//! `list mutants --json` alongside the rotation to keep the denominator honest:
 //!
 //! ```bash
 //! cargo gamma list mutants --json-report reports/current.json

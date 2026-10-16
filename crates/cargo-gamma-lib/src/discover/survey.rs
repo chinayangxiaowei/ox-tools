@@ -15,6 +15,7 @@ use std::thread;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Target, TargetKind};
+use regex::RegexSet;
 use syn::visit::{self, Visit};
 use walkdir::WalkDir;
 
@@ -109,8 +110,8 @@ pub struct Survey {
     /// Every mutable source file walked for each selected package, including files excluded from
     /// mutation by `--file` or `--in-diff`.
     ///
-    /// Module declarations in an excluded parent can still prove that an included child exists
-    /// only under `#[cfg(test)]`, so the declaration graph must be wider than the population.
+    /// Excluded files still supply module declarations and `Default` implementations, so the
+    /// evidence graph must be wider than the mutation population.
     declaration_files: HashMap<String, Vec<Utf8PathBuf>>,
 
     /// For each workspace package, the workspace packages its test binaries can reach.
@@ -139,6 +140,9 @@ pub struct Survey {
 
     /// Library unit-test harnesses Cargo may build, retaining package ownership.
     pub(crate) library_tests: Vec<LibraryTestTarget>,
+
+    /// Workspace packages with a library target, including libraries without a test harness.
+    pub(crate) library_packages: HashSet<String>,
 
     /// Every test target that appears to run the compiler rather than the code under test.
     ///
@@ -196,11 +200,11 @@ pub struct Survey {
     untracked_build_script_inputs: bool,
 
     diff: Option<Diff>,
+    name_patterns: Option<RegexSet>,
     shard: Option<(u32, u32)>,
     only_mutants: Option<HashSet<MutantId>>,
     settled: HashMap<MutantId, super::Settled>,
     exclude_trait_impls: Vec<String>,
-    complete_defaults: bool,
 }
 
 /// What scanning some part of the workspace yielded.
@@ -299,6 +303,12 @@ impl Survey {
         cache_inputs: bool,
     ) -> Result<Self> {
         cargo.validate()?;
+
+        let name_patterns = if args.name_patterns.is_empty() {
+            None
+        } else {
+            Some(RegexSet::new(&args.name_patterns).map_err(|error| error!("invalid --re pattern: {error}").usage())?)
+        };
 
         let features = features::from_extra(&args.features, &cargo.extra);
         let metadata = load_metadata(&args.dir, &features)?;
@@ -463,8 +473,6 @@ impl Survey {
             by_package.entry(file.package.clone()).or_default().push(position);
         }
 
-        let complete_defaults = args.files.is_empty() && args.exclude_files.is_empty() && args.in_diff.is_none();
-
         Ok(Self {
             root,
             target,
@@ -475,16 +483,17 @@ impl Survey {
             selected: sorted(selected),
             tests: test_targets(&metadata),
             library_tests: library_tests(&metadata),
+            library_packages: library_packages(&metadata),
             compile_fail: compile_fail_targets(&metadata),
             roots,
             specs,
             cfgs,
             diff,
+            name_patterns,
             shard,
             only_mutants: None,
             settled: HashMap::default(),
             exclude_trait_impls: args.exclude_trait_impls.clone(),
-            complete_defaults,
             source_dirs: sorted(source_dirs),
             external_inputs: external_inputs.roots,
             untracked_build_script_inputs: external_inputs.has_build_scripts,
@@ -606,10 +615,6 @@ impl Survey {
     /// # Errors
     ///
     /// Returns an error if a file cannot be read or parsed.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "scanning keeps selection, discovery, and stable ordinal assignment in one transaction"
-    )]
     pub fn scan(&self, package: Option<&str>, selection: &Selection, ordinals: &mut u32) -> Result<Scanned> {
         let files: Vec<&TargetFile> = package.map_or_else(
             || self.files.iter().collect(),
@@ -625,14 +630,14 @@ impl Survey {
             || self.roots.values().flatten().cloned().collect(),
             |wanted| self.roots.get(wanted).cloned().unwrap_or_default(),
         );
-        let declaration_files: Vec<(&Utf8Path, &CfgSet)> = package.map_or_else(
+        let declaration_files: Vec<(&Utf8Path, &CfgSet, &str)> = package.map_or_else(
             || {
                 self.declaration_files
                     .iter()
                     .flat_map(|(package, paths)| {
                         let cfg = self.cfgs.for_package(package);
 
-                        paths.iter().map(move |path| (path.as_path(), cfg))
+                        paths.iter().map(move |path| (path.as_path(), cfg, package.as_str()))
                     })
                     .collect()
             },
@@ -641,26 +646,17 @@ impl Survey {
 
                 self.declaration_files
                     .get(wanted)
-                    .map(|paths| paths.iter().map(|path| (path.as_path(), cfg)).collect())
+                    .map(|paths| paths.iter().map(|path| (path.as_path(), cfg, wanted)).collect())
                     .unwrap_or_default()
             },
         );
         let Scan {
             mut mutants,
-            suppressed,
             idle,
             skipped,
             digests,
             sources,
-        } = scan(
-            &files,
-            &declaration_files,
-            &roots,
-            selection,
-            &self.cfgs,
-            &self.exclude_trait_impls,
-            self.complete_defaults,
-        )?;
+        } = scan(&files, &declaration_files, &roots, selection, &self.cfgs, &self.exclude_trait_impls)?;
 
         // Within a file the diff still has the last word: a changed line usually sits among many
         // that were not touched, and mutating those would report on code the change never went
@@ -675,9 +671,17 @@ impl Survey {
             });
         }
 
+        if let Some(patterns) = self.name_patterns.as_ref() {
+            retain_name_matches(&mut mutants, patterns);
+        }
+
         if let Some(only) = self.only_mutants.as_ref() {
             mutants.retain(|mutant| only.contains(&mutant.id));
         }
+
+        // Suppression is applied during scanning. Count only the suppressed mutants that remain
+        // after the diff, name, and ID filters narrow this run's population.
+        let suppressed = suppressed_count(&mutants);
 
         // A mutant an earlier run already settled takes the verdict that run gave it and stops
         // being work: no ordinal, no shard slot, nothing built for it. It stays in the population,
@@ -769,6 +773,24 @@ impl Survey {
     }
 }
 
+/// Matches the name as it appears in the plain mutant listing.
+fn matches_displayed_name(patterns: &RegexSet, name: &str) -> bool {
+    patterns.is_match(&crate::report::encode_controls(name))
+}
+
+fn retain_name_matches(mutants: &mut Vec<Mutant>, patterns: &RegexSet) {
+    let mut name = String::new();
+    mutants.retain(|mutant| {
+        name.clear();
+        mutant.write_selection_name(&mut name);
+        matches_displayed_name(patterns, &name)
+    });
+}
+
+fn suppressed_count(mutants: &[Mutant]) -> usize {
+    mutants.iter().filter(|mutant| mutant.outcome == Outcome::Ignored).count()
+}
+
 fn unmatched_exclusion(index: usize, exclusion: &str) -> Error {
     error!(
         "exclude-trait-impls entry {} (`{}`) matched no trait implementations; check the unqualified Rust identifier forming the final written trait-path segment",
@@ -842,7 +864,7 @@ fn mutate(
         .into_iter()
         .unzip();
     let directives = suppress::directives_for(source, cfg)?;
-    let mut suppressed = suppress::suppress(&mut found, &directives);
+    suppress::suppress(&mut found, &directives);
 
     for (mutant, trait_impl) in found.iter_mut().zip(trait_impls) {
         let Some(trait_name) = trait_impl
@@ -854,7 +876,7 @@ fn mutate(
 
         // Source suppression already made an overlapping mutant visible and accounted for it.
         // Configuration changes only otherwise-live matches so the population keeps one ignored
-        // entry and one suppression count per mutant.
+        // entry per mutant.
         if mutant.outcome == Outcome::Pending {
             mutant.outcome = Outcome::Ignored;
             mutant.suppression = Some(Suppression {
@@ -863,7 +885,6 @@ fn mutate(
                 tag: None,
                 line: None,
             });
-            suppressed = suppressed.saturating_add(1);
         }
     }
 
@@ -875,7 +896,6 @@ fn mutate(
 
     Ok(Parsed {
         mutants: found,
-        suppressed,
         idle,
         declared,
         digest: crate::discover::digest(source.text().as_bytes()),
@@ -983,7 +1003,7 @@ fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
-/// Reads, parses and mutates every file, returning the population and how much of it was suppressed.
+/// Reads, parses and mutates every file, returning the population before run-specific filters.
 ///
 /// Parsing is what discovery actually spends its time on, so the files are divided across the
 /// available cores. Work is claimed one file at a time rather than in fixed blocks, since files
@@ -1007,23 +1027,36 @@ fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
 /// panics are caught, held, and resumed once both waits are behind them.
 fn scan(
     files: &[&TargetFile],
-    declaration_files: &[(&Utf8Path, &CfgSet)],
+    declaration_files: &[(&Utf8Path, &CfgSet, &str)],
     roots: &[Utf8PathBuf],
     selection: &Selection,
     cfgs: &Cfgs,
     exclude_trait_impls: &[String],
-    complete_defaults: bool,
 ) -> Result<Scan> {
+    let selected: HashSet<&Utf8Path> = files.iter().map(|file| file.absolute.as_path()).collect();
+    let mut extra_decl_files: Vec<(&Utf8Path, &CfgSet, &str)> = declaration_files
+        .iter()
+        .copied()
+        .filter(|(path, _cfg, _package)| !selected.contains(path))
+        .collect();
+    extra_decl_files.sort_by(|left, right| left.0.cmp(right.0));
+    let Declarations {
+        declared: extra_declared,
+        skipped: declaration_skips,
+        defaults: extra_defaults,
+        incomplete_packages,
+    } = parse_declarations_parallel(&extra_decl_files)?;
+
     // #[gamma::skip(all, reason = "the worker count is a positive resource bound; changing it either preserves results while changing scheduling or violates that bound")]
     let workers = thread::available_parallelism().map_or(1, NonZero::get).min(files.len().max(1));
     let shared = Shared {
         next: AtomicUsize::new(0),
-        partials: Mutex::new(Vec::new()),
+        partials: Mutex::new(vec![extra_defaults]),
         skipped: Mutex::new(Vec::new()),
         // #[gamma::skip(all, reason = "the barrier party count must exactly equal the number of spawned workers or discovery deadlocks")]
         barrier: Barrier::new(workers),
         defaults: OnceLock::new(),
-        complete_defaults,
+        incomplete_packages: &incomplete_packages,
     };
 
     let mut collected: Vec<(usize, Parsed)> = thread::scope(|scope| {
@@ -1069,41 +1102,21 @@ fn scan(
     // production population, whatever it looks like from the inside, and its mutants are dropped
     // rather than reported. A mutated assertion is a broken test, not a gap in one, and inactive
     // code is not built for any test to catch.
-    let mut declared: Vec<(Utf8PathBuf, Vec<modules::Declaration>)> = collected
+    let declared: Vec<(Utf8PathBuf, Vec<modules::Declaration>)> = collected
         .iter()
         .map(|(index, parsed)| {
             let path = files.get(*index).map_or_else(Utf8PathBuf::new, |file| file.absolute.clone());
 
             (path, parsed.declared.clone())
         })
+        .chain(extra_declared)
         .collect();
-    let selected: HashSet<&Utf8Path> = files.iter().map(|file| file.absolute.as_path()).collect();
-
-    let extra_decl_files: Vec<(&Utf8Path, &CfgSet)> = declaration_files
-        .iter()
-        .filter(|&&(path, _cfg)| !selected.contains(path))
-        .map(|&(path, cfg)| (path, cfg))
-        .collect();
-
-    // #[gamma::skip(cond.always_false, reason = "parsing an empty declaration slice returns the same two empty vectors and only adds call overhead")]
-    let declaration_skips: Vec<(Utf8PathBuf, String)> = if extra_decl_files.is_empty() {
-        Vec::new()
-    } else {
-        let Declarations {
-            declared: extra_declared,
-            skipped: extra_skipped,
-        } = parse_declarations_parallel(&extra_decl_files)?;
-
-        declared.extend(extra_declared);
-        extra_skipped
-    };
 
     let excluded = modules::excluded_files(roots, &declared);
     let total = collected.iter().map(|(_index, parsed)| parsed.mutants.len()).sum();
     let mut mutants = Vec::with_capacity(total);
     let mut digests: HashMap<Utf8PathBuf, String> = HashMap::default();
     let mut sources: HashMap<Utf8PathBuf, String> = HashMap::default();
-    let mut suppressed = 0;
     let mut idle = Vec::new();
 
     for (index, parsed) in collected {
@@ -1116,7 +1129,6 @@ fn scan(
             let _replaced = sources.insert(file.path.clone(), parsed.source);
         }
         mutants.extend(parsed.mutants);
-        suppressed += parsed.suppressed;
         idle.extend(parsed.idle);
     }
 
@@ -1141,7 +1153,6 @@ fn scan(
 
     Ok(Scan {
         mutants,
-        suppressed,
         idle,
         skipped: unanalyzable.into_iter().map(|(_path, message)| message).collect(),
         digests,
@@ -1154,7 +1165,7 @@ type DeclarationParse = (usize, Result<DeclarationOutcome>);
 /// What parsing one declaration-only file yielded: its declarations, or the reason it was skipped.
 enum DeclarationOutcome {
     /// The file parsed, and declares these modules.
-    Declared(Utf8PathBuf, Vec<modules::Declaration>),
+    Declared(Utf8PathBuf, Vec<modules::Declaration>, Box<collect::Defaults>),
 
     /// The file could not be analyzed, and this diagnostic names it and says why.
     Skipped(Utf8PathBuf, String),
@@ -1164,11 +1175,13 @@ enum DeclarationOutcome {
 struct Declarations {
     declared: Vec<(Utf8PathBuf, Vec<modules::Declaration>)>,
     skipped: Vec<(Utf8PathBuf, String)>,
+    defaults: HashMap<String, collect::Defaults>,
+    incomplete_packages: HashSet<String>,
 }
 
 /// Parses declaration-only files with bounded parallelism.
 ///
-/// Each file is read and parsed solely to extract module declarations — no mutation is performed.
+/// Each file supplies module declarations and package `Default` evidence, but no mutants.
 /// The parallelism is bounded by `available_parallelism` to avoid exceeding system thread limits.
 /// Results are returned in filesystem-path order.
 ///
@@ -1183,11 +1196,13 @@ struct Declarations {
 /// # Errors
 ///
 /// Returns the first non-skippable file-read or parse error encountered, in path order.
-fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declarations> {
+fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet, &str)]) -> Result<Declarations> {
     if files.is_empty() {
         return Ok(Declarations {
             declared: Vec::new(),
             skipped: Vec::new(),
+            defaults: HashMap::default(),
+            incomplete_packages: HashSet::default(),
         });
     }
 
@@ -1196,7 +1211,7 @@ fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declara
     let mut results: Vec<DeclarationParse> = if workers <= 1 {
         let mut results = Vec::with_capacity(files.len());
 
-        for (index, &(path, cfg)) in files.iter().enumerate() {
+        for (index, &(path, cfg, _package)) in files.iter().enumerate() {
             results.push((index, parse_declarations_of(path, cfg)));
         }
 
@@ -1213,8 +1228,10 @@ fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declara
                         let mut mine = Vec::new();
 
                         loop {
+                            // #[gamma::skip(literal.int_decrement, tag = "outofmemory", reason = "a zero atomic increment repeatedly parses and accumulates the same file")]
                             let index = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(path, cfg)) = files.get(index) else {
+                            let Some(&(path, cfg, _package)) = files.get(index) else {
+                                // #[gamma::skip(loop.break_to_continue, tag = "timeout", reason = "workers must exit after exhausting the finite file list")]
                                 break;
                             };
 
@@ -1242,12 +1259,21 @@ fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declara
     let mut gathered = Declarations {
         declared: Vec::with_capacity(results.len()),
         skipped: Vec::new(),
+        defaults: HashMap::default(),
+        incomplete_packages: HashSet::default(),
     };
 
-    for (_index, result) in results {
+    for (index, result) in results {
+        let (_, _, package) = files[index];
         match result? {
-            DeclarationOutcome::Declared(path, declarations) => gathered.declared.push((path, declarations)),
-            DeclarationOutcome::Skipped(path, message) => gathered.skipped.push((path, message)),
+            DeclarationOutcome::Declared(path, declarations, defaults) => {
+                gathered.declared.push((path, declarations));
+                gathered.defaults.entry(package.to_owned()).or_default().absorb(*defaults);
+            }
+            DeclarationOutcome::Skipped(path, message) => {
+                gathered.skipped.push((path, message));
+                let _inserted = gathered.incomplete_packages.insert(package.to_owned());
+            }
         }
     }
 
@@ -1264,6 +1290,7 @@ fn parse_declarations_of(path: &Utf8Path, cfg: &CfgSet) -> Result<DeclarationOut
         Ok(source) => Ok(DeclarationOutcome::Declared(
             path.to_owned(),
             modules::declarations(path, source.ast(), cfg),
+            Box::new(collect::Defaults::of_in(source.ast(), cfg)),
         )),
 
         Err(error) if error.is_skippable() => Ok(DeclarationOutcome::Skipped(path.to_owned(), error.to_string())),
@@ -1272,10 +1299,9 @@ fn parse_declarations_of(path: &Utf8Path, cfg: &CfgSet) -> Result<DeclarationOut
     }
 }
 
-/// What parsing and mutating a set of files produced.
+/// What parsing and mutating a set of files produced before population filters.
 struct Scan {
     mutants: Vec<Mutant>,
-    suppressed: usize,
     idle: Vec<suppress::Idle>,
     skipped: Vec<String>,
     digests: HashMap<Utf8PathBuf, String>,
@@ -1284,7 +1310,7 @@ struct Scan {
 
 /// Everything the workers of one scan share, so that adding a channel does not widen every
 /// signature between here and the loop that uses it.
-struct Shared {
+struct Shared<'a> {
     /// The next file index to claim, so work is taken one file at a time rather than in blocks.
     next: AtomicUsize,
 
@@ -1300,7 +1326,9 @@ struct Shared {
 
     /// The merged package indexes, set once by the leader and read by all of them.
     defaults: OnceLock<HashMap<String, collect::Defaults>>,
-    complete_defaults: bool,
+
+    /// Packages with an unanalyzable declaration-only file cannot supply negative evidence.
+    incomplete_packages: &'a HashSet<String>,
 }
 
 /// What one file yielded when it was parsed.
@@ -1315,7 +1343,7 @@ struct Shared {
 // #[gamma::skip(all, reason = "parallel discovery aggregation is covered by deterministic single- and multi-worker plan equality; deleting an individual merge changes only resource scheduling under the mutation harness")]
 fn work(
     files: &[&TargetFile],
-    shared: &Shared,
+    shared: &Shared<'_>,
     selection: &Selection,
     cfgs: &Cfgs,
     exclude_trait_impls: &[String],
@@ -1326,7 +1354,7 @@ fn work(
         skipped,
         barrier,
         defaults,
-        complete_defaults,
+        incomplete_packages,
     } = shared;
 
     let mut mine: Vec<(usize, SourceFile)> = Vec::new();
@@ -1355,11 +1383,7 @@ fn work(
                     // Report paths relative to the workspace root; that is what a user can act on
                     // and what a suppression or an expectation is keyed by.
                     source.set_path(file.path.clone());
-                    let defaults = if *complete_defaults {
-                        collect::Defaults::of_in(source.ast(), cfgs.for_package(&file.package))
-                    } else {
-                        collect::Defaults::optimistic_of_in(source.ast(), cfgs.for_package(&file.package))
-                    };
+                    let defaults = collect::Defaults::of_in(source.ast(), cfgs.for_package(&file.package));
                     indexes.entry(file.package.clone()).or_default().absorb(defaults);
                     mine.push((at, source));
                 }
@@ -1401,6 +1425,11 @@ fn work(
 
             for (at, _message) in skipped.lock().unwrap_or_else(PoisonError::into_inner).iter() {
                 if let Some(index) = files.get(*at).and_then(|file| merged.get_mut(&file.package)) {
+                    index.mark_incomplete();
+                }
+            }
+            for package in *incomplete_packages {
+                if let Some(index) = merged.get_mut(package) {
                     index.mark_incomplete();
                 }
             }
@@ -1451,7 +1480,6 @@ fn work(
 
 struct Parsed {
     mutants: Vec<Mutant>,
-    suppressed: usize,
     idle: Vec<suppress::Idle>,
     declared: Vec<modules::Declaration>,
 
@@ -2153,6 +2181,15 @@ fn target_is_library(target: &Target) -> bool {
             TargetKind::Lib | TargetKind::RLib | TargetKind::DyLib | TargetKind::CDyLib | TargetKind::StaticLib | TargetKind::ProcMacro
         )
     })
+}
+
+fn library_packages(metadata: &Metadata) -> HashSet<String> {
+    metadata
+        .workspace_packages()
+        .iter()
+        .filter(|package| package.targets.iter().any(target_is_library))
+        .map(|package| package.name.to_string())
+        .collect()
 }
 
 /// Returns the first `--file` or `--exclude-file` pattern that matches no source file.
@@ -4460,6 +4497,180 @@ mod tests {
         );
     }
 
+    #[test]
+    fn evidence_only_aliases_and_reexports_do_not_suppress_imported_default_mutants() {
+        for export in [
+            "pub type Artifact = std::time::Duration;",
+            "pub use std::time::Duration as Artifact;",
+        ] {
+            let (_directory, root) = workspace();
+            write(
+                &root,
+                "core/src/lib.rs",
+                "mod other; mod exports; use crate::exports::Artifact; \
+                 pub fn make() -> Artifact { Artifact::from_secs(5) }",
+            );
+            write(&root, "core/src/other.rs", "pub struct Artifact;");
+            write(&root, "core/src/exports.rs", export);
+            for args in [
+                SelectArgs {
+                    files: vec!["core/src/lib.rs".to_owned()],
+                    ..SelectArgs::default()
+                },
+                SelectArgs {
+                    exclude_files: vec!["core/src/exports.rs".to_owned(), "core/src/other.rs".to_owned()],
+                    ..SelectArgs::default()
+                },
+            ] {
+                let survey = survey(&root, args);
+                for selector in ["all", "fn_value.default"] {
+                    let scanned = survey.scan(Some("core"), &Selection::parse(selector).unwrap(), &mut 0).unwrap();
+                    assert!(
+                        scanned
+                            .mutants
+                            .iter()
+                            .any(|mutant| mutant.file.as_str() == "core/src/lib.rs" && mutant.mutator.as_ref() == "fn_value.default"),
+                        "{export}: {selector}"
+                    );
+                    assert!(
+                        scanned
+                            .mutants
+                            .iter()
+                            .all(|mutant| !matches!(mutant.file.as_str(), "core/src/other.rs" | "core/src/exports.rs"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_filters_preserve_default_evidence_without_mutating_evidence_only_files() {
+        let (_directory, root) = workspace();
+        write(
+            &root,
+            "core/src/lib.rs",
+            "mod model;\nmod generated;\nuse crate::model::{Missing, Ready};\n\
+             pub fn missing() -> Missing { Missing }\n\
+             pub fn ready() -> Ready { Ready }\n\
+             pub fn external() -> std::net::TcpListener { unimplemented!() }\n",
+        );
+        write(&root, "core/src/model.rs", "pub struct Missing;\npub struct Ready;\n");
+        write(
+            &root,
+            "core/src/generated.rs",
+            "impl Default for crate::model::Ready { fn default() -> Self { Self } }\n\
+             pub fn helper() -> crate::model::Ready { crate::model::Ready }\n",
+        );
+        write(
+            &root,
+            "change.patch",
+            "--- a/core/src/lib.rs\n+++ b/core/src/lib.rs\n@@ -4,3 +4,3 @@\n\
+             +pub fn missing() -> Missing { Missing }\n\
+             +pub fn ready() -> Ready { Ready }\n\
+             +pub fn external() -> std::net::TcpListener { unimplemented!() }\n",
+        );
+
+        for args in [
+            SelectArgs {
+                exclude_files: vec!["core/src/generated.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+            SelectArgs {
+                files: vec!["core/src/lib.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+            SelectArgs {
+                in_diff: Some(root.join("change.patch")),
+                ..SelectArgs::default()
+            },
+        ] {
+            let survey = survey(&root, args);
+            let selection = Selection::parse("fn_value.default").expect("the registered mutator resolves");
+            let scanned = survey.scan(None, &selection, &mut 0).expect("the fixture sources are readable");
+            let found: Vec<_> = scanned
+                .mutants
+                .iter()
+                .map(|mutant| (mutant.item_path.as_ref(), mutant.replacement.as_str()))
+                .collect();
+
+            assert_eq!(
+                found,
+                [("ready", "Default::default()"), ("external", "Default::default()")],
+                "filters must preserve cross-file implementations and unknown external types, but screen Missing"
+            );
+            assert!(
+                scanned.mutants.iter().all(|mutant| mutant.file.as_str() == "core/src/lib.rs"),
+                "evidence-only files must not contribute mutants: {:?}",
+                scanned.mutants
+            );
+        }
+    }
+
+    #[test]
+    fn an_exclusion_does_not_disable_negative_default_evidence_in_either_package() {
+        let (_directory, root) = workspace();
+        write(
+            &root,
+            "core/src/lib.rs",
+            "mod generated;\npub struct Shape;\npub fn build() -> Shape { Shape }\n",
+        );
+        write(
+            &root,
+            "app/src/main.rs",
+            "struct Shape;\nfn build() -> Shape { Shape }\nfn main() {}\n",
+        );
+        let survey = survey(
+            &root,
+            SelectArgs {
+                exclude_files: vec!["core/src/generated.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+        );
+        let selection = Selection::parse("fn_value.default").expect("the registered mutator resolves");
+        for package in [None, Some("core"), Some("app")] {
+            let scanned = survey.scan(package, &selection, &mut 0).expect("the fixture sources are readable");
+            assert!(scanned.mutants.is_empty(), "{:?}", scanned.mutants);
+        }
+    }
+
+    #[test]
+    fn an_unanalyzable_excluded_file_disables_evidence_only_for_its_own_package() {
+        let (_directory, root) = workspace();
+        write(
+            &root,
+            "core/src/lib.rs",
+            "mod generated;\npub struct Shape;\npub fn build() -> Shape { Shape }\n",
+        );
+        write(
+            &root,
+            "core/src/generated.rs",
+            &format!(
+                "impl Default for crate::Shape {{ fn default() -> Self {{ Self }} }}\n{}",
+                too_deep_source()
+            ),
+        );
+        write(
+            &root,
+            "app/src/main.rs",
+            "struct Shape;\nfn build() -> Shape { Shape }\nfn main() {}\n",
+        );
+        let survey = survey(
+            &root,
+            SelectArgs {
+                exclude_files: vec!["core/src/generated.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+        );
+        let selection = Selection::parse("fn_value.default").expect("the registered mutator resolves");
+        let scanned = survey
+            .scan(None, &selection, &mut 0)
+            .expect("a skippable source does not abort discovery");
+        assert_eq!(scanned.skipped.len(), 1, "{:?}", scanned.skipped);
+        assert_eq!(scanned.mutants.len(), 1, "{:?}", scanned.mutants);
+        assert_eq!(scanned.mutants[0].package.as_ref(), "core");
+        assert_eq!(scanned.mutants[0].replacement, "Default::default()");
+    }
+
     /// A diff path that cannot be read at all has to fail the survey up front, naming the diff,
     /// rather than falling through to a scan that silently behaves as though `--in-diff` had never
     /// been given: a run over the wrong set of lines because a diff path was mistyped is far harder
@@ -4483,8 +4694,7 @@ mod tests {
 
     #[test]
     fn a_file_the_diff_never_mentions_is_dropped_before_it_is_parsed() {
-        // This is most of what makes `--in-diff` affordable on a pull request: the files the change
-        // did not touch are skipped without ever being read, let alone parsed.
+        // Unchanged files supply declaration evidence but do not enter the mutation selection.
         let (_directory, root) = workspace();
 
         write(
@@ -4632,6 +4842,89 @@ mod tests {
             "{:?}",
             scanned.mutants
         );
+    }
+
+    #[test]
+    fn name_patterns_match_the_control_encoded_listing() {
+        let name = "src/line\n\t\u{1b}.rs:1:1: add: replace + with - [arith.add_to_sub]";
+        let encoded = crate::report::encode_controls(name);
+        assert!(encoded.contains(r"\n\t\e"), "{encoded}");
+
+        let visible_escapes = RegexSet::new([r"\\n\\t\\e"]).expect("visible control escapes form a valid regex");
+        assert!(matches_displayed_name(&visible_escapes, name));
+
+        let raw_controls = RegexSet::new(["\n\t\u{1b}"]).expect("raw control characters form a valid regex");
+        assert!(!matches_displayed_name(&raw_controls, name));
+    }
+
+    #[test]
+    fn a_name_pattern_selects_only_mutants_in_the_matching_function() {
+        let add = Mutant {
+            item_path: "add".to_owned().into(),
+            outcome: Outcome::Pending,
+            ..crate::fixtures::mutant()
+        };
+        let quiet = Mutant {
+            item_path: "quiet".to_owned().into(),
+            outcome: Outcome::Ignored,
+            suppression: Some(Suppression {
+                channel: Channel::Attribute,
+                reason: None,
+                tag: None,
+                line: None,
+            }),
+            ..crate::fixtures::mutant()
+        };
+        let mut suppressed = vec![quiet.clone()];
+        let marker = RegexSet::new([r"\[suppressed: attribute\]$"]).expect("the listing marker is a valid regex");
+        retain_name_matches(&mut suppressed, &marker);
+        assert_eq!(suppressed.len(), 1);
+        assert!(suppressed[0].selection_name().ends_with(" [suppressed: attribute]"));
+
+        let mut mutants = vec![add, quiet];
+        let patterns = RegexSet::new([": add: "]).expect("function name is a valid regex");
+
+        retain_name_matches(&mut mutants, &patterns);
+
+        assert_eq!(mutants.len(), 1);
+        assert_eq!(mutants[0].item_path.as_ref(), "add");
+        assert_eq!(suppressed_count(&mutants), 0);
+    }
+
+    #[test]
+    fn repeated_name_patterns_match_either_pattern() {
+        let mut mutants = vec![
+            Mutant {
+                item_path: "add".to_owned().into(),
+                ..crate::fixtures::mutant()
+            },
+            Mutant {
+                item_path: "main".to_owned().into(),
+                ..crate::fixtures::mutant()
+            },
+        ];
+        let patterns = RegexSet::new(["does_not_match", ": main: "]).expect("both patterns are valid");
+
+        retain_name_matches(&mut mutants, &patterns);
+
+        assert_eq!(mutants.len(), 1);
+        assert_eq!(mutants[0].item_path.as_ref(), "main");
+    }
+
+    #[test]
+    fn invalid_name_pattern_is_a_usage_error() {
+        let error = Survey::new(
+            &SelectArgs {
+                dir: Utf8PathBuf::from("unused-with-invalid-regex"),
+                name_patterns: vec!["[".to_owned()],
+                ..SelectArgs::default()
+            },
+            None,
+        )
+        .expect_err("an invalid regex must fail before scanning");
+
+        assert!(error.is_usage(), "{error}");
+        assert!(error.to_string().contains("invalid --re pattern"), "{error}");
     }
 
     #[test]
