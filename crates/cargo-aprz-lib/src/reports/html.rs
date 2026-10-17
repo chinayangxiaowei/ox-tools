@@ -989,6 +989,7 @@ fn write_metrics_category<W: Write>(
 }
 
 fn crate_anchor_id(name: &str, version: &str) -> String {
+    // #[gamma::skip(arith.add_to_mul, literal.int_decrement, literal.int_increment, literal.int_to_one, literal.int_to_zero, tag = "equivalent", reason = "these capacity estimates do not change anchor bytes; String grows as characters are appended")]
     let mut id = String::with_capacity(name.len() + version.len() + 7);
     id.push_str("crate-");
     for c in name.chars() {
@@ -1300,25 +1301,22 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call GetTimeZoneInformationForYear")]
     fn crate_description_is_rendered_in_the_risk_list() {
-        let described_metrics = vec![Metric::with_value(
-            &CRATE_DESCRIPTION_DEF,
-            MetricValue::String("A precise crate description".into()),
-        )];
-        let crates = vec![
-            ReportableCrate::new(
-                "described".into(),
-                Arc::new("1.0.0".parse().unwrap()),
-                described_metrics,
-                Some(Appraisal::new(Risk::Low, vec![], 1, 1, 100.0)),
-            ),
-            create_test_crate("other", "1.0.0", Some(Appraisal::new(Risk::Low, vec![], 1, 1, 100.0))),
-        ];
-        let mut output = String::new();
-        generate(&crates, test_timestamp(), &mut output).unwrap();
-        assert!(
-            output.contains("title=\"described v1.0.0\nA precise crate description\""),
-            "{output}"
-        );
+        for appraisal in [None, Some(Appraisal::new(Risk::Low, vec![], 1, 1, 100.0))] {
+            let described_metrics = vec![Metric::with_value(
+                &CRATE_DESCRIPTION_DEF,
+                MetricValue::String("A precise crate description".into()),
+            )];
+            let crates = vec![
+                ReportableCrate::new("described".into(), Arc::new("1.0.0".parse().unwrap()), described_metrics, appraisal),
+                create_test_crate("other", "1.0.0", Some(Appraisal::new(Risk::Low, vec![], 1, 1, 100.0))),
+            ];
+            let mut output = String::new();
+            generate(&crates, test_timestamp(), &mut output).unwrap();
+            assert!(
+                output.contains("title=\"described v1.0.0\nA precise crate description\""),
+                "{output}"
+            );
+        }
     }
 
     #[test]
@@ -2464,21 +2462,32 @@ mod tests {
             extractor: |_| None,
             default_value: || None,
         };
-        struct FailOnValue;
+        struct FailOnValue<'a>(&'a str);
 
-        impl Write for FailOnValue {
+        impl Write for FailOnValue<'_> {
             fn write_str(&mut self, s: &str) -> fmt::Result {
-                if s == "visible" { Err(fmt::Error) } else { Ok(()) }
+                if s == self.0 { Err(fmt::Error) } else { Ok(()) }
             }
         }
 
-        let metrics = [Metric::with_value(&PLAIN_DEF, MetricValue::String("visible".into()))];
-        let mut metrics_by_category = HashMap::default();
-        let _ = metrics_by_category.insert(MetricCategory::Metadata, vec![PLAIN_DEF.name]);
-        let mut metric_map = HashMap::default();
-        let _ = metric_map.insert(PLAIN_DEF.name, &metrics[0]);
+        for (value, escaped) in [("visible", "visible"), ("visible & important", "visible &amp; important")] {
+            let metrics = [Metric::with_value(&PLAIN_DEF, MetricValue::String(value.into()))];
+            let mut metrics_by_category = HashMap::default();
+            let _ = metrics_by_category.insert(MetricCategory::Metadata, vec![PLAIN_DEF.name]);
+            let mut metric_map = HashMap::default();
+            let _ = metric_map.insert(PLAIN_DEF.name, &metrics[0]);
 
-        assert!(write_metrics_category(&mut FailOnValue, MetricCategory::Metadata, &metrics_by_category, &metric_map).is_err());
+            assert!(
+                write_metrics_category(
+                    &mut FailOnValue(escaped),
+                    MetricCategory::Metadata,
+                    &metrics_by_category,
+                    &metric_map
+                )
+                .is_err(),
+                "writing the plain metric value {value:?} must return the writer error"
+            );
+        }
     }
 
     #[test]

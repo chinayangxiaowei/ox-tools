@@ -325,6 +325,7 @@ const fn is_operator(byte: u8) -> bool {
 }
 
 /// The end of the Rust identifier beginning at `at`.
+// #[gamma::skip(parameter.default_shadow, tag = "timeout", reason = "resetting at returns endpoints from the beginning of the text and repeatedly revisits identifiers")]
 fn identifier_end(text: &str, at: usize) -> Option<usize> {
     let mut characters = text.get(at..)?.char_indices();
     let (_, first) = characters.next()?;
@@ -339,13 +340,20 @@ fn identifier_end(text: &str, at: usize) -> Option<usize> {
             .take_while(|(_, character)| rustc_lexer::is_id_continue(*character))
             .last()
             // #[gamma::skip(all, reason = "corrupting the endpoint can move the outer scanner backward or leave it non-progressing")]
-            .map_or_else(|| at + first.len_utf8(), |(offset, character)| at + offset + character.len_utf8()),
+            .map_or_else(
+                || at + first.len_utf8(),
+                |(offset, character)| {
+                    // #[gamma::skip(arith.add_to_sub, tag = "timeout", reason = "subtracting an identifier offset or width can move the outer scanner backward and repeat the same identifier")]
+                    at + offset + character.len_utf8()
+                },
+            ),
     )
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use core::num::NonZeroUsize;
     use std::{env, fs};
 
     use camino::Utf8Path;
@@ -355,10 +363,218 @@ mod tests {
     use super::super::source_file::line_starts;
     use super::*;
 
+    #[test]
+    fn macro_token_else_markers_only_count_after_a_current_closing_block() {
+        for (text, limit) in [
+            ("m!((---else))", 3),
+            ("m!({} else (--1))", 4),
+            ("m!({} item-------else)", 3),
+            ("m!(({}) (else--1))", 5),
+            ("m!({{}} {else-------1})", 4),
+            ("m!({},-------else)", 3),
+        ] {
+            assert_eq!(beyond_limit(text, limit), None, "{text}");
+        }
+        let text = "m!({} else (---1))";
+        assert_eq!(beyond_limit(text, 4), text.rfind('-'));
+    }
+
+    #[test]
+    fn unmatched_closers_do_not_erase_the_root_else_ladder_budget() {
+        let prefix = format!("if ready {{}}{}", " else if ready {}".repeat(8));
+        assert_eq!(beyond_limit(&prefix, 2), None);
+        for closer in [')', ']'] {
+            let text = format!("{prefix}{closer} else {{}}");
+            assert_eq!(beyond_limit(&text, 2), Some(prefix.len() + 2), "{text}");
+        }
+    }
+
+    #[test]
+    fn exact_else_ladder_budget_resets_in_sibling_expressions_and_reused_delimiter_depths() {
+        fn ladder(links: NonZeroUsize) -> String {
+            format!("if a {{}} {}else {{}}", "else if a {} ".repeat(links.get() - 1))
+        }
+        let at_limit = ladder(NonZeroUsize::new(8).unwrap());
+        assert_eq!(beyond(&at_limit, &[], 2), None);
+        let excessive = ladder(NonZeroUsize::new(9).unwrap());
+        assert_eq!(beyond(&excessive, &[], 2), excessive.match_indices("else").nth(8).map(|(at, _)| at));
+        for separator in ["; ", ", ", " "] {
+            let siblings = format!("{at_limit}{separator}{at_limit}");
+            assert_eq!(beyond(&siblings, &[], 2), None, "{separator:?}");
+        }
+        let nested = ladder(NonZeroUsize::new(12).unwrap());
+        for text in [
+            format!("({nested}); ({nested})"),
+            format!("{{{nested}}} {{{nested}}}"),
+            format!("[{nested}], [{nested}]"),
+        ] {
+            assert_eq!(beyond(&text, &[], 3), None, "{text}");
+        }
+        let retained_outer_base = "{{----1}; 2---------1}";
+        assert_eq!(beyond(retained_outer_base, &[], 3), retained_outer_base.rfind('-'));
+    }
+
     fn beyond_limit(text: &str, limit: usize) -> Option<usize> {
         let comments = scan_comments(text, &line_starts(text));
 
         beyond(text, &comments, limit)
+    }
+
+    #[test]
+    fn nested_chain_diagnostics_keep_inherited_cost_after_comments_literals_and_closers() {
+        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+            let at_limit = format!("{open}{open}----1{close}{close}");
+            assert_eq!(beyond_limit(&at_limit, 3), None, "{at_limit}");
+            let overflow = format!("{open}{open}-----1{close}{close}");
+            assert_eq!(beyond_limit(&overflow, 3), Some(6), "{overflow}");
+            let after_close = format!("{open}{open}----1{close}+{close}");
+            assert_eq!(beyond_limit(&after_close, 3), Some(8), "{after_close}");
+            let after_both = format!("{open}{open}----1{close}{close}+");
+            assert_eq!(beyond_limit(&after_both, 3), Some(9), "{after_both}");
+            for ignored in ["/* [ ((( +++++ */", "// ] } +++++\n"] {
+                let text = format!("{open}{open}----{ignored}+1{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), Some(6 + ignored.len()), "{text}");
+            }
+            for literal in ["\"++++(]\"", "r##\"+++({\"##", "'+'"] {
+                let text = format!("{open}{open}----{literal}+{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), Some(6 + literal.len()), "{text}");
+            }
+            let byte_literal = format!("{open}{open}b'('----1{close}{close}");
+            assert_eq!(beyond_limit(&byte_literal, 3), None, "{byte_literal}");
+            let byte_literal = format!("{open}{open}b'('-----1{close}{close}");
+            assert_eq!(beyond_limit(&byte_literal, 3), Some(10), "{byte_literal}");
+            for separator in [";", ","] {
+                let text = format!("{open}{open}----1{separator}----2{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), None, "{text}");
+                let text = format!("{open}{open}----1{separator}-----2{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), Some(12), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_tokens_reset_paths_without_erasing_postfix_or_ladder_cost() {
+        for boundary in [" value ", " \"text\" ", " 7 "] {
+            let text = format!("++++1{boundary}+");
+            assert_eq!(beyond_limit(&text, 1), None, "{text}");
+        }
+        for operator in ["?", ">"] {
+            let text = format!("{operator}()");
+            assert_eq!(beyond_limit(&text, 1), Some(1), "{text}");
+        }
+        for punctuation in [":", "#", "@", "$", "'"] {
+            let text = format!("value{punctuation}()");
+            assert_eq!(beyond_limit(&text, 1), None, "{text}");
+        }
+        for text in ["++++1🦀+", "++++1 /* comment */ +", "++++1 // comment\n+"] {
+            assert_eq!(beyond_limit(text, 1), Some(text.len() - 1), "{text}");
+        }
+        assert_eq!(beyond_limit("else", 0), None);
+        assert_eq!(beyond_limit("if a {} else", 1), Some(8));
+        assert_eq!(beyond_limit("if a {} unrelated else", 1), None);
+        assert_eq!(beyond_limit("if a {} as T; else", 1), Some(8));
+        assert_eq!(beyond_limit("if a {}; else", 1), None);
+        assert_eq!(beyond_limit("if a {}, else", 1), None);
+    }
+
+    #[test]
+    fn nesting_helpers_retain_exact_depths_peaks_and_unicode_endpoints() {
+        let mut path = Vec::new();
+        let mut peak = Vec::new();
+        assert!(!link(&mut path, &mut peak, 2, 2));
+        assert_eq!(path, [0, 0, 1]);
+        assert_eq!(peak, [0, 0, 1]);
+        assert!(!link(&mut path, &mut peak, 2, 2));
+        assert!(link(&mut path, &mut peak, 2, 2));
+        assert_eq!(peak, [0, 0, 3]);
+        set(&mut path, 2, 1);
+        raise(&mut path, 2, 2);
+        raise(&mut path, 2, 1);
+        raise(&mut path, 4, 7);
+        assert_eq!(path, [0, 0, 2, 0, 7]);
+        let mut flags = Vec::new();
+        set_bool(&mut flags, 2, true);
+        set_bool(&mut flags, 2, false);
+        assert_eq!(flags, [false, false, false]);
+
+        for (text, at, expected) in [
+            ("xx café!", 3, Some(8)),
+            ("xx a!", 3, Some(4)),
+            ("xx αβ!", 3, Some(7)),
+            ("a", 1, None),
+            ("é", 1, None),
+            ("", 0, None),
+            ("+", 0, None),
+        ] {
+            assert_eq!(identifier_end(text, at), expected, "{text} at {at}");
+        }
+    }
+
+    #[test]
+    fn nesting_path_resets_and_postfix_boundaries_have_exact_offsets() {
+        for (text, expected) in [
+            ("++++", None),
+            ("+++++", Some(4)),
+            ("a()", Some(1)),
+            ("()", None),
+            ("()()", Some(2)),
+            ("[]", None),
+            ("[][]", Some(2)),
+            ("{{", Some(1)),
+            ("++++ {}", None),
+            ("++++ {}+", Some(7)),
+            ("++++ 1 \"x\" +", None),
+            ("++++ 1 value +", None),
+            ("++++ 1 2 +", None),
+            ("++++ 1;+", None),
+            ("++++ 1,+", None),
+            ("++++// ignored\n+", Some(15)),
+        ] {
+            assert_eq!(beyond_limit(text, 1), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn cast_and_else_ladder_limits_reset_only_at_real_path_boundaries() {
+        for limit in 2..=5 {
+            let links = limit * CHAIN_FACTOR;
+            let casts = format!("value{}", " as T".repeat(links));
+            assert_eq!(beyond_limit(&casts, limit), None, "{casts}");
+            let over = format!("{casts} as T");
+            assert_eq!(beyond_limit(&over, limit), Some(casts.len() + 1), "{over}");
+            for separator in [";", ","] {
+                let sibling = format!("{casts}{separator}{casts}");
+                assert_eq!(beyond_limit(&sibling, limit), None, "{sibling}");
+            }
+            let ladder = format!("if ready {{}}{}", " else if ready {}".repeat(links));
+            assert_eq!(beyond_limit(&ladder, limit), None, "{ladder}");
+            let over = format!("{ladder} else if ready {{}}");
+            assert_eq!(beyond_limit(&over, limit), Some(ladder.len() + 1), "{over}");
+            if limit >= 3 {
+                let nested = format!("{{{ladder}}}");
+                assert_eq!(beyond_limit(&nested, limit), None, "{nested}");
+                let nested_over = format!("{{{ladder} else if ready {{}}}}");
+                assert_eq!(beyond_limit(&nested_over, limit), Some(ladder.len() + 2), "{nested_over}");
+            }
+            for separator in [";", ",", " unrelated ", " as T;"] {
+                let siblings = format!("{ladder}{separator}{ladder}");
+                assert_eq!(beyond_limit(&siblings, limit), None, "{siblings}");
+            }
+            for delimiters in [("(", ")"), ("[", "]"), ("{", "}")] {
+                let balanced = format!("{}{}", delimiters.0.repeat(limit), delimiters.1.repeat(limit));
+                assert_eq!(beyond_limit(&balanced, limit), None, "{balanced}");
+                let over = delimiters.0.repeat(limit + 1);
+                assert_eq!(beyond_limit(&over, limit), Some(limit), "{over}");
+            }
+        }
+        for punctuation in [":", "#", "@", "$", "'"] {
+            let text = format!("value{punctuation}()");
+            assert_eq!(beyond_limit(&text, 1), None, "{text}");
+        }
+        for operator in ["?", ">"] {
+            let text = format!("value{operator}()");
+            assert_eq!(beyond_limit(&text, 1), Some("value?".len()), "{text}");
+        }
     }
 
     #[test]

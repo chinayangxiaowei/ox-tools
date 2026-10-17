@@ -88,6 +88,14 @@ pub fn run<H: Host>(host: &mut H, args: impl IntoIterator<Item = impl Into<OsStr
 /// Split out of [`run`] only so that the catch has a single call to wrap, which keeps the `?`-less
 /// early returns below readable.
 fn dispatched<H: Host>(host: &mut H, args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> i32 {
+    dispatched_with(host, args, dispatch)
+}
+
+fn dispatched_with<H: Host>(
+    host: &mut H,
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+    execute: impl FnOnce(&mut H, Cli, Styler) -> crate::Result<i32>,
+) -> i32 {
     let normalized = normalize(args);
 
     let cli = match Cli::try_parse_from(normalized) {
@@ -111,7 +119,7 @@ fn dispatched<H: Host>(host: &mut H, args: impl IntoIterator<Item = impl Into<Os
 
     let styler = Styler::new(cli.color.resolve(host.is_terminal()));
 
-    let code = match dispatch(host, cli, styler) {
+    let code = match execute(host, cli, styler) {
         Ok(code) => code,
 
         Err(cause) => {
@@ -125,6 +133,7 @@ fn dispatched<H: Host>(host: &mut H, args: impl IntoIterator<Item = impl Into<Os
         }
     };
 
+    // #[gamma::skip(call_result.default, reason = "say_notes returns unit and this mutator still emits the same notes before replacing unit with unit")]
     say_notes(host, styler);
 
     code
@@ -168,6 +177,7 @@ fn normalize(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> Vec
         normalized.insert(1, "run".into());
     }
 
+    // #[gamma::skip(call_result.default, reason = "normalize_list_mode returns unit and this mutator still normalizes the same arguments before replacing unit with unit")]
     normalize_list_mode(&mut normalized);
 
     normalized
@@ -215,8 +225,10 @@ fn subcommand_index(args: &[OsString]) -> Option<usize> {
         {
             index += 1;
         } else if GLOBAL_OPTIONS.contains(&first) {
+            // #[gamma::skip(stmt.delete_assign, literal.int_to_zero, tag = "timeout", reason = "the global-option scan must consume the option and value to make progress")]
             index += 2;
         } else {
+            // #[gamma::skip(loop.break_to_continue, loop.delete_break, tag = "timeout", reason = "an unrecognized argument ends this scan; continuing revisits the same argument forever")]
             break;
         }
     }
@@ -302,10 +314,12 @@ pub(super) fn dispatch<H: Host>(host: &mut H, cli: Cli, styler: Styler) -> crate
     match cli.command {
         Command::Run(mut args) => {
             configure(host, &mut args, styler)?;
-            check_shard(&args.select)?;
+            check_run_shard(&args)?;
 
             #[cfg(target_os = "linux")]
-            if let Some(code) = relaunch_for_memory_control(host, &args) {
+            if !args.resume_testing
+                && let Some(code) = relaunch_for_memory_control(host, &args)
+            {
                 return Ok(code);
             }
 
@@ -333,6 +347,13 @@ pub(super) fn dispatch<H: Host>(host: &mut H, cli: Cli, styler: Styler) -> crate
 
         Command::Completions(args) => Ok(completions(host, &args)),
     }
+}
+
+fn check_run_shard(args: &super::cli::RunArgs) -> crate::Result<()> {
+    if args.resume_testing {
+        return Ok(());
+    }
+    check_shard(&args.select)
 }
 
 /// Checks the settings that can arrive half from the command line and half from the file.
@@ -495,6 +516,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn survivor_dispatch_propagates_run_unsuppress_configuration_and_unsuppress_shard_errors() {
+        let fixtures = camino::Utf8Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let invalid = fixtures.join("dispatch-invalid.txt");
+        for command in ["run", "unsuppress"] {
+            let cli = Cli::try_parse_from(normalize([
+                "cargo-gamma",
+                command,
+                "--dir",
+                fixtures.as_str(),
+                "--config",
+                invalid.as_str(),
+            ]))
+            .expect("the command line itself is valid");
+            let error = dispatch(&mut crate::testing::Sink::default(), cli, Styler::new(false))
+                .expect_err("malformed configuration must return before discovery or execution");
+            assert!(error.is_usage());
+            assert_eq!(error.message(), format!("{invalid}: unclosed array, expected `]`"));
+        }
+        let valid = fixtures.join("dispatch-valid.txt");
+        let cli = Cli::try_parse_from(normalize([
+            "cargo-gamma",
+            "unsuppress",
+            "--dir",
+            fixtures.as_str(),
+            "--config",
+            valid.as_str(),
+            "--shard-count",
+            "2",
+        ]))
+        .expect("a partial shard is validated after configuration folding");
+        let error = dispatch(&mut crate::testing::Sink::default(), cli, Styler::new(false))
+            .expect_err("a shard count without an index is an ordinary usage error");
+        assert!(error.is_usage());
+        assert_eq!(
+            error.to_string(),
+            "a shard count of 2 was set without a shard index; a shard is both, so pass `--shard-index` or set `index` in the `[shard]` table"
+        );
+    }
+
+    #[test]
+    fn survivor_dispatch_errors_keep_the_error_prefix_and_drained_notes_keep_requested_warning_color() {
+        let mut host = crate::testing::Sink::default();
+        assert_eq!(
+            dispatched_with(&mut host, ["cargo-gamma", "--color", "never", "clean"], |_, cli, _| {
+                assert!(matches!(cli.command, Command::Clean(_)));
+                Err(crate::error::error!("scripted dispatch failure"))
+            }),
+            EXIT_CANNOT_PROCEED
+        );
+        assert_eq!(host.err(), "error: scripted dispatch failure\n");
+        let notes = crate::notes::Run::new();
+        let _scope = crate::notes::enter(Some(&notes));
+        crate::notes::note("leftover report");
+        let mut host = crate::testing::Sink::default().terminal(80);
+        say_notes(&mut host, Styler::new(true));
+        assert!(host.err().contains("\x1b["), "{}", host.err());
+        assert_eq!(host.err(), format!("{} leftover report\n", Styler::new(true).warning()));
+        assert!(crate::notes::drain().is_empty(), "notes are emitted exactly once");
+    }
+
     /// A crate small enough to enumerate mutants in, with whatever configuration the test needs.
     fn crate_dir(name: &str, config: Option<&str>) -> tempfile::TempDir {
         let (dir, root) = crate::fixtures::crate_dir(name, "pub fn less(a: i32, b: i32) -> bool { a < b }\n");
@@ -539,6 +621,25 @@ mod tests {
             assert!(host.err().contains("--shard-index"), "{}", host.err());
             assert!(host.out().is_empty(), "a rejected shard listed mutants anyway: {}", host.out());
         });
+    }
+
+    #[test]
+    fn resumed_runs_ignore_live_shards_but_fresh_runs_validate_them() {
+        let mut args = super::super::cli::RunArgs {
+            resume_testing: true,
+            select: SelectArgs {
+                shard_count: Some(2),
+                ..SelectArgs::default()
+            },
+            ..super::super::cli::RunArgs::default()
+        };
+        check_run_shard(&args).expect("resume uses the saved shard rather than the incomplete live pair");
+        args.resume_testing = false;
+        let error = check_run_shard(&args).expect_err("fresh runs require the missing shard index");
+        assert!(error.is_usage());
+        assert_eq!(error.to_string(), check_shard(&args.select).unwrap_err().to_string());
+        args.select.shard_index = Some(1);
+        check_run_shard(&args).expect("the complete fresh-run shard is valid");
     }
 
     #[test]
@@ -972,5 +1073,43 @@ mod tests {
             normalize(["cargo-gamma", "gamma", "--progress=never", "--mutators", "relational"]),
             vec!["cargo-gamma", "run", "--progress=never", "--mutators", "relational"]
         );
+    }
+}
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod normalization_regressions {
+    use super::*;
+    #[test]
+    fn survivor_global_equals_options_and_every_explicit_list_mode_keep_their_argument_positions() {
+        for mode in ["mutants", "files", "mutators", "presets"] {
+            for prefix in [
+                vec!["cargo-gamma"],
+                vec!["cargo-gamma", "--color=never"],
+                vec!["cargo-gamma", "--color", "never"],
+            ] {
+                let mut input = prefix;
+                input.extend(["list", mode]);
+                let expected = input.iter().map(OsString::from).collect::<Vec<_>>();
+                assert_eq!(normalize(input), expected);
+            }
+        }
+        for (args, expected) in [
+            (vec!["cargo-gamma"], None),
+            (vec!["cargo-gamma", "--color=never"], None),
+            (vec!["cargo-gamma", "--color=never", "list"], Some(2)),
+            (vec!["cargo-gamma", "--color=always", "--color=never", "list"], Some(3)),
+            (vec!["cargo-gamma", "--colorful=never", "list"], Some(1)),
+        ] {
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert_eq!(subcommand_index(&args), expected);
+        }
+        for (args, expected) in [
+            (vec!["--color=never", "--jobs", "2"], true),
+            (vec!["--color=never", "merge"], false),
+            (vec!["--color=never", "--help"], false),
+            (vec!["--colorxnever", "merge"], true),
+        ] {
+            assert_eq!(implies_run(&args.into_iter().map(OsString::from).collect::<Vec<_>>()), expected);
+        }
     }
 }

@@ -58,6 +58,7 @@ fn parse_file(mut reader: impl BufRead, source: &Arc<str>, records: &mut Vec<Jso
         let read = reader
             .read_until(b'\n', &mut bytes)
             .map_err(|error| JsonLinesFileReadError::caused_by(source.to_string(), error))?;
+        // #[gamma::skip(cond.always_false, tag = "timeout", reason = "ignoring EOF retries read_until on the exhausted reader forever; campaign log 4539")]
         if read == 0 {
             return Ok(());
         }
@@ -99,6 +100,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_reader_errors_and_parse_line_numbers_are_preserved() {
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected reader failure"))
+            }
+        }
+        impl std::io::BufRead for FailingReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Err(std::io::Error::other("injected reader failure"))
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        let source: Arc<str> = Arc::from("campaign.jsonl");
+        let mut records = Vec::new();
+        let error = parse_file(FailingReader, &source, &mut records).expect_err("reader failure must be returned");
+        assert!(error.to_string().contains("campaign.jsonl"), "{error}");
+        let error = parse_file(std::io::Cursor::new("\n\n{bad\n"), &source, &mut records).expect_err("line three contains invalid JSON");
+        assert!(error.to_string().contains("line 3,"), "{error}");
+        assert!(records.is_empty());
+        let error = parse_file(std::io::Cursor::new("{}\n\u{feff}{}\n"), &source, &mut records)
+            .expect_err("only the first line may start with a BOM");
+        assert!(error.to_string().contains("line 2,"), "{error}");
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore = "uses temporary files; Miri isolation forbids filesystem access")]
     fn inline_and_file_records_preserve_source_order_and_duplicates() {
         let temp = tempfile::tempdir().expect("temporary directory");
@@ -131,6 +159,23 @@ mod tests {
 
         let array = load(&["[]".to_owned()], &[]).expect_err("array records must fail").to_string();
         assert!(array.contains("must be an object"));
+    }
+
+    #[test]
+    fn non_object_records_report_their_exact_physical_line() {
+        let source: Arc<str> = Arc::from("shapes.jsonl");
+        for value in ["[]", "null", "42", "\"text\"", "true"] {
+            let mut records = Vec::new();
+            let input = format!("\n{{\"name\":\"kept\"}}\n{value}\n{{\"name\":\"unread\"}}\n");
+
+            let error = parse_file(std::io::Cursor::new(input), &source, &mut records)
+                .expect_err("each scalar or array must be rejected as a record");
+
+            assert_eq!(error.to_string(), "JSON record in shapes.jsonl at line 3 must be an object");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].fields["name"], "kept");
+            assert_eq!(records[0].line, 2);
+        }
     }
 
     #[test]
