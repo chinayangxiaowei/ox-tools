@@ -1232,7 +1232,7 @@ impl ProcessTree {
     pub fn observe(&mut self) -> io::Result<Option<ExitStatus>> {
         #[cfg(target_os = "macos")]
         if let Some(sampler) = self.sampler.as_mut() {
-            sampler.check()?;
+            sampler.check().map_err(|cause| sampler_failure(&cause))?;
         }
 
         let mut child = self
@@ -1270,7 +1270,7 @@ impl ProcessTree {
                 && let Err(cause) = sampler.finish(true)
             {
                 self.child = Some(child);
-                return Err(cause);
+                return Err(sampler_failure(&cause));
             }
 
             match cleanup_after_observation(
@@ -1373,11 +1373,6 @@ impl ProcessTree {
     /// failure takes precedence over the sweep failure after both cleanup attempts complete.
     fn kill(&self, child: &mut Child) -> io::Result<()> {
         #[cfg(target_os = "macos")]
-        if self.sampler.as_ref().is_some_and(Sampler::swept) {
-            return Ok(());
-        }
-
-        #[cfg(target_os = "macos")]
         {
             let pid = child.id();
             kill_with_observation(
@@ -1458,7 +1453,7 @@ impl ProcessTree {
         reap: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
         let reaped = self.finish_termination(killed, reap)?;
-        sampled.map_err(|cause| io::Error::new(cause.kind(), format!("the memory sampler failed: {cause}")))?;
+        sampled.map_err(|cause| sampler_failure(&cause))?;
         Ok(reaped)
     }
 
@@ -1839,6 +1834,12 @@ fn kill_if_running(child: &mut Child) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(kill_error) => resolve_kill_failure(kill_error, &child.try_wait()),
     }
+}
+
+/// Names the memory sampler as the source of an accounting failure, preserving its error kind.
+#[cfg(target_os = "macos")]
+fn sampler_failure(cause: &io::Error) -> io::Error {
+    io::Error::new(cause.kind(), format!("the memory sampler failed: {cause}"))
 }
 
 fn reaped_after_cleanup<T>(reaped: io::Result<T>, killed: io::Result<()>) -> io::Result<T> {
