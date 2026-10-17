@@ -74,10 +74,16 @@ been scanned, the complete population is instrumented and handed to global
 schema convergence.
 
 Schema convergence first checks normal libraries, binaries, and test targets
-for every package with pending mutations. Compiler diagnostics are decoded
-with package and target context; unattributed failures use bounded,
-target-specific proof checks over the failing package's dependency cone. `build/isolation.rs`
-owns diagnostic contexts, tier construction, invocation-wide context/proof budgets, exact active
+for every package with pending mutations. Cargo metadata identifies which
+selected packages have library targets. If none do, the check uses `--bins --tests`
+without `--lib`. A mixed selection keeps `--lib --bins --tests`: Cargo accepts
+the selectors because at least one selected package has a library, and checks
+all available targets under one feature graph. No manifests or sources are
+added for this choice.
+Compiler diagnostics are decoded with package and target context; unattributed
+failures use bounded, target-specific proof checks over the failing package's
+dependency cone. `build/isolation.rs` owns diagnostic contexts, tier construction,
+invocation-wide context/proof budgets, exact active
 schemas, package-root and target selection, memoized proof verdicts, and interaction minimization. A context is charged to the
 invocation budget only after tier construction finds a nonempty tier within the candidate bound.
 `build.rs` snapshots all
@@ -112,6 +118,9 @@ replacement uses Fx-keyed tables;
 canonical sorting and reach-set interning restore deterministic output before
 publication. Identical generalized generations merge without duplicating reach
 clusters, and no-op promotion preserves the original generation metadata.
+Compact record encoding resolves references by binary search in the sorted
+identity pools, using the same comparators for sorting and lookup. Pool order,
+reference indices, and serialized bytes remain unchanged.
 
 Completed ledgers persist the latest campaign population separately from their
 accumulated outcome files. Narrow campaigns can therefore retain unchanged
@@ -144,6 +153,22 @@ Loom models cover reader-accounting races with the smallest actor sets that
 create contention. Test-only command pauses synchronize on channels rather
 than elapsed time. Last-resort watchdogs are disabled under cargo-gamma so
 mutation campaign supervision, rather than a test deadline, classifies hangs.
+
+## Sweep scheduling
+
+The scheduler keeps pending cold and informed priorities in per-item/package
+queues. Each group contributes an idle and active head to its file/package
+queues; package queues index only the current file heads. File contention is
+applied when publishing those heads, not by rekeying every mutant in the file.
+A claim or release updates the affected item groups and file/package heads.
+Learning converts the remaining cold priorities once, and completed groups
+leave the resource-selection frontier.
+
+Resource-blocked selection searches pending item queues for the best eligible
+alternative. Regression tests compare indexed selection with full-scan
+selection across claims, out-of-order releases, shared items/packages, learning,
+and resource constraints. Work-count assertions guard against repeated
+whole-file population updates.
 
 ## Testing progress
 
