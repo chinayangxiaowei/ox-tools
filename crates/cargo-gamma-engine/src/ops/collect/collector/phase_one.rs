@@ -111,6 +111,7 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     /// any of them.
     fn visit_item(&mut self, node: &'ast Item) {
         if !self.cfg.skip_gate(item_attrs(node)) {
+            self.walk.on_local_attributes(item_attrs(node));
             visit::visit_item(self, node);
         }
     }
@@ -153,6 +154,10 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     /// discards, and that evidence would then answer for the `n` the build actually has.
     fn visit_stmt(&mut self, node: &'ast Stmt) {
         if !self.cfg.skip_gate(stmt_attrs(node)) {
+            self.walk.on_local_attributes(stmt_attrs(node));
+            if matches!(node, Stmt::Expr(Expr::Macro(_), _)) {
+                self.walk.on_opaque_macro();
+            }
             visit::visit_stmt(self, node);
         }
     }
@@ -161,14 +166,36 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     /// ones it does not admit yet, exactly as the collector's own `visit_expr` does.
     fn visit_expr(&mut self, node: &'ast Expr) {
         if !self.cfg.skip_gate(expr_attrs(node)) {
+            self.walk.on_local_attributes(expr_attrs(node));
             visit::visit_expr(self, node);
         }
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.audit.on_item_fn(node);
+        self.walk.on_item_fn(node);
         self.walk.signature(&node.sig);
         visit::visit_item_fn(self, node);
+    }
+
+    fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+        self.walk.on_pat_ident(node);
+        visit::visit_pat_ident(self, node);
+    }
+
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        self.walk.on_opaque_macro();
+        visit::visit_item_macro(self, node);
+    }
+
+    fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
+        self.walk.on_item_extern_crate(node);
+        visit::visit_item_extern_crate(self, node);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        self.walk.on_opaque_macro();
+        visit::visit_stmt_macro(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
@@ -191,6 +218,16 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     fn visit_item_struct(&mut self, node: &'ast ItemStruct) {
         self.walk.on_item_struct(node);
         visit::visit_item_struct(self, node);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        self.walk.shadow_type(&node.ident);
+        visit::visit_item_enum(self, node);
+    }
+
+    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        self.walk.shadow_type(&node.ident);
+        visit::visit_item_union(self, node);
     }
 
     fn visit_item_mod(&mut self, node: &'ast ItemMod) {
@@ -218,11 +255,13 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     }
 
     fn visit_item_const(&mut self, node: &'ast ItemConst) {
+        self.walk.on_value_name(&node.ident);
         self.walk.declared(&node.ident.to_string(), &node.ty);
         visit::visit_item_const(self, node);
     }
 
     fn visit_item_static(&mut self, node: &'ast ItemStatic) {
+        self.walk.on_value_name(&node.ident);
         self.walk.declared(&node.ident.to_string(), &node.ty);
         visit::visit_item_static(self, node);
     }
@@ -230,6 +269,16 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
     fn visit_impl_item_const(&mut self, node: &'ast ImplItemConst) {
         self.walk.declared(&node.ident.to_string(), &node.ty);
         visit::visit_impl_item_const(self, node);
+    }
+
+    fn visit_foreign_item_fn(&mut self, node: &'ast syn::ForeignItemFn) {
+        self.walk.on_value_name(&node.sig.ident);
+        visit::visit_foreign_item_fn(self, node);
+    }
+
+    fn visit_foreign_item_static(&mut self, node: &'ast syn::ForeignItemStatic) {
+        self.walk.on_value_name(&node.ident);
+        visit::visit_foreign_item_static(self, node);
     }
 
     fn visit_trait_item_const(&mut self, node: &'ast TraitItemConst) {
@@ -262,6 +311,249 @@ impl<'ast> Visit<'ast> for PhaseOne<'_> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_recursive_children_and_method_receiver_evidence_are_independent() {
+        let file = SourceFile::parse(
+            "fixture.rs",
+            "type Bytes = [u8; alias_left - alias_right]; \
+             unsafe extern \"C\" { \
+                 fn foreign(value: [u8; argument_left - argument_right]); \
+                 static FOREIGN: [u8; static_left - static_right]; \
+             } \
+             fn f() { let _ = values[index_left - index_right]; \
+                 value.abs(); receiver.method(method_left - method_right); }"
+                .into(),
+        )
+        .unwrap();
+        let cfg = CfgSet::unconditional();
+        let found = run(&file, &Selection::everything(), &cfg).unwrap();
+        for name in [
+            "alias_left",
+            "alias_right",
+            "argument_left",
+            "argument_right",
+            "static_left",
+            "static_right",
+            "index_left",
+            "index_right",
+            "value",
+            "method_left",
+            "method_right",
+        ] {
+            assert!(found.numeric_uses.names.contains(name), "{name}");
+        }
+        assert!(!found.numeric_uses.names.contains("receiver"));
+        assert!(!found.numeric_uses.names.contains("values"));
+    }
+
+    #[test]
+    fn fused_and_standalone_prepasses_have_independent_declaration_and_effect_oracles() {
+        let text = r"
+            use std::time as clock;
+            use clock::Duration;
+            use clock::Duration;
+            use dependency::*;
+            extern crate external as imported;
+            fn imported() {}
+            fn constant() {}
+            fn static_value() {}
+            fn foreign_function() {}
+            fn foreign_static() {}
+            fn Record() {}
+            fn shadowed() {}
+            const constant: u8 = 7;
+            static static_value: u16 = 8;
+            unsafe extern 'C' {
+                fn foreign_function();
+                static foreign_static: u32;
+            }
+            struct Record { #[cfg(any())] absent: u32, kept: u8 }
+            struct Conflict { kept: bool }
+            struct Again { kept: u16 }
+            type Alias<T> = Option<T>;
+            impl Record {
+                const ASSOCIATED: usize = 2;
+                #[cfg(any())] const HIDDEN_IMPL: usize = 2;
+                fn method(value: u64) -> u32 { let _ = impl_left - impl_right; value as u32 }
+            }
+            trait Behavior {
+                #[cfg(any())] const HIDDEN_TRAIT: usize = 2;
+                fn method_body(value: u16) -> u8 { let _ = trait_left - trait_right; value as u8 }
+            }
+            fn walk(values: &[u8], index: usize) {
+                let outer @ shadowed = value;
+                let _ = values[index - lower..upper.abs()];
+                let _ = #[cfg(any())] (skipped - 1);
+            }
+            mod nested { fn inside() {} }
+            fn after() {}
+        "
+        .replace("'C'", "\"C\"");
+        let file = SourceFile::parse("fixture.rs", text).unwrap();
+        let cfg = CfgSet::parse("");
+        let selection = Selection::everything();
+        let fused = run(&file, &selection, &cfg).unwrap();
+        assert_eq!(fused.returns.get("method"), Some(&Some(syn::parse_quote!(u32))));
+        assert_eq!(fused.parameters.get("method"), Some(&Some(vec![syn::parse_quote!(u64)])));
+        assert_eq!(fused.returns.get("method_body"), Some(&Some(syn::parse_quote!(u8))));
+        assert_eq!(fused.parameters.get("method_body"), Some(&Some(vec![syn::parse_quote!(u16)])));
+        for indexes in [fused, super::super::indexes::indexes_in(&file.ast, &selection, &cfg)] {
+            assert_eq!(
+                indexes.root_imports.get("Duration"),
+                Some(&Some(vec!["std".into(), "time".into(), "Duration".into()]))
+            );
+            assert_eq!(indexes.root_imports.get("*"), Some(&None));
+            assert_eq!(indexes.root_imports.get("imported"), Some(&Some(vec!["external".into()])));
+            assert_eq!(indexes.fields.get("kept"), Some(&false));
+            assert!(!indexes.fields.contains_key("absent"));
+            assert_eq!(indexes.constants.get("ASSOCIATED"), Some(&true));
+            assert!(!indexes.constants.contains_key("HIDDEN_IMPL"));
+            assert!(!indexes.constants.contains_key("HIDDEN_TRAIT"));
+            assert!(indexes.aliases.contains_key("Alias"));
+            for name in ["index", "lower", "upper", "impl_left", "impl_right", "trait_left", "trait_right"] {
+                assert!(indexes.numeric_uses.names.contains(name), "{name}");
+            }
+            assert!(!indexes.numeric_uses.names.contains("skipped"));
+            let empty_imports = crate::HashMap::default();
+            for name in [
+                "imported",
+                "constant",
+                "static_value",
+                "foreign_function",
+                "foreign_static",
+                "Record",
+                "shadowed",
+            ] {
+                assert!(
+                    !indexes
+                        .local_calls
+                        .returns_unit(&syn::parse_str(name).unwrap(), &Vec::new(), &empty_imports),
+                    "{name}"
+                );
+            }
+            assert!(
+                indexes
+                    .local_calls
+                    .returns_unit(&syn::parse_quote!(after), &Vec::new(), &empty_imports)
+            );
+        }
+    }
+
+    #[test]
+    fn prepasses_mark_only_the_lexical_macro_or_transforming_attribute_scope_opaque() {
+        for statement in [
+            "opaque!();",
+            "#[transform] let value = 1;",
+            "#[transform] struct Local;",
+            "#[transform] { 1 };",
+        ] {
+            let file = SourceFile::parse(
+                "fixture.rs",
+                format!("fn unit() {{}} fn affected() {{ {statement} }} fn clean() {{ unit(); }}"),
+            )
+            .unwrap();
+            let Item::Fn(affected) = &file.ast.items[1] else {
+                panic!("fixture function")
+            };
+            let Item::Fn(clean) = &file.ast.items[2] else {
+                panic!("fixture function")
+            };
+            let affected_scope = vec![super::super::indexes::block_id(&affected.block)];
+            let clean_scope = vec![super::super::indexes::block_id(&clean.block)];
+            let cfg = CfgSet::unconditional();
+            let selection = Selection::everything();
+            for indexes in [
+                run(&file, &selection, &cfg).unwrap(),
+                super::super::indexes::indexes_in(&file.ast, &selection, &cfg),
+            ] {
+                assert!(!indexes.local_calls.scope_is_transparent(&affected_scope), "{statement}");
+                assert!(indexes.local_calls.scope_is_transparent(&clean_scope), "{statement}");
+                assert!(
+                    !indexes
+                        .local_calls
+                        .returns_unit(&syn::parse_quote!(unit), &affected_scope, &crate::HashMap::default())
+                );
+                assert!(
+                    indexes
+                        .local_calls
+                        .returns_unit(&syn::parse_quote!(unit), &clean_scope, &crate::HashMap::default())
+                );
+            }
+        }
+        let mut file = SourceFile::parse("fixture.rs", "fn f() {} fn clean() {}".into()).unwrap();
+        let Item::Fn(function) = &mut file.ast.items[0] else {
+            panic!("fixture function")
+        };
+        function.block.stmts.push(Stmt::Expr(syn::parse_quote!(opaque!()), None));
+        let scope = vec![super::super::indexes::block_id(&function.block)];
+        let cfg = CfgSet::unconditional();
+        let selection = Selection::everything();
+        for indexes in [
+            run(&file, &selection, &cfg).unwrap(),
+            super::super::indexes::indexes_in(&file.ast, &selection, &cfg),
+        ] {
+            assert!(!indexes.local_calls.scope_is_transparent(&scope));
+        }
+    }
+
+    #[test]
+    fn fused_and_standalone_indexes_agree_across_gates_and_lexical_scopes() {
+        let source = r"
+            use std::{time::Duration, vec::Vec};
+            type Count = usize;
+            struct Record { size: usize, #[cfg(not(unix))] disabled: bool }
+            const LIMIT: usize = 4;
+            static FLAG: bool = true;
+            fn scalar(value: usize) -> usize { value }
+            fn walk(values: &[u8], offset: usize) {
+                let _ = values[offset..LIMIT];
+                let _ = offset.saturating_add(1);
+                let _ = offset + 1;
+                { use core::num::NonZeroU32; let _ = NonZeroU32::new(1); }
+                for i in 0..LIMIT { scalar(i); }
+            }
+            mod nested {
+                use std::collections::HashSet;
+                type Set = HashSet<u8>;
+                fn inside(value: u8) -> bool { value > 0 }
+            }
+            #[cfg(not(unix))] mod absent { const DISABLED: usize = 1; }
+            #[cfg(test)] mod tests { struct TestRecord { test_only: usize } }
+        ";
+        let file = SourceFile::parse("fixture.rs", source.to_owned()).unwrap();
+        let cfg = CfgSet::parse("unix");
+        for selectors in [
+            "relational",
+            "fn_value",
+            "expr.increment",
+            "call_result.default",
+            "parameter.default_shadow",
+            "all",
+        ] {
+            let selection = Selection::parse(selectors).unwrap();
+            let fused = run(&file, &selection, &cfg).unwrap();
+            let standalone = super::super::indexes::indexes_in(&file.ast, &selection, &cfg);
+            assert_eq!(fused.fields, standalone.fields, "{selectors}");
+            assert_eq!(fused.imports, standalone.imports, "{selectors}");
+            assert_eq!(fused.root_imports, standalone.root_imports, "{selectors}");
+            assert_eq!(fused.scope_imports, standalone.scope_imports, "{selectors}");
+            assert_eq!(fused.constants, standalone.constants, "{selectors}");
+            assert_eq!(fused.declared_types, standalone.declared_types, "{selectors}");
+            assert_eq!(fused.returns, standalone.returns, "{selectors}");
+            assert_eq!(fused.parameters, standalone.parameters, "{selectors}");
+            assert!(fused.aliases == standalone.aliases, "{selectors}");
+            assert!(fused.scope_aliases == standalone.scope_aliases, "{selectors}");
+            assert_eq!(fused.numeric_uses.names, standalone.numeric_uses.names, "{selectors}");
+            assert_eq!(
+                fused.numeric_uses.unsigned_names, standalone.numeric_uses.unsigned_names,
+                "{selectors}"
+            );
+            assert_eq!(fused.numeric_uses.fields, standalone.numeric_uses.fields, "{selectors}");
+            assert!(!fused.constants.contains_key("DISABLED"));
+            assert!(!fused.fields.contains_key("test_only"));
+        }
+    }
 
     fn run_source(source: &str, selection: &str, cfg: &CfgSet) -> Result<Indexes> {
         let file = SourceFile::parse("fixture.rs", source.to_owned()).expect("the fixture parses");
@@ -321,6 +613,40 @@ mod tests {
         );
         assert!(indexes.aliases.contains_key("Count"));
         assert!(indexes.numeric_uses.names.contains("index"));
+    }
+
+    #[test]
+    fn opaque_macros_foreign_names_and_shadow_types_reach_both_index_walks() {
+        let source = r#"
+            extern crate other as external;
+            enum Choice { First, Second }
+            union Storage { value: u32, alternate: f32 }
+            macro_rules! define { () => {} }
+            unsafe extern "C" {
+                fn foreign();
+                static FOREIGN_VALUE: u32;
+            }
+            fn local() {}
+            fn caller() { define!(); local(); }
+        "#;
+        let file = SourceFile::parse("fixture.rs", source.to_owned()).unwrap();
+        let selection = Selection::everything();
+        let cfg = CfgSet::unconditional();
+        let fused = run(&file, &selection, &cfg).unwrap();
+        let standalone = super::super::indexes::indexes_in(&file.ast, &selection, &cfg);
+        for indexes in [&fused, &standalone] {
+            assert!(!indexes.local_calls.scope_is_transparent(&Vec::new()));
+            assert!(
+                !indexes
+                    .local_calls
+                    .returns_unit(&syn::parse_quote!(foreign), &Vec::new(), &crate::HashMap::default())
+            );
+            let aliases = indexes.scope_aliases.get(&Vec::new()).expect("root declarations are indexed");
+            assert!(matches!(aliases.get("Choice"), Some(None)));
+            assert!(matches!(aliases.get("Storage"), Some(None)));
+        }
+        assert_eq!(fused.imports, standalone.imports);
+        assert!(fused.aliases == standalone.aliases);
     }
 
     #[test]
