@@ -29,7 +29,7 @@ const BINARIES_METADATA_FILE: &str = "nextest-binaries.json";
 const CARGO_METADATA_FILE: &str = "nextest-metadata.json";
 
 /// The metadata that lets nextest run a tree it did not build, and the ids it knows the binaries by.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Harness {
     /// Where the binaries nextest may run are described.
     binaries: Utf8PathBuf,
@@ -43,6 +43,49 @@ pub(super) struct Harness {
     /// the tree rather than a fact about any mutant; [`Harness::id`] reports it as an error rather
     /// than silently running the whole suite in its place.
     ids: HashMap<Utf8PathBuf, String>,
+}
+
+impl Harness {
+    pub(super) fn testing_paths(&self) -> [&Utf8Path; 2] {
+        [&self.binaries, &self.metadata]
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod final_survivor_tests {
+    use super::*;
+
+    #[test]
+    fn leading_progress_indentation_is_discarded_before_identifying_the_first_failure() {
+        let output = " \tPASS [0.1s] binary ignored\n \tFAIL [0.2s] (2/3) binary first::failed \t\nFAIL [0.3s] binary later::failed\n";
+        assert_eq!(first_failure(output), Some("first::failed"));
+    }
+
+    #[test]
+    fn narrowed_nextest_commands_cannot_turn_an_empty_selection_into_a_pass() {
+        let root = Utf8PathBuf::from(if cfg!(windows) { "C:/nextest-policy" } else { "/nextest-policy" });
+        let work = Workspace::adopt(root.clone(), root.join("target"));
+        let binary = crate::testing::test_binary("subject-binary");
+        let harness = Harness::fake(&[("subject-binary", "subject::tests")]);
+        assert_eq!(
+            harness.testing_paths(),
+            [Utf8Path::new("/t/binaries.json"), Utf8Path::new("/t/metadata.json")]
+        );
+        for only in [&[][..], &["suite::one"][..]] {
+            let command = harness.command(&work, &binary, only, true, true).unwrap();
+            let arguments = command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                arguments.iter().filter(|argument| *argument == "--no-tests").count(),
+                usize::from(only.is_empty())
+            );
+            assert!(arguments.iter().any(|argument| argument == "--fail-fast"));
+            assert!(arguments.windows(2).any(|pair| pair == ["--test-threads", "1"]));
+        }
+    }
 }
 
 impl Harness {
