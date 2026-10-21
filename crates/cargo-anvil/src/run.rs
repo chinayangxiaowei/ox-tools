@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::{env, io};
 
-use ohno::{AppError, bail};
+use ohno::{AppError, app_err, bail};
 use tracing::info;
 
 use crate::anvil::artifacts;
@@ -28,8 +28,8 @@ use crate::plan::{Plan, PlanItem, Target};
 #[cfg(test)]
 use crate::region::upsert_region;
 use crate::region::{
-    CommentSyntax, MarkerRepair, RegionPlacement, find_region, legacy_lint_region_id, lint_region_placement, managed_region_ids,
-    remove_region, repair_markers,
+    CommentSyntax, HostScanner, MarkerRepair, RegionPlacement, find_region, legacy_lint_region_id, lint_region_placement,
+    raw_marker_line_present, remove_region, xml_comment_scan_failed, xml_document_root,
 };
 use crate::workspace::{self, Workspace};
 
@@ -73,15 +73,54 @@ fn run_with_current_dir(catalog: &Catalog, cli: &Cli, current_dir: io::Result<Pa
 /// Propagates errors from any subsystem (workspace discovery, manifest
 /// I/O, emitter, plan application).
 pub fn run_update(catalog: &Catalog, args: &Cli, start_dir: &Path) -> Result<RunOutcome, AppError> {
-    let repo_root = workspace::find_workspace_root(start_dir)?;
-    let manifest = Manifest::load(&repo_root)?;
+    run_update_with(
+        catalog,
+        args,
+        start_dir,
+        |start| {
+            let root = workspace::find_workspace_root(start)?;
+            let manifest = Manifest::load(&root)?;
+            Ok((root, manifest))
+        },
+        |root, manifest| {
+            let ws = workspace::load_workspace(root)?;
+            let backends = backend::resolve(&args.backends, args.no_backends, root)?;
+            info!(
+                repo_root = %root.display(),
+                backends = ?backends.iter().map(|b| b.name()).collect::<Vec<_>>(),
+                dry_run = args.dry_run,
+                "anvil"
+            );
+            let plan = build_plan(root, &ws, manifest, &backends, catalog)?;
+            Ok((plan, backends))
+        },
+        read_file_if_present,
+        |root, plan, next| {
+            plan.apply_files(root)?;
+            next.save(root)
+        },
+    )
+}
+
+// The comparison read is distinct from initial manifest discovery: a late read failure must
+// stop publication even after planning has succeeded. Injecting both boundaries pins that order.
+fn run_update_with(
+    catalog: &Catalog,
+    args: &Cli,
+    start_dir: &Path,
+    discover: impl FnOnce(&Path) -> Result<(PathBuf, Manifest), AppError>,
+    plan_update: impl FnOnce(&Path, &Manifest) -> Result<(Plan, Vec<Backend>), AppError>,
+    read_manifest: impl FnOnce(&Path) -> Result<Option<String>, AppError>,
+    publish: impl FnOnce(&Path, &Plan, &Manifest) -> Result<(), AppError>,
+) -> Result<RunOutcome, AppError> {
+    let (repo_root, manifest) = discover(start_dir)?;
 
     // The single-tool guard: a repository is managed by exactly one
     // anvil-family tool. If the lock records a *different* tool, refuse
     // before doing any other work — content-free, and honored even under
     // --dry-run — unless --force is passed to switch ownership to this tool.
     // A lock with no `tool` field (first run, or a legacy pre-split lock) is
-    // never blocked. See updates.md §1 "The single-tool guard".
+    // never blocked.
     //
     // This runs immediately after loading the lock and before
     // `load_workspace`, so a mismatched lock reliably refuses regardless of
@@ -89,34 +128,19 @@ pub fn run_update(catalog: &Catalog, args: &Cli, start_dir: &Path) -> Result<Run
     // parsing, which could otherwise surface unrelated errors first.
     enforce_single_tool_guard(catalog, args, &manifest)?;
 
-    let ws = workspace::load_workspace(&repo_root)?;
-
-    let backends = backend::resolve(&args.backends, args.no_backends, &repo_root)?;
-    info!(
-        repo_root = %repo_root.display(),
-        backends = ?backends.iter().map(|b| b.name()).collect::<Vec<_>>(),
-        dry_run = args.dry_run,
-        "anvil"
-    );
-
-    let mut plan = build_plan(&repo_root, &ws, &manifest, &backends, catalog)?;
+    let (mut plan, backends) = plan_update(&repo_root, &manifest)?;
     let mut next = plan.projected_manifest(&manifest);
     next.tool = Some(catalog.cli().subcommand.clone());
     next.tool_version = Some(catalog.cli().version.clone());
     next.catalog_checksum = Some(catalog.checksum());
 
     let expected_manifest = next.to_toml();
-    let current_manifest = read_file_if_present(&Manifest::path_for(&repo_root))?;
-    let manifest_is_current = current_manifest
-        .as_deref()
-        .is_some_and(|current| normalize_line_endings(current.as_bytes()) == normalize_line_endings(expected_manifest.as_bytes()));
+    let manifest_is_current = manifest_matches(read_manifest(&Manifest::path_for(&repo_root)), &expected_manifest)?;
     plan.set_manifest_update_required(!manifest_is_current);
 
     let applied = !args.dry_run;
     if applied {
-        plan.apply_files(&repo_root)?;
-        // #[gamma::skip(try.propagate_to_unwrap, tag = "timeout", reason = "a forced panic aborts manifest-write failure reporting before the mutation subprocess can publish a verdict")]
-        next.save(&repo_root)?;
+        publish(&repo_root, &plan, &next)?;
     }
 
     Ok(RunOutcome {
@@ -125,6 +149,13 @@ pub fn run_update(catalog: &Catalog, args: &Cli, start_dir: &Path) -> Result<Run
         applied,
         backends,
     })
+}
+
+fn manifest_matches(current: Result<Option<String>, AppError>, expected: &str) -> Result<bool, AppError> {
+    let current = current?;
+    Ok(current
+        .as_deref()
+        .is_some_and(|current| normalize_line_endings(current.as_bytes()) == normalize_line_endings(expected.as_bytes())))
 }
 
 /// Enforce the single-tool guard: refuse if the lock names a different tool
@@ -163,14 +194,24 @@ fn enforce_single_tool_guard(catalog: &Catalog, args: &Cli, manifest: &Manifest)
 /// Computed before anything is planned, because the validity check each region
 /// runs has to know which of the regions already in its host are on their way
 /// out — and removals are not planned until every region has been visited.
-fn live_region_keys(repo_root: &Path, workspace: &Workspace, catalog: &Catalog) -> Result<BTreeSet<(String, String)>, AppError> {
+fn live_region_keys(
+    repo_root: &Path,
+    workspace: &Workspace,
+    catalog: &Catalog,
+    hosts: &HostTextCache,
+) -> Result<BTreeSet<(String, String)>, AppError> {
     let mut keys = BTreeSet::new();
+    let mut identities = BTreeSet::new();
     for artifact in catalog.artifacts() {
         let Artifact::Region(spec) = artifact else {
             continue;
         };
         for host in region_host_paths(workspace, spec) {
-            keys.insert((resolve_existing_case_insensitive(repo_root, host)?, spec.id.as_str().to_owned()));
+            let host = (hosts.resolve)(repo_root, host)?;
+            if !identities.insert((host.to_ascii_lowercase(), spec.id.as_str().to_owned())) {
+                bail!("duplicate resolved region identity: {host} [{}]", spec.id);
+            }
+            keys.insert((host, spec.id.as_str().to_owned()));
         }
     }
     Ok(keys)
@@ -183,26 +224,54 @@ fn build_plan(
     backends: &[Backend],
     catalog: &Catalog,
 ) -> Result<Plan, AppError> {
-    let mut plan = Plan::default();
     let mut hosts = HostTextCache::default();
+    build_plan_with_hosts(repo_root, workspace, manifest, backends, catalog, &mut hosts)
+}
+
+fn build_plan_with_hosts(
+    repo_root: &Path,
+    workspace: &Workspace,
+    manifest: &Manifest,
+    backends: &[Backend],
+    catalog: &Catalog,
+    hosts: &mut HostTextCache,
+) -> Result<Plan, AppError> {
+    let mut plan = Plan::default();
     // Hosts already reported as unsafe to compose. Every region targeting one
     // hits the same fault, and four copies of one message is noise.
     let mut composed = ComposedHosts {
-        live: live_region_keys(repo_root, workspace, catalog)?,
+        live: live_region_keys(repo_root, workspace, catalog, hosts)?,
         ..ComposedHosts::default()
     };
+    let (array_paths, mut original_hosts) = array_host_inputs(repo_root, workspace, manifest, catalog, hosts)?;
+    for host in array_paths.keys() {
+        for other in composed
+            .live
+            .iter()
+            .map(|(host, _)| host)
+            .chain(manifest.regions.keys().map(|key| &key.host))
+        {
+            let other = (hosts.resolve)(repo_root, other)?;
+            if host != &other && host.eq_ignore_ascii_case(&other) {
+                bail!("ambiguous casing for TOML array host: {host} and {other}");
+            }
+        }
+    }
     // Adoption, validation, and retirement must see the same repaired text.
     // Extra complete pairs retain their bodies as unmanaged settings.
     //
     // Only regions on their way out are repaired here. A live one is repaired
-    // by `push_region_at` when it plans the region, with that region's own
-    // comment syntax rather than the `Hash` assumed below.
-    for key in manifest.regions.keys() {
-        let host = resolve_existing_case_insensitive(repo_root, &key.host)?;
+    // by `push_region_at` when it plans the region, with that region's declared
+    // comment syntax.
+    for (key, recorded_checksum) in &manifest.regions {
+        let host = (hosts.resolve)(repo_root, &key.host)?;
         if !composed.live.contains(&(host.clone(), key.id.clone())) {
             // An unpaired result is left for the path that plans the region:
             // it refuses there, where the region's own id is being handled.
-            let _ = repair_host_markers(repo_root, &mut plan, &mut hosts, &host, &key.id, CommentSyntax::Hash)?;
+            let Some(syntax) = retirement_syntax_or_refuse(repo_root, &mut plan, hosts, &host, &key.id, recorded_checksum)? else {
+                continue;
+            };
+            let _ = repair_host_markers(repo_root, &mut plan, hosts, &host, &key.id, syntax)?;
         }
     }
 
@@ -211,19 +280,148 @@ fn build_plan(
             Artifact::OwnedFile(spec) => {
                 let selected = spec.gate.is_none_or(|gate| backends.contains(&gate));
                 if selected {
-                    let path = resolve_existing_case_insensitive(repo_root, spec.path)?;
+                    let path = (hosts.resolve)(repo_root, spec.path)?;
                     plan.push(plan_owned_file(repo_root, manifest, &path, &spec.body)?);
                 }
             }
             Artifact::Region(spec) => {
-                push_region(repo_root, workspace, manifest, &mut plan, &mut hosts, &mut composed, spec)?;
+                if let Some(path) = catalog.toml_array_path(spec) {
+                    let array = crate::catalog::TomlArrayRegionSpec {
+                        region: spec.clone(),
+                        path: path.to_vec(),
+                    };
+                    for host in region_host_paths(workspace, spec) {
+                        let host = (hosts.resolve)(repo_root, host)?;
+                        let current = hosts.get_or_read(repo_root, &host)?;
+                        match crate::emit::toml_array_region::plan_toml_array_region(manifest, current.as_deref(), &host, &array) {
+                            Ok(item) => {
+                                if let Some(text) = &item.spliced_host {
+                                    hosts.set(&host, text.clone());
+                                }
+                                plan.push(item);
+                            }
+                            Err(refusal) => {
+                                // No partially composed host is returned for application.
+                                return Err(array_plan_refusal(&host, &refusal));
+                            }
+                        }
+                    }
+                } else {
+                    push_region(repo_root, workspace, manifest, &mut plan, hosts, &mut composed, spec)?;
+                }
             }
         }
     }
 
-    plan_removals(repo_root, manifest, &mut plan, &mut hosts, &composed)?;
+    plan_removals(repo_root, manifest, &mut plan, hosts, &composed)?;
+
+    // Validate every write in application order, not only the final projection.
+    // An interrupted apply must not leave a temporarily invalid array host.
+    for item in plan.items() {
+        if let Target::Region { host, .. } = &item.target
+            && let Some(after) = &item.spliced_host
+        {
+            let host = (hosts.resolve)(repo_root, host)?;
+            if let Some(paths) = array_paths.get(&host) {
+                let before = original_hosts.get(&host).expect("array hosts were captured before planning");
+                let adopted = item.rendered.as_deref().and_then(|body| {
+                    match crate::region::adopt_unmanaged_toml_tables(before, body, CommentSyntax::Hash) {
+                        crate::region::TomlAdoption::Adopted { text, .. } => Some(text),
+                        _ => None,
+                    }
+                });
+                // Table adoption and region insertion are separate edits. Checking
+                // their combined envelope would reject an untouched array between them.
+                if let Some(adopted) = &adopted {
+                    crate::emit::toml_array_region::validate_neighbor_splice(before, adopted, paths)
+                        .map_err(|refusal| array_plan_refusal(&host, &refusal))?;
+                }
+                crate::emit::toml_array_region::validate_neighbor_splice(adopted.as_deref().unwrap_or(before), after, paths)
+                    .map_err(|refusal| array_plan_refusal(&host, &refusal))?;
+                original_hosts.insert(host, after.clone());
+            }
+        }
+    }
 
     Ok(plan)
+}
+
+type ArrayHostPaths = std::collections::BTreeMap<String, Vec<Vec<String>>>;
+
+fn array_host_inputs(
+    repo_root: &Path,
+    workspace: &Workspace,
+    manifest: &Manifest,
+    catalog: &Catalog,
+    hosts: &mut HostTextCache,
+) -> Result<(ArrayHostPaths, HashMap<String, String>), AppError> {
+    let mut paths = ArrayHostPaths::new();
+    for artifact in catalog.artifacts() {
+        if let Artifact::Region(spec) = artifact
+            && let Some(path) = catalog.toml_array_path(spec)
+        {
+            for host in region_host_paths(workspace, spec) {
+                let host = (hosts.resolve)(repo_root, host)?;
+                paths.entry(host).or_default().push(path.to_vec());
+            }
+        }
+    }
+    let mut candidates: BTreeSet<String> = paths.keys().cloned().collect();
+    for key in manifest.regions.keys() {
+        if HostScanner::for_path(&key.host) == HostScanner::Toml {
+            candidates.insert((hosts.resolve)(repo_root, &key.host)?);
+        }
+    }
+    let mut originals = HashMap::new();
+    let live = live_region_keys(repo_root, workspace, catalog, hosts)?;
+    for host in candidates {
+        let text = hosts.get_or_read(repo_root, &host)?.unwrap_or_default();
+        match crate::emit::toml_array_region::existing_array_paths(&text) {
+            Ok(existing) if !existing.is_empty() || paths.contains_key(&host) => {
+                crate::emit::toml_array_region::validated_regions(&text).map_err(|refusal| array_plan_refusal(&host, &refusal))?;
+                paths.entry(host.clone()).or_default().extend(existing);
+                originals.insert(host, text);
+            }
+            Err(refusal)
+                if paths.contains_key(&host)
+                    || manifest
+                        .regions
+                        .keys()
+                        .any(|key| key.host.eq_ignore_ascii_case(&host) && !live.contains(&(host.clone(), key.id.clone()))) =>
+            {
+                return Err(array_plan_refusal(&host, &refusal));
+            }
+            _ => {}
+        }
+    }
+    for artifact in catalog.artifacts() {
+        if let Artifact::Region(spec) = artifact
+            && spec.syntax != CommentSyntax::Hash
+        {
+            for host in region_host_paths(workspace, spec) {
+                let host = (hosts.resolve)(repo_root, host)?;
+                if paths.contains_key(&host) {
+                    bail!(
+                        "region '{}' has comment syntax incompatible with its TOML array host: {host}",
+                        spec.id
+                    );
+                }
+            }
+        }
+        if let Artifact::OwnedFile(spec) = artifact {
+            let path = (hosts.resolve)(repo_root, spec.path)?;
+            if paths.keys().any(|host| host.eq_ignore_ascii_case(&path)) {
+                bail!("a TOML array host cannot also be an owned file: {}", spec.path);
+            }
+        }
+    }
+    for file in manifest.files.keys() {
+        let path = (hosts.resolve)(repo_root, file)?;
+        if paths.keys().any(|host| host.eq_ignore_ascii_case(&path)) {
+            bail!("retire whole-file ownership separately before managing TOML array entries: {file}");
+        }
+    }
+    Ok((paths, originals))
 }
 
 /// In-memory accumulator of host-file text, shared across every region
@@ -239,10 +437,20 @@ fn build_plan(
 /// cache from disk; every subsequent region splices against — and, when it
 /// writes, updates — the accumulated in-memory text, so the composed
 /// result preserves every region. See `updates.md §4`.
-#[derive(Default)]
 struct HostTextCache {
     texts: HashMap<String, Option<String>>,
     newlines: HashMap<String, &'static str>,
+    resolve: fn(&Path, &str) -> Result<String, AppError>,
+}
+
+impl Default for HostTextCache {
+    fn default() -> Self {
+        Self {
+            texts: HashMap::new(),
+            newlines: HashMap::new(),
+            resolve: resolve_existing_case_insensitive,
+        }
+    }
 }
 
 impl HostTextCache {
@@ -350,7 +558,11 @@ fn push_region_at(
     host: &str,
     spec: &RegionSpec,
 ) -> Result<(), AppError> {
-    let host = resolve_existing_case_insensitive(repo_root, host)?;
+    let host = (hosts.resolve)(repo_root, host)?;
+    let current = hosts.get_or_read(repo_root, &host)?;
+    if refuse_region_syntax_change(plan, manifest, &host, spec, current.as_deref()) {
+        return Ok(());
+    }
     if !repair_or_refuse(repo_root, plan, hosts, &host, spec.id.as_str(), spec.syntax, false)? {
         return Ok(());
     }
@@ -360,6 +572,7 @@ fn push_region_at(
     {
         return Ok(());
     }
+    // #[gamma::skip(try.propagate_to_unwrap, reason = "successful marker repair already cached this exact host, including absent files; the repeated lookup cannot perform I/O or return Err")]
     let current = hosts.get_or_read(repo_root, &host)?;
     if let Some(declared) = composed_host
         && !declared.order.contains(&spec.id.as_str())
@@ -377,11 +590,14 @@ fn push_region_at(
             spec.id.as_str()
         );
     }
-    let placement = composed_host.map_or_else(
-        || region_placement(spec.id.as_str(), current.as_deref()),
-        |declared| composed_placement(declared.order, declared.scaffold, spec.id.as_str(), current.as_deref()),
-    );
-    let body = match delta_region_body(current.as_deref(), spec) {
+    let Some(placement) = region_placement_or_refuse(plan, &host, spec, composed_host, current.as_deref()) else {
+        return Ok(());
+    };
+    let body = match if spec.syntax == CommentSyntax::Hash {
+        delta_region_body(current.as_deref(), spec)
+    } else {
+        DeltaRegionBody::Managed
+    } {
         DeltaRegionBody::Managed => spec.body.as_str(),
         DeltaRegionBody::PreserveRepositoryKey => {
             plan.note(
@@ -426,7 +642,8 @@ fn push_region_at(
                 composed.states.insert(host.clone(), ComposedHostState::Unsafe(reason.clone()));
                 composed.reported.insert(host.clone());
             }
-            refuse_region(plan, host, spec.id.as_str(), &reason, refusal.remedy);
+            let id = spec.id.as_str();
+            refuse_region(plan, host, id, &reason, refusal.remedy);
             return Ok(());
         }
     };
@@ -437,7 +654,8 @@ fn push_region_at(
     if item.decision == Decision::Write
         && let Some(refusal) = toml_introduction_refusal(current.as_deref(), request, &retiring)
     {
-        refuse_region(plan, host, spec.id.as_str(), &refusal.reason, refusal.remedy);
+        let id = spec.id.as_str();
+        refuse_region(plan, host, id, &refusal.reason, refusal.remedy);
         return Ok(());
     }
     // Fold actual writes into the accumulator so later regions compose.
@@ -448,6 +666,78 @@ fn push_region_at(
     }
     plan.push(item);
     Ok(())
+}
+
+fn region_placement_or_refuse(
+    plan: &mut Plan,
+    host: &str,
+    spec: &RegionSpec,
+    composed_host: Option<ComposedHost>,
+    current: Option<&str>,
+) -> Option<RegionPlacement> {
+    if let Some(declared) = composed_host {
+        return Some(composed_placement(declared.order, declared.scaffold, spec.id.as_str(), current));
+    }
+    match region_placement(spec.id.as_str(), spec.syntax, current) {
+        Ok(placement) => Some(placement),
+        Err(reason) => {
+            refuse_region(plan, host.to_owned(), spec.id.as_str(), &reason, RefusalRemedy::XmlPlacement);
+            None
+        }
+    }
+}
+
+fn refuse_region_syntax_change(plan: &mut Plan, manifest: &Manifest, host: &str, spec: &RegionSpec, current: Option<&str>) -> bool {
+    let Some(text) = current else {
+        return false;
+    };
+    let current_checksum = checksum_str(&spec.body);
+    let recorded_checksum = manifest.region_checksum(host, spec.id.as_str()).unwrap_or(&current_checksum);
+    let scanner = HostScanner::for_path(host);
+    let other_syntaxes = match spec.syntax {
+        CommentSyntax::Hash => [CommentSyntax::SlashSlash, CommentSyntax::Xml],
+        CommentSyntax::SlashSlash => [CommentSyntax::Hash, CommentSyntax::Xml],
+        CommentSyntax::Xml => [CommentSyntax::Hash, CommentSyntax::SlashSlash],
+    };
+    let has_conflicting_evidence = other_syntaxes.into_iter().any(|syntax| {
+        !matches!(scanner.find(text, spec.id.as_str(), syntax), Ok(None))
+            || (syntax == CommentSyntax::Xml
+                && scanner == HostScanner::Lines
+                && xml_comment_scan_failed(text)
+                && raw_marker_line_present(text, spec.id.as_str(), syntax))
+    });
+    if !has_conflicting_evidence {
+        return false;
+    }
+    let existing = match infer_recorded_region_syntax(Some(text), scanner, host, spec.id.as_str(), recorded_checksum) {
+        Ok(existing) => existing,
+        Err(reason) => {
+            refuse_region(
+                plan,
+                host.to_owned(),
+                spec.id.as_str(),
+                &reason.to_string(),
+                RefusalRemedy::SyntaxChange,
+            );
+            return true;
+        }
+    };
+    if existing == spec.syntax {
+        return false;
+    }
+    let name = |syntax| match syntax {
+        CommentSyntax::Hash => "hash",
+        CommentSyntax::SlashSlash => "slash-slash",
+        CommentSyntax::Xml => "XML",
+    };
+    let reason = format!(
+        "existing marker lines use {} comments, but the catalog now declares {} comments. \
+         Changing marker syntax in place is not supported because the manifest does not record the previous syntax",
+        name(existing),
+        name(spec.syntax)
+    );
+    refuse_region(plan, host.to_owned(), spec.id.as_str(), &reason, RefusalRemedy::SyntaxChange);
+    true
 }
 
 /// Repair markers and classify a composed host once, before updating its bodies.
@@ -516,7 +806,35 @@ fn refuse_region(plan: &mut Plan, host: String, id: &str, reason: &str, remedy: 
     // the sentence break is supplied only when the reason has not already
     // written one.
     let stop = if reason.trim_end().ends_with('.') { "" } else { "." };
-    let remedy = match remedy {
+    let remedy = refusal_guidance(remedy);
+    plan.refusal(format!(
+        "Refused to manage {host} [{id}]: {reason}{stop} This region was left unchanged; other regions in the same \
+         file and other artifacts may still be updated. {remedy}"
+    ));
+    plan.push(PlanItem::noop(Target::Region { host, id: id.to_owned() }, Decision::LeaveAlone));
+}
+
+fn array_plan_refusal(host: &str, refusal: &crate::emit::managed_region::ManagedRegionRefusal) -> AppError {
+    let guidance = if refusal.remedy == RefusalRemedy::BetweenManagedRegions {
+        "Reconcile the neighboring managed regions in the catalog before retrying; array hosts cannot depend on staged ownership migrations."
+    } else {
+        refusal_guidance(refusal.remedy)
+    };
+    app_err!(
+        "Refused TOML array host {host}: {}. No plan was produced; no files were changed. {guidance}",
+        refusal.reason
+    )
+}
+
+fn refusal_guidance(remedy: RefusalRemedy) -> &'static str {
+    match remedy {
+        RefusalRemedy::EnclosingOwnership
+        | RefusalRemedy::ArrayDependency
+        | RefusalRemedy::MisplacedArrayMarkers
+        | RefusalRemedy::ArrayShape
+        | RefusalRemedy::ArrayScaffold => {
+            "Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported."
+        }
         RefusalRemedy::HandWrittenTable => "Reconcile the hand-written table with the managed one before retrying.",
         RefusalRemedy::InvalidGeneratedToml => {
             "The generated region is invalid TOML even without repository content. Repair the catalog template \
@@ -563,12 +881,20 @@ fn refuse_region(plan: &mut Plan, host: String, id: &str, reason: &str, remedy: 
              missing sentinel around the body anvil generated, or delete the stray one together with the \
              body it was meant to enclose."
         }
-    };
-    plan.refusal(format!(
-        "Refused to manage {host} [{id}]: {reason}{stop} This region was left unchanged; other regions in the same \
-         file and other artifacts may still be updated. {remedy}"
-    ));
-    plan.push(PlanItem::noop(Target::Region { host, id: id.to_owned() }, Decision::LeaveAlone));
+        RefusalRemedy::RetirementInference => {
+            "Identify the marker pair whose body matches the recorded generated content and remove only competing \
+             marker lines while preserving their bodies. If XML tokenization failed, repair the repository-owned \
+             XML first so anvil can inspect the complete host, then retry."
+        }
+        RefusalRemedy::SyntaxChange => {
+            "Restore the catalog's previous comment syntax, or deliberately remove the old marker lines and \
+             their generated body before retrying with the new syntax."
+        }
+        RefusalRemedy::XmlPlacement => {
+            "Create or restore a well-formed XML host with its closing document-root element on its own line \
+             so anvil can insert the managed region inside the root, then retry."
+        }
+    }
 }
 
 /// Bring a composed host's state up to date and report whether the region may
@@ -637,7 +963,8 @@ fn repair_or_refuse(
     } else {
         "this region's marker lines do not form a matching pair, so the boundary of any body anvil already generated cannot be established"
     };
-    refuse_region(plan, host.to_owned(), id, reason, RefusalRemedy::MalformedMarkers);
+    let host = host.to_owned();
+    refuse_region(plan, host, id, reason, RefusalRemedy::MalformedMarkers);
     Ok(false)
 }
 
@@ -657,7 +984,7 @@ fn repair_host_markers(
     let Some(text) = hosts.get_or_read(repo_root, host)? else {
         return Ok(MarkerRepair::Repaired(String::new()));
     };
-    let outcome = repair_markers(&text, id, syntax);
+    let outcome = HostScanner::for_path(host).repair(&text, id, syntax);
     if let MarkerRepair::Repaired(repaired) = &outcome
         && repaired != &text
     {
@@ -716,28 +1043,54 @@ fn composed_placement(order: &[&str], scaffold: &str, id: &str, text: Option<&st
     // #[gamma::skip(literal.char_to_nul, tag = "timeout", reason = "a NUL line terminator prevents malformed marker recovery from reaching a stable boundary within the campaign budget")]
     let first_line = text[..first_line_end].trim_end_matches('\r');
     let key = opening.split_once('=').map(|(key, _)| key);
+    // #[gamma::skip(logical.and_remove_left, reason = "an empty opening can only match an empty first line, yielding offset zero either way; split_once proves opening starts with its returned key")]
     let carries_directive =
         !opening.is_empty() && (first_line == opening || key.is_some_and(|key| opening.starts_with(key) && first_line.starts_with(key)));
     RegionPlacement::At(if carries_directive { first_line.len() } else { 0 })
 }
 
-fn region_placement(region_id: &str, current: Option<&str>) -> RegionPlacement {
-    if matches!(region_id, DELTA_REGION_ID | "anvil-spellcheck-root") {
-        return RegionPlacement::Start;
+fn region_placement(region_id: &str, syntax: CommentSyntax, current: Option<&str>) -> Result<RegionPlacement, String> {
+    if syntax == CommentSyntax::Hash && matches!(region_id, DELTA_REGION_ID | "anvil-spellcheck-root") {
+        return Ok(RegionPlacement::Start);
     }
-    if matches!(region_id, "anvil-spellcheck-hunspell" | "anvil-spellcheck-quirks")
+    if syntax == CommentSyntax::Hash
+        && matches!(region_id, "anvil-spellcheck-hunspell" | "anvil-spellcheck-quirks")
         && let Some(old) = current.and_then(|text| find_region(text, "anvil-spellcheck", CommentSyntax::Hash).ok().flatten())
         && crate::region::ends_in_toml_table(old.body_str(), &["Hunspell", "quirks"])
     {
         // Install the replacement tables before retiring the combined block:
         // its trailing user settings must still follow Hunspell.quirks. An
         // empty block establishes no table context; append replacements instead.
-        return RegionPlacement::At(old.start_line.start);
+        return Ok(RegionPlacement::At(old.start_line.start));
     }
-    if let Some(placement) = lint_region_placement(region_id, current) {
-        return placement;
+    if syntax == CommentSyntax::Hash
+        && let Some(placement) = lint_region_placement(region_id, current)
+    {
+        return Ok(placement);
     }
-    RegionPlacement::End
+    if syntax == CommentSyntax::Xml {
+        let text = current.ok_or_else(|| {
+            "the XML host does not exist, so its document root and a safe insertion point cannot be established".to_owned()
+        })?;
+        let root = xml_document_root(text)?;
+        if let Some(region) = find_region(text, region_id, syntax).ok().flatten() {
+            let root = root.ok_or_else(|| "the XML document element is self-closing, so it cannot contain a managed region".to_owned())?;
+            if !region_is_inside_xml_root(region.start_line.start, region.end_line.end, root) {
+                return Err("the existing XML managed region is outside the document root".to_owned());
+            }
+            return Ok(RegionPlacement::End);
+        }
+        let root = root.ok_or_else(|| "the XML document element is self-closing, so it cannot contain a managed region".to_owned())?;
+        let offset = root.closing_line_start.ok_or_else(|| {
+            "the XML host has no complete-line closing root element, so a safe insertion point cannot be established".to_owned()
+        })?;
+        return Ok(RegionPlacement::At(offset));
+    }
+    Ok(RegionPlacement::End)
+}
+
+fn region_is_inside_xml_root(start: usize, end: usize, root: crate::region::XmlRootBounds) -> bool {
+    start >= root.opening_end && end <= root.closing_start
 }
 
 /// The composed-host declaration for a host, when it has one.
@@ -799,7 +1152,8 @@ impl ComposedHosts {
     /// writes a duplicate header, and treating a removed one as staying refuses
     /// a migration that is about to become valid.
     fn retiring_regions(&self, manifest: &Manifest, host_relpath: &str, host_text: &str, syntax: CommentSyntax) -> BTreeSet<String> {
-        managed_region_ids(host_text, syntax)
+        HostScanner::for_path(host_relpath)
+            .ids(host_text, syntax)
             .into_iter()
             .filter(|id| !self.live.contains(&(host_relpath.to_owned(), id.clone())))
             .filter(|id| {
@@ -818,7 +1172,7 @@ impl ComposedHosts {
                     // a duplicate of a region that is on its way out.
                     return false;
                 };
-                let region = find_region(host_text, id, syntax).ok().flatten();
+                let region = HostScanner::for_path(host_relpath).find(host_text, id, syntax).ok().flatten();
                 region.is_some_and(|region| region.is_empty() || checksum_str(region.body_str()) == *last)
             })
             .collect()
@@ -987,7 +1341,7 @@ fn plan_removals(
         // the two are compared through the same resolution. Without it a
         // case-only rename makes anvil's own file look retired and the removal
         // below deletes the artifact this very pass just wrote.
-        let resolved = resolve_existing_case_insensitive(repo_root, path)?;
+        let resolved = (hosts.resolve)(repo_root, path)?;
         if live_files.contains(&resolved) {
             continue;
         }
@@ -1049,7 +1403,7 @@ fn plan_removals(
         // No `resolved_host != key.host` guard: the `continue` above has
         // already established that the recorded key is not live, so when the
         // resolution changes nothing this lookup repeats it and fails.
-        let resolved_host = resolve_existing_case_insensitive(repo_root, &key.host)?;
+        let resolved_host = (hosts.resolve)(repo_root, &key.host)?;
         // A refused host was not opened, and "nothing was written to it" has to
         // be true of the lock as well as the file -- the same invariant the
         // owned-file loop above keeps. A lock entry naming a region the catalog
@@ -1068,17 +1422,17 @@ fn plan_removals(
             }));
             continue;
         }
-        if !repair_or_refuse(repo_root, plan, hosts, &resolved_host, &key.id, CommentSyntax::Hash, true)? {
+        let Some(syntax) = retirement_syntax_or_refuse(repo_root, plan, hosts, &resolved_host, &key.id, last)? else {
+            continue;
+        };
+        if !repair_or_refuse(repo_root, plan, hosts, &resolved_host, &key.id, syntax, true)? {
             // The lock entry survives with the region, so the next run still
             // knows it is anvil's to retire once the boundary is repaired.
             continue;
         }
         if let Some(host_text) = hosts.cached(&resolved_host) {
-            // CommentSyntax is currently always Hash for managed regions.
-            // When that assumption changes, the manifest will need to
-            // record the syntax used.
-            let syntax = CommentSyntax::Hash;
-            let region = find_region(&host_text, &key.id, syntax)
+            let region = HostScanner::for_path(&resolved_host)
+                .find(&host_text, &key.id, syntax)
                 .expect("repair_or_refuse above established that this host has well-formed region markers");
             let body_checksum = region.as_ref().map(|r| checksum_str(r.body_str()));
             let decision = if region.as_ref().is_some_and(crate::region::Region::is_empty) {
@@ -1095,19 +1449,22 @@ fn plan_removals(
                     // cache is keyed by the resolved spelling, which is what
                     // the writes used; reading under the recorded spelling
                     // would miss it and splice into the pre-pass text.
-                    let spliced =
-                        remove_region(&host_text, &key.id, syntax).expect("the region markers were validated by repair_or_refuse above");
+                    let spliced = HostScanner::for_path(&resolved_host)
+                        .remove(&host_text, &key.id, syntax)
+                        .expect("the region markers were validated by repair_or_refuse above");
                     hosts.set(&resolved_host, spliced.clone());
                     plan.push(PlanItem::remove_region(key.host.clone(), key.id.clone(), spliced));
                 }
+
                 RemovalDecision::OrphanedKept => {
                     // Named by the spelling on disk, not the one the lock
                     // recorded: this refusal says a file was left alone, so it has
                     // to name the file that is actually there. A case-only rename
                     // is exactly where the two diverge.
+                    let refusal_host = resolved_host.clone();
                     refuse_region(
                         plan,
-                        resolved_host.clone(),
+                        refusal_host,
                         &key.id,
                         // #[gamma::skip(literal.str_to_xyzzy, tag = "timeout", reason = "changes only the terminal refusal text after retirement has already stopped; the subprocess exhausts its budget before a distinct verdict")]
                         "this retired managed region contains edits. Restore its last generated body, empty it, or remove it to complete retirement",
@@ -1135,6 +1492,107 @@ fn plan_removals(
     Ok(())
 }
 
+/// Infer the marker syntax of a retired region from current host evidence.
+///
+/// Manifest schema 1 records the body checksum but not marker syntax. A unique
+/// checksum match proves ownership; otherwise all complete and malformed marker
+/// evidence must identify one syntax. Ambiguous or incomplete XML scans refuse
+/// rather than being treated as historical fact or proof that the region is
+/// absent.
+fn retirement_syntax_or_refuse(
+    repo_root: &Path,
+    plan: &mut Plan,
+    hosts: &mut HostTextCache,
+    host: &str,
+    id: &str,
+    recorded_checksum: &str,
+) -> Result<Option<CommentSyntax>, AppError> {
+    let text = hosts.get_or_read(repo_root, host)?;
+    match infer_recorded_region_syntax(text.as_deref(), HostScanner::for_path(host), host, id, recorded_checksum) {
+        Ok(syntax) => Ok(Some(syntax)),
+        Err(reason) => {
+            refuse_region(plan, host.to_owned(), id, &reason.to_string(), RefusalRemedy::RetirementInference);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+fn recorded_region_syntax(
+    repo_root: &Path,
+    hosts: &mut HostTextCache,
+    host: &str,
+    id: &str,
+    recorded_checksum: &str,
+) -> Result<CommentSyntax, AppError> {
+    let text = hosts.get_or_read(repo_root, host)?;
+    infer_recorded_region_syntax(text.as_deref(), HostScanner::for_path(host), host, id, recorded_checksum)
+}
+
+fn infer_recorded_region_syntax(
+    text: Option<&str>,
+    scanner: HostScanner,
+    host: &str,
+    id: &str,
+    recorded_checksum: &str,
+) -> Result<CommentSyntax, AppError> {
+    let Some(text) = text else {
+        return Ok(CommentSyntax::Hash);
+    };
+    let syntaxes = [CommentSyntax::Hash, CommentSyntax::SlashSlash, CommentSyntax::Xml];
+    let xml_scan_failed = scanner == HostScanner::Lines && xml_comment_scan_failed(text);
+    if xml_scan_failed && raw_marker_line_present(text, id, CommentSyntax::Xml) {
+        bail!(
+            "managed region '{id}' in '{host}' has XML marker-shaped lines after an XML tokenization failure, so absence cannot be proven"
+        );
+    }
+    let mut checksum_match = None;
+    let mut checksum_matches = 0usize;
+    let mut evidence = None;
+    let mut evidence_count = 0;
+
+    for syntax in syntaxes {
+        let found = scanner.find(text, id, syntax);
+        let complete = match &found {
+            Ok(Some(region)) => {
+                if checksum_str(region.body_str()) == recorded_checksum {
+                    checksum_matches += 1;
+                    checksum_match = Some(syntax);
+                }
+                true
+            }
+            Ok(None) | Err(_) => false,
+        };
+        let incomplete_xml_evidence = match syntax {
+            CommentSyntax::Xml => xml_scan_failed && raw_marker_line_present(text, id, syntax),
+            CommentSyntax::Hash | CommentSyntax::SlashSlash => false,
+        };
+        let has_evidence = !matches!(found, Ok(None)) || incomplete_xml_evidence;
+        if complete || has_evidence {
+            evidence_count += 1;
+            evidence = Some(syntax);
+        }
+    }
+
+    match checksum_matches {
+        1 => {
+            return Ok(checksum_match.expect("checksum_matches == 1 guarantees one recorded syntax"));
+        }
+        2.. => {
+            bail!("managed region '{id}' in '{host}' has multiple marker syntaxes whose bodies match the recorded checksum");
+        }
+        0 => {}
+    }
+    if evidence_count == 1 {
+        return Ok(evidence.expect("one marker-evidence syntax was recorded"));
+    }
+    if evidence_count == 0 {
+        Ok(CommentSyntax::Hash)
+    } else {
+        bail!("managed region '{id}' in '{host}' has ambiguous marker lines in multiple comment syntaxes")
+    }
+}
+
 fn live_files(plan: &Plan) -> BTreeSet<String> {
     plan.items()
         .iter()
@@ -1155,6 +1613,667 @@ mod tests {
     use super::*;
     use crate::anvil::artifacts::region;
     use crate::{CliMeta, RegionId};
+
+    #[test]
+    fn update_returns_a_late_manifest_read_error_before_publishing_any_changes() {
+        let root = Path::new("workspace");
+        let catalog = empty_catalog();
+        let error = run_update_with(
+            &catalog,
+            &local_only(),
+            root,
+            |start| {
+                assert_eq!(start, root);
+                Ok((root.to_owned(), Manifest::default()))
+            },
+            |path, _| {
+                assert_eq!(path, root);
+                Ok((Plan::default(), Vec::new()))
+            },
+            |path| {
+                assert_eq!(path, Manifest::path_for(root));
+                Err(ohno::app_err!("injected late manifest read failure"))
+            },
+            |_, _, _| panic!("a failed manifest read must prevent all publication"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected late manifest read failure"), "{error}");
+    }
+
+    /// Minimal identity for tests that exercise catalog mechanics rather than
+    /// the built-in catalog's full embedded artifact set.
+    fn test_cli() -> CliMeta {
+        CliMeta::new("anvil")
+    }
+
+    fn array_catalog(ordinary: Option<RegionSpec>, array_first: bool) -> Catalog {
+        let array = crate::catalog::TomlArrayRegionSpec {
+            region: RegionSpec {
+                host: HostSelector::Path("config.toml".to_owned()),
+                id: RegionId::new("entries"),
+                body: "\"required\",\n".to_owned(),
+                syntax: CommentSyntax::Hash,
+            },
+            path: vec!["plugins".to_owned(), "default".to_owned()],
+        };
+        let mut builder = Catalog::builder(test_cli());
+        if array_first {
+            builder = builder.with_toml_array_region(array.clone());
+        }
+        if let Some(ordinary) = ordinary {
+            builder = builder.with_artifact(Artifact::region(ordinary));
+        }
+        if !array_first {
+            builder = builder.with_toml_array_region(array);
+        }
+        builder.build().unwrap()
+    }
+
+    fn array_plan(text: &str, manifest: &Manifest, catalog: &Catalog) -> Result<Plan, AppError> {
+        let mut hosts = memory_hosts();
+        hosts.set("config.toml", text.to_owned());
+        hosts.newlines.insert("config.toml".to_owned(), crate::region::text_newline(text));
+        build_plan_with_hosts(
+            Path::new("in-memory-array-tests"),
+            &Workspace {
+                members: Vec::new(),
+                has_workspace_table: false,
+            },
+            manifest,
+            &[],
+            catalog,
+            &mut hosts,
+        )
+    }
+
+    fn memory_hosts() -> HostTextCache {
+        HostTextCache {
+            resolve: |root, path| crate::io::resolve_case_insensitive_with(root, path, |_, _| Ok(None)),
+            ..HostTextCache::default()
+        }
+    }
+
+    fn managed_region_plan(text: Option<&str>, manifest: &Manifest, spec: &RegionSpec) -> (Plan, HostTextCache) {
+        let HostSelector::Path(host) = &spec.host else {
+            panic!("the managed-region test helper requires HostSelector::Path");
+        };
+        let mut hosts = memory_hosts();
+        hosts.texts.insert(host.clone(), text.map(str::to_owned));
+        hosts.newlines.insert(host.clone(), crate::region::text_newline(text.unwrap_or("")));
+        let mut plan = Plan::default();
+        push_region_at(
+            Path::new("in-memory-managed-region-tests"),
+            manifest,
+            &mut plan,
+            &mut hosts,
+            &mut ComposedHosts::default(),
+            host,
+            spec,
+        )
+        .unwrap();
+        (plan, hosts)
+    }
+
+    #[test]
+    fn array_and_plain_regions_can_share_an_id_without_sharing_a_host() {
+        let catalog = array_catalog(
+            Some(RegionSpec {
+                host: HostSelector::Path("other.conf".to_owned()),
+                id: RegionId::new("entries"),
+                body: "user documentation.\n".to_owned(),
+                syntax: CommentSyntax::Hash,
+            }),
+            true,
+        );
+        let mut hosts = memory_hosts();
+        hosts.set("config.toml", "[plugins]\ndefault = []\n".to_owned());
+        hosts.set("other.conf", String::new());
+        let plan = build_plan_with_hosts(
+            Path::new("in-memory-array-tests"),
+            &Workspace {
+                members: Vec::new(),
+                has_workspace_table: false,
+            },
+            &Manifest::default(),
+            &[],
+            &catalog,
+            &mut hosts,
+        )
+        .unwrap();
+        assert_eq!(plan.items().len(), 2);
+        let outputs = plan
+            .items()
+            .iter()
+            .map(|item| item.spliced_host.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outputs.iter().filter(|text| text.contains("\"required\",")).count(), 1);
+        assert_eq!(outputs.iter().filter(|text| text.contains("user documentation.")).count(), 1);
+        assert!(outputs.iter().all(|text| text.contains("# >>> anvil-managed: entries")));
+    }
+
+    #[test]
+    fn toml_array_retirement_preserves_adjacent_repository_bytes() {
+        let catalog = array_catalog(None, true);
+        let empty = Catalog::builder(catalog.cli().clone()).build().unwrap();
+        for newline in ["\n", "\r\n"] {
+            for tail in ["\n\"user\"]\n", "\n\n# user\n\"user\"]", " \t\n\"user\"]\n", "]\n"] {
+                let source = format!("[plugins]\ndefault = [\n{tail}").replace('\n', newline);
+                let introduced = array_plan(&source, &Manifest::default(), &catalog).unwrap();
+                let managed = introduced.items()[0].spliced_host.as_ref().unwrap();
+                let manifest = introduced.projected_manifest(&Manifest::default());
+                let retired = array_plan(managed, &manifest, &empty).unwrap();
+                assert_eq!(retired.items().len(), 1);
+                assert_eq!(retired.items()[0].decision, Decision::Remove);
+                assert_eq!(retired.items()[0].spliced_host.as_deref(), Some(source.as_str()));
+                assert_eq!(retired.projected_manifest(&manifest).regions.len(), 0);
+                let emptied = managed.replace(&format!("  \"required\",{newline}"), "");
+                let retired_empty = array_plan(&emptied, &manifest, &empty).unwrap();
+                assert_eq!(retired_empty.items()[0].spliced_host.as_deref(), Some(source.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn toml_array_preflight_leaves_live_ordinary_hosts_alone() {
+        let catalog = Catalog::builder(test_cli())
+            .with_artifact(Artifact::region(RegionSpec {
+                host: HostSelector::Path("config.toml".to_owned()),
+                id: RegionId::new("settings"),
+                body: "setting = true\n".to_owned(),
+                syntax: CommentSyntax::Hash,
+            }))
+            .build()
+            .unwrap();
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.toml", "settings", checksum_str("setting = true\n"));
+        for text in ["setting = true\n", "not valid TOML\n"] {
+            let mut hosts = memory_hosts();
+            hosts.set("config.toml", text.to_owned());
+            let (paths, originals) = array_host_inputs(
+                Path::new("in-memory-array-tests"),
+                &Workspace {
+                    members: Vec::new(),
+                    has_workspace_table: false,
+                },
+                &manifest,
+                &catalog,
+                &mut hosts,
+            )
+            .unwrap();
+            assert_eq!(paths, ArrayHostPaths::new());
+            assert_eq!(originals, HashMap::new());
+        }
+    }
+
+    #[test]
+    fn toml_array_invalid_retirement_refuses_before_producing_a_plan() {
+        let source = "[plugins]\ndefault = [\n# >>> anvil-managed: entries\n\"required\",\n# <<< anvil-managed: entries\n";
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.toml", "entries", checksum_str("\"required\",\n"));
+        let empty = Catalog::builder(test_cli()).build().unwrap();
+        let refusal = crate::emit::toml_array_region::existing_array_paths(source).unwrap_err();
+        assert_eq!(
+            array_plan(source, &manifest, &empty).unwrap_err().to_string(),
+            array_plan_refusal("config.toml", &refusal).to_string()
+        );
+        // A declared array without historical ownership must also refuse at preflight.
+        let catalog = array_catalog(None, true);
+        assert_eq!(
+            array_plan(source, &Manifest::default(), &catalog).unwrap_err().to_string(),
+            array_plan_refusal("config.toml", &refusal).to_string()
+        );
+    }
+
+    #[test]
+    fn toml_array_plan_lifecycle_preserves_repository_and_schema_one() {
+        let catalog = array_catalog(None, true);
+        let source = "# user\n[plugins]\ndefault = ['required', \"user\", { option = true }]\n";
+        let expected = "# user\n[plugins]\ndefault = [\n  # >>> anvil-managed: entries\n  \"required\",\n  # <<< anvil-managed: entries\n \"user\", { option = true }]\n";
+        let plan = array_plan(source, &Manifest::default(), &catalog).unwrap();
+        assert_eq!(plan.items().len(), 1);
+        assert_eq!(plan.items()[0].spliced_host.as_deref(), Some(expected));
+        assert_eq!(plan.dry_run_exit_code(), 1);
+        let manifest = plan.projected_manifest(&Manifest::default());
+        assert_eq!(crate::manifest::SCHEMA_VERSION, 1);
+        assert_eq!(manifest.regions.len(), 1);
+        let plan = array_plan(expected, &manifest, &catalog).unwrap();
+        assert_eq!(plan.items()[0].decision, Decision::InSync);
+        assert_eq!(plan.dry_run_exit_code(), 0);
+        let empty = Catalog::builder(catalog.cli().clone()).build().unwrap();
+        let plan = array_plan(expected, &manifest, &empty).unwrap();
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some("# user\n[plugins]\ndefault = [\n \"user\", { option = true }]\n")
+        );
+        assert_eq!(plan.projected_manifest(&manifest).regions.len(), 0);
+        let edited = expected.replace("\"required\"", "\"edited\"");
+        assert_eq!(
+            array_plan(&edited, &manifest, &catalog).unwrap_err().to_string(),
+            "Refused TOML array host config.toml: the managed region contains edits that do not match its last render or the current template. Restore its generated content, or empty its body to regenerate it; keep user settings outside the sentinels. No plan was produced; no files were changed. The body between the sentinels is anvil's to write, and it will not overwrite changes it did not make. Settings that must survive belong outside the sentinels, where anvil never touches them."
+        );
+        let plan = array_plan(&edited, &manifest, &empty).unwrap();
+        assert!(!plan.refusals().is_empty());
+        assert_eq!(plan.projected_manifest(&manifest), manifest);
+        assert!(plan.items().iter().all(|item| item.spliced_host.is_none()));
+    }
+
+    #[test]
+    fn toml_array_plan_allows_independent_neighbors_in_either_order() {
+        let source =
+            "[plugins]\ndefault = [\"user\"]\n\n# >>> anvil-managed: settings\n[settings]\nmode = true\n# <<< anvil-managed: settings\n";
+        let expected = "[plugins]\ndefault = [\n  # >>> anvil-managed: entries\n  \"required\",\n  # <<< anvil-managed: entries\n\"user\"]\n\n# >>> anvil-managed: settings\n[settings]\nmode = false\n# <<< anvil-managed: settings\n";
+        let neighbor = RegionSpec {
+            host: HostSelector::Path("config.toml".to_owned()),
+            id: RegionId::new("settings"),
+            body: "[settings]\nmode = false\n".to_owned(),
+            syntax: CommentSyntax::Hash,
+        };
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.toml", "settings", checksum_str("[settings]\nmode = true\n"));
+        for array_first in [false, true] {
+            let catalog = array_catalog(Some(neighbor.clone()), array_first);
+            let plan = array_plan(source, &manifest, &catalog).unwrap();
+            assert_eq!(plan.refusals(), &[] as &[String]);
+            assert_eq!(
+                plan.items().iter().filter_map(|item| item.spliced_host.as_deref()).next_back(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn toml_array_neighbor_adoption_preserves_the_array_between_edits() {
+        let source = "[settings]\nmode = true\n\n[plugins]\ndefault = [\"user\"]\n";
+        let expected = "[plugins]\ndefault = [\n  # >>> anvil-managed: entries\n  \"required\",\n  # <<< anvil-managed: entries\n\"user\"]\n\n# >>> anvil-managed: settings\n[settings]\nmode = true\n# <<< anvil-managed: settings\n";
+        let neighbor = RegionSpec {
+            host: HostSelector::Path("config.toml".to_owned()),
+            id: RegionId::new("settings"),
+            body: "[settings]\nmode = true\n".to_owned(),
+            syntax: CommentSyntax::Hash,
+        };
+        for array_first in [false, true] {
+            let catalog = array_catalog(Some(neighbor.clone()), array_first);
+            let plan = array_plan(source, &Manifest::default(), &catalog).unwrap();
+            assert!(plan.refusals().is_empty());
+            assert_eq!(
+                plan.items().iter().filter_map(|item| item.spliced_host.as_deref()).next_back(),
+                Some(expected)
+            );
+            let manifest = plan.projected_manifest(&Manifest::default());
+            let synced = array_plan(expected, &manifest, &catalog).unwrap();
+            assert_eq!(synced.dry_run_exit_code(), 0);
+            let retired = array_plan(expected, &manifest, &array_catalog(None, array_first)).unwrap();
+            assert_eq!(
+                retired.items().iter().filter_map(|item| item.spliced_host.as_deref()).next_back(),
+                Some(
+                    "[plugins]\ndefault = [\n  # >>> anvil-managed: entries\n  \"required\",\n  # <<< anvil-managed: entries\n\"user\"]\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn toml_array_plan_refuses_existing_whole_file_ownership() {
+        let mut manifest = Manifest::default();
+        manifest
+            .files
+            .insert("config.toml".to_owned(), checksum_str("[plugins]\ndefault = []\n"));
+        assert_eq!(
+            array_plan("[plugins]\ndefault = []\n", &manifest, &array_catalog(None, true))
+                .unwrap_err()
+                .to_string(),
+            "retire whole-file ownership separately before managing TOML array entries: config.toml"
+        );
+    }
+
+    #[test]
+    fn array_plan_refusal_preserves_guidance_without_partial_apply_advice() {
+        for (remedy, expected) in [
+            (
+                RefusalRemedy::ArrayShape,
+                "Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported.",
+            ),
+            (
+                RefusalRemedy::ArrayScaffold,
+                "Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported.",
+            ),
+            (
+                RefusalRemedy::ArrayDependency,
+                "Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported.",
+            ),
+            (
+                RefusalRemedy::EnclosingOwnership,
+                "Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported.",
+            ),
+            (
+                RefusalRemedy::MisplacedArrayMarkers,
+                "Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported.",
+            ),
+            (
+                RefusalRemedy::InvalidGeneratedToml,
+                "The generated region is invalid TOML even without repository content. Repair the catalog template that renders this region before retrying.",
+            ),
+            (
+                RefusalRemedy::HostAlreadyUnparsable,
+                "This file does not parse as it stands, before this region is written, so no run can write it until the existing TOML is repaired.",
+            ),
+            (
+                RefusalRemedy::BetweenManagedRegions,
+                "Reconcile the neighboring managed regions in the catalog before retrying; array hosts cannot depend on staged ownership migrations.",
+            ),
+            (
+                RefusalRemedy::MalformedMarkers,
+                "Without a matching pair of sentinels the boundary of the generated body cannot be established, so anvil will not write this region rather than risk appending a second copy of it. Restore the missing sentinel around the body anvil generated, or delete the stray one together with the body it was meant to enclose.",
+            ),
+            (
+                RefusalRemedy::RetirementInference,
+                "Identify the marker pair whose body matches the recorded generated content and remove only competing marker lines while preserving their bodies. If XML tokenization failed, repair the repository-owned XML first so anvil can inspect the complete host, then retry.",
+            ),
+            (
+                RefusalRemedy::SyntaxChange,
+                "Restore the catalog's previous comment syntax, or deliberately remove the old marker lines and their generated body before retrying with the new syntax.",
+            ),
+            (
+                RefusalRemedy::XmlPlacement,
+                "Create or restore a well-formed XML host with its closing document-root element on its own line so anvil can insert the managed region inside the root, then retry.",
+            ),
+            (
+                RefusalRemedy::EditedRegion,
+                "The body between the sentinels is anvil's to write, and it will not overwrite changes it did not make. Settings that must survive belong outside the sentinels, where anvil never touches them.",
+            ),
+        ] {
+            assert_eq!(
+                array_plan_refusal(
+                    "config.toml",
+                    &crate::emit::managed_region::ManagedRegionRefusal::new(app_err!("problem"), remedy)
+                )
+                .to_string(),
+                format!("Refused TOML array host config.toml: problem. No plan was produced; no files were changed. {expected}")
+            );
+        }
+    }
+
+    #[test]
+    fn toml_array_plan_refuses_header_dependencies_and_partial_migrations() {
+        let header = "# >>> anvil-managed: parent\n[plugins]\n# <<< anvil-managed: parent\n";
+        let entries = "default = [\n# >>> anvil-managed: entries\n\"required\",\n# <<< anvil-managed: entries\n\"user\"]\n";
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.toml", "parent", checksum_str("[plugins]\n"));
+        manifest.set_region("config.toml", "entries", checksum_str("\"required\",\n"));
+        let parent = RegionSpec {
+            host: HostSelector::Path("config.toml".to_owned()),
+            id: RegionId::new("parent"),
+            body: "[other]\n".to_owned(),
+            syntax: CommentSyntax::Hash,
+        };
+        let dependency = "Refused TOML array host config.toml: this change would remove or rebind the live TOML array selector [\"plugins\", \"default\"]. No plan was produced; no files were changed. Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported.";
+        for array_first in [false, true] {
+            let error = array_plan(
+                &format!("{header}{entries}"),
+                &manifest,
+                &array_catalog(Some(parent.clone()), array_first),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if array_first {
+                    dependency
+                } else {
+                    "Refused TOML array host config.toml: the managed region is outside its selected TOML array. No plan was produced; no files were changed. Keep array scaffolding repository-owned and independent of other regions. Ownership migrations are not supported."
+                }
+            );
+        }
+        // Both regions retiring must not rebind the remaining user array either.
+        let empty = Catalog::builder(test_cli()).build().unwrap();
+        assert_eq!(
+            array_plan(&format!("{header}{entries}"), &manifest, &empty)
+                .unwrap_err()
+                .to_string(),
+            dependency
+        );
+        let malformed = format!("{header}{entries}# >>> anvil-managed: stray\n");
+        let error = array_plan(&malformed, &manifest, &empty).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Refused TOML array host config.toml: opening sentinel without its matching close. No plan was produced; no files were changed. Without a matching pair of sentinels the boundary of the generated body cannot be established, so anvil will not write this region rather than risk appending a second copy of it. Restore the missing sentinel around the body anvil generated, or delete the stray one together with the body it was meant to enclose."
+        );
+        let duplicate = format!("{header}{entries}\n[plugins]\nmode = true\n");
+        for array_first in [false, true] {
+            assert_eq!(
+                array_plan(&duplicate, &manifest, &array_catalog(None, array_first))
+                    .unwrap_err()
+                    .to_string(),
+                "Refused TOML array host config.toml: TOML parse error at line 10, column 2\n   |\n10 | [plugins]\n   |  ^^^^^^^\nduplicate key\n. No plan was produced; no files were changed. This file does not parse as it stands, before this region is written, so no run can write it until the existing TOML is repaired."
+            );
+        }
+    }
+
+    #[test]
+    fn toml_array_plan_retirement_ignores_markers_in_multiline_string_data() {
+        let source = "text = '''\n# >>> anvil-managed: entries\nnot ownership\n# <<< anvil-managed: entries\n'''\n[plugins]\ndefault = [\n# >>> anvil-managed: entries\n\"required\",\n# <<< anvil-managed: entries\n\"user\"]\n";
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.toml", "entries", checksum_str("\"required\",\n"));
+        let empty = Catalog::builder(test_cli()).build().unwrap();
+        let plan = array_plan(source, &manifest, &empty).unwrap();
+        assert_eq!(plan.items().len(), 1);
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some(
+                "text = '''\n# >>> anvil-managed: entries\nnot ownership\n# <<< anvil-managed: entries\n'''\n[plugins]\ndefault = [\n\"user\"]\n"
+            )
+        );
+        assert_eq!(plan.projected_manifest(&manifest).regions.len(), 0);
+    }
+
+    #[test]
+    fn toml_array_plan_rejects_resolved_identity_aliases_before_planning() {
+        for (selector, workspace) in [
+            (
+                HostSelector::WorkspaceCargoToml,
+                Workspace {
+                    members: Vec::new(),
+                    has_workspace_table: true,
+                },
+            ),
+            (
+                HostSelector::SingleCrateCargoToml,
+                Workspace {
+                    members: Vec::new(),
+                    has_workspace_table: false,
+                },
+            ),
+            (
+                HostSelector::EachMemberManifest,
+                Workspace {
+                    members: vec![workspace::WorkspaceMember {
+                        manifest_relpath: "Cargo.toml".to_owned(),
+                    }],
+                    has_workspace_table: true,
+                },
+            ),
+        ] {
+            let spec = RegionSpec {
+                host: selector,
+                id: RegionId::new("same"),
+                body: "\"x\",\n".to_owned(),
+                syntax: CommentSyntax::Hash,
+            };
+            let mut literal = spec.clone();
+            literal.host = HostSelector::Path("Cargo.toml".to_owned());
+            let catalog = Catalog::builder(test_cli())
+                .with_artifact(Artifact::region(literal))
+                .with_toml_array_region(crate::catalog::TomlArrayRegionSpec {
+                    region: spec,
+                    path: vec!["items".to_owned()],
+                })
+                .build()
+                .unwrap();
+            let error = build_plan_with_hosts(
+                Path::new("in-memory-array-tests"),
+                &workspace,
+                &Manifest::default(),
+                &[],
+                &catalog,
+                &mut memory_hosts(),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "duplicate resolved region identity: Cargo.toml [same]");
+        }
+    }
+
+    #[test]
+    fn toml_array_plan_rejects_resolved_syntax_aliases_before_planning() {
+        for selector in [
+            HostSelector::WorkspaceCargoToml,
+            HostSelector::SingleCrateCargoToml,
+            HostSelector::EachMemberManifest,
+        ] {
+            let workspace = Workspace {
+                members: vec![workspace::WorkspaceMember {
+                    manifest_relpath: "Cargo.toml".to_owned(),
+                }],
+                has_workspace_table: selector != HostSelector::SingleCrateCargoToml,
+            };
+            for reverse in [false, true] {
+                for swap in [false, true] {
+                    let literal = HostSelector::Path("Cargo.toml".to_owned());
+                    let array = crate::catalog::TomlArrayRegionSpec {
+                        region: RegionSpec {
+                            host: if swap { literal.clone() } else { selector.clone() },
+                            id: RegionId::new("entries"),
+                            body: "\"required\",\n".to_owned(),
+                            syntax: CommentSyntax::Hash,
+                        },
+                        path: vec!["items".to_owned()],
+                    };
+                    let ordinary = Artifact::region(RegionSpec {
+                        host: if swap { selector.clone() } else { literal },
+                        id: RegionId::new("ordinary"),
+                        body: String::new(),
+                        syntax: CommentSyntax::SlashSlash,
+                    });
+                    let builder = Catalog::builder(test_cli());
+                    let catalog = if reverse {
+                        builder.with_artifact(ordinary).with_toml_array_region(array)
+                    } else {
+                        builder.with_toml_array_region(array).with_artifact(ordinary)
+                    }
+                    .build()
+                    .unwrap();
+                    let mut hosts = memory_hosts();
+                    hosts.set("Cargo.toml", String::new());
+                    let error = build_plan_with_hosts(
+                        Path::new("in-memory-array-tests"),
+                        &workspace,
+                        &Manifest::default(),
+                        &[],
+                        &catalog,
+                        &mut hosts,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        "region 'ordinary' has comment syntax incompatible with its TOML array host: Cargo.toml"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toml_array_plan_rejects_absent_owned_file_aliases() {
+        for (array_host, owned_path) in [
+            ("config.toml", "CONFIG.toml"),
+            ("a/config.toml", "a//config.toml"),
+            ("a//config.toml", "a/config.toml"),
+        ] {
+            for owned_first in [false, true] {
+                let mut builder = Catalog::builder(test_cli());
+                if owned_first {
+                    builder = builder.with_artifact(Artifact::owned_file(owned_path, "other = true\n"));
+                }
+                let array = crate::catalog::TomlArrayRegionSpec {
+                    region: RegionSpec {
+                        host: HostSelector::Path(array_host.to_owned()),
+                        id: RegionId::new("entries"),
+                        body: "\"x\",\n".to_owned(),
+                        syntax: CommentSyntax::Hash,
+                    },
+                    path: vec!["items".to_owned()],
+                };
+                builder = builder.with_toml_array_region(array.clone());
+                if !owned_first {
+                    builder = builder.with_artifact(Artifact::owned_file(owned_path, "other = true\n"));
+                }
+                let workspace = Workspace {
+                    members: Vec::new(),
+                    has_workspace_table: false,
+                };
+                let mut hosts = memory_hosts();
+                let root = Path::new("in-memory-array-tests");
+                let resolved = (hosts.resolve)(root, array_host).unwrap();
+                hosts.texts.insert(resolved, None);
+                let error = build_plan_with_hosts(
+                    Path::new("in-memory-array-tests"),
+                    &workspace,
+                    &Manifest::default(),
+                    &[],
+                    &builder.build().unwrap(),
+                    &mut hosts,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!("a TOML array host cannot also be an owned file: {owned_path}")
+                );
+                let catalog = Catalog::builder(test_cli()).with_toml_array_region(array).build().unwrap();
+                let mut manifest = Manifest::default();
+                manifest.files.insert(owned_path.to_owned(), checksum_str("other = true\n"));
+                let error = build_plan_with_hosts(root, &workspace, &manifest, &[], &catalog, &mut hosts).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!("retire whole-file ownership separately before managing TOML array entries: {owned_path}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toml_array_plan_rejects_absent_case_aliases() {
+        let mut builder = Catalog::builder(test_cli());
+        for (host, id) in [("config.toml", "one"), ("CONFIG.toml", "two")] {
+            builder = builder.with_toml_array_region(crate::catalog::TomlArrayRegionSpec {
+                region: RegionSpec {
+                    host: HostSelector::Path(host.to_owned()),
+                    id: RegionId::new(id),
+                    body: "\"x\",\n".to_owned(),
+                    syntax: CommentSyntax::Hash,
+                },
+                path: vec!["items".to_owned()],
+            });
+        }
+        let workspace = Workspace {
+            members: Vec::new(),
+            has_workspace_table: false,
+        };
+        let mut hosts = memory_hosts();
+        hosts.texts.insert("config.toml".to_owned(), None);
+        hosts.texts.insert("CONFIG.toml".to_owned(), None);
+        let error = build_plan_with_hosts(
+            Path::new("in-memory-array-tests"),
+            &workspace,
+            &Manifest::default(),
+            &[],
+            &builder.build().unwrap(),
+            &mut hosts,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ambiguous casing for TOML array host: CONFIG.toml and config.toml"
+        );
+    }
+
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -1327,6 +2446,13 @@ mod tests {
                 !markers.contains("Reconcile the hand-written table"),
                 "a marker fault has nothing to do with a table: {markers}"
             );
+
+            let syntax = remedy_for(RefusalRemedy::SyntaxChange);
+            assert!(syntax.contains("previous comment syntax"), "{syntax}");
+            assert!(!syntax.contains("missing sentinel"), "{syntax}");
+
+            let xml = remedy_for(RefusalRemedy::XmlPlacement);
+            assert!(xml.contains("inside the root"), "{xml}");
         }
 
         #[test]
@@ -1462,6 +2588,26 @@ mod tests {
             };
             assert_eq!(offset, SCAFFOLD.trim_end_matches('\n').len());
             assert!(offset > 0, "the directive must keep line 1");
+        }
+
+        #[test]
+        fn scaffold_first_line_matching_does_not_accept_partial_parser_keys() {
+            for (scaffold, host, offset) in [
+                ("# syntax=docker/dockerfile:1\n", "# syntactic=different\nFROM base\n", 0),
+                (
+                    "# ordinary header\nlater\n",
+                    "# ordinary header\nFROM base\n",
+                    "# ordinary header".len(),
+                ),
+                ("", "\nFROM base\n", 0),
+                ("", "FROM base\n", 0),
+            ] {
+                assert_eq!(
+                    super::super::composed_placement(&["new"], scaffold, "new", Some(host)),
+                    RegionPlacement::At(offset),
+                    "{scaffold:?}, {host:?}"
+                );
+            }
         }
 
         #[test]
@@ -1814,11 +2960,30 @@ mod tests {
     /// entirely -- see `unpaired_markers_are_refused_rather_than_unmanaged`.
     #[cfg_attr(miri, ignore = "uses filesystem")]
     #[test]
-    fn marker_recovery_preserves_content_and_settles_for_both_syntaxes() {
-        for syntax in [CommentSyntax::Hash, CommentSyntax::SlashSlash] {
-            let prefix = if syntax == CommentSyntax::Hash { "#" } else { "//" };
-            let open = format!("{prefix} >>> anvil-managed: repair\r\n");
-            let close = format!("{prefix} <<< anvil-managed: repair\r\n");
+    fn marker_recovery_preserves_content_and_settles_for_all_syntaxes() {
+        for (syntax, prefix, open, close, suffix) in [
+            (
+                CommentSyntax::Hash,
+                "",
+                "# >>> anvil-managed: repair\r\n",
+                "# <<< anvil-managed: repair\r\n",
+                "",
+            ),
+            (
+                CommentSyntax::SlashSlash,
+                "",
+                "// >>> anvil-managed: repair\r\n",
+                "// <<< anvil-managed: repair\r\n",
+                "",
+            ),
+            (
+                CommentSyntax::Xml,
+                "<root>\r\n",
+                "<!-- >>> anvil-managed: repair -->\r\n",
+                "<!-- <<< anvil-managed: repair -->\r\n",
+                "</root>\r\n",
+            ),
+        ] {
             let catalog = Catalog::builder(CliMeta::new("anvil"))
                 .with_artifact(Artifact::region(RegionSpec {
                     host: HostSelector::Path("host.txt".to_owned()),
@@ -1829,8 +2994,8 @@ mod tests {
                 .build()
                 .unwrap();
             for input in [
-                format!("{open}{open}generated\r\n{close}user\r\n"),
-                format!("{open}generated\r\n{close}user\r\n{close}"),
+                format!("{prefix}{open}{open}generated\r\n{close}user\r\n{suffix}"),
+                format!("{prefix}{open}generated\r\n{close}user\r\n{close}{suffix}"),
             ] {
                 let tmp = empty_workspace();
                 let path = tmp.path().join("host.txt");
@@ -1841,13 +3006,341 @@ mod tests {
                 let region = find_region(&output, "repair", syntax).unwrap().unwrap();
                 assert_eq!(region.body_str(), "generated\r\n");
                 assert!(remove_region(&output, "repair", syntax).unwrap().contains("user"));
-                assert_eq!(output.matches(&open).count(), 1);
-                assert_eq!(output.matches(&close).count(), 1);
+                assert_eq!(output.matches(open).count(), 1);
+                assert_eq!(output.matches(close).count(), 1);
                 assert!(!output.replace("\r\n", "").contains('\n'));
                 assert!(!run_update(&catalog, &local_only(), tmp.path()).unwrap().plan.has_changes());
                 assert_eq!(fs::read_to_string(&path).unwrap(), output);
             }
         }
+    }
+
+    #[test]
+    fn absent_xml_region_is_inserted_inside_the_project_root() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("dirs.proj".to_owned()),
+            id: RegionId::new("projects"),
+            body: "  <Project Include=\"generated.proj\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let (plan, _) = managed_region_plan(
+            Some("<Project>\n  <Import Project=\"repository.props\" />\n</Project>\n"),
+            &Manifest::default(),
+            &spec,
+        );
+
+        assert!(plan.refusals().is_empty());
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some(concat!(
+                "<Project>\n",
+                "  <Import Project=\"repository.props\" />\n",
+                "\n",
+                "<!-- >>> anvil-managed: projects -->\n",
+                "  <Project Include=\"generated.proj\" />\n",
+                "<!-- <<< anvil-managed: projects -->\n",
+                "\n",
+                "</Project>\n",
+            ))
+        );
+    }
+
+    #[test]
+    fn absent_xml_region_is_inserted_inside_an_arbitrary_document_root() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("config.xml".to_owned()),
+            id: RegionId::new("settings"),
+            body: "  <setting name=\"generated\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let (plan, _) = managed_region_plan(
+            Some("<configuration>\n  <setting name=\"user\" />\n</configuration>\n"),
+            &Manifest::default(),
+            &spec,
+        );
+
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some(concat!(
+                "<configuration>\n",
+                "  <setting name=\"user\" />\n",
+                "\n",
+                "<!-- >>> anvil-managed: settings -->\n",
+                "  <setting name=\"generated\" />\n",
+                "<!-- <<< anvil-managed: settings -->\n",
+                "\n",
+                "</configuration>\n",
+            ))
+        );
+    }
+
+    #[test]
+    fn changing_a_live_region_syntax_refuses_without_duplicating_the_region() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("host.txt".to_owned()),
+            id: RegionId::new("projects"),
+            body: "generated\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let complete = "# >>> anvil-managed: projects\ngenerated\n# <<< anvil-managed: projects\n";
+        let malformed = "# >>> anvil-managed: projects\ngenerated\n";
+        for host in [complete, malformed] {
+            let mut manifest = Manifest::default();
+            manifest.set_region("host.txt", "projects", checksum_str("generated\n"));
+            let (plan, hosts) = managed_region_plan(Some(host), &manifest, &spec);
+
+            assert_eq!(
+                plan.refusals(),
+                &["Refused to manage host.txt [projects]: existing marker lines use hash comments, but the catalog now declares XML comments. \
+                   Changing marker syntax in place is not supported because the manifest does not record the previous syntax. This region was left unchanged; \
+                   other regions in the same file and other artifacts may still be updated. Restore the catalog's previous comment syntax, or deliberately \
+                   remove the old marker lines and their generated body before retrying with the new syntax."
+                    .to_owned()]
+            );
+            assert_eq!(hosts.cached("host.txt").as_deref(), Some(host));
+            assert_eq!(host.matches("generated").count(), 1);
+        }
+    }
+
+    #[test]
+    fn untracked_region_in_another_syntax_is_refused_without_duplication() {
+        let host = "# >>> anvil-managed: projects\ngenerated\n# <<< anvil-managed: projects\n";
+        let spec = RegionSpec {
+            host: HostSelector::Path("host.txt".to_owned()),
+            id: RegionId::new("projects"),
+            body: "generated\n".to_owned(),
+            syntax: CommentSyntax::SlashSlash,
+        };
+
+        let (plan, hosts) = managed_region_plan(Some(host), &Manifest::default(), &spec);
+
+        assert_eq!(
+            plan.refusals(),
+            &["Refused to manage host.txt [projects]: existing marker lines use hash comments, but the catalog now declares slash-slash comments. \
+               Changing marker syntax in place is not supported because the manifest does not record the previous syntax. This region was left unchanged; \
+               other regions in the same file and other artifacts may still be updated. Restore the catalog's previous comment syntax, or deliberately \
+               remove the old marker lines and their generated body before retrying with the new syntax."
+                .to_owned()]
+        );
+        assert_eq!(hosts.cached("host.txt").as_deref(), Some(host));
+        assert_eq!(host.matches("generated").count(), 1);
+    }
+
+    #[test]
+    fn empty_declared_syntax_pair_does_not_mask_the_tracked_region() {
+        let host = "# >>> anvil-managed: projects\ngenerated\n# <<< anvil-managed: projects\n\
+                    // >>> anvil-managed: projects\n// <<< anvil-managed: projects\n";
+        let spec = RegionSpec {
+            host: HostSelector::Path("host.txt".to_owned()),
+            id: RegionId::new("projects"),
+            body: "generated\n".to_owned(),
+            syntax: CommentSyntax::SlashSlash,
+        };
+        let mut manifest = Manifest::default();
+        manifest.set_region("host.txt", "projects", checksum_str("generated\n"));
+        let (plan, hosts) = managed_region_plan(Some(host), &manifest, &spec);
+
+        assert_eq!(
+            plan.refusals(),
+            &["Refused to manage host.txt [projects]: existing marker lines use hash comments, but the catalog now declares slash-slash comments. \
+               Changing marker syntax in place is not supported because the manifest does not record the previous syntax. This region was left unchanged; \
+               other regions in the same file and other artifacts may still be updated. Restore the catalog's previous comment syntax, or deliberately \
+               remove the old marker lines and their generated body before retrying with the new syntax."
+                .to_owned()]
+        );
+        assert_eq!(hosts.cached("host.txt").as_deref(), Some(host));
+    }
+
+    #[test]
+    fn live_syntax_change_refuses_when_xml_failure_hides_the_tracked_pair() {
+        let host = "<root>\n<broken attr=>\n<!-- >>> anvil-managed: settings -->\n  <generated />\n<!-- <<< anvil-managed: settings -->\n</root>\n";
+        let spec = RegionSpec {
+            host: HostSelector::Path("config.xml".to_owned()),
+            id: RegionId::new("settings"),
+            body: "setting = true\n".to_owned(),
+            syntax: CommentSyntax::Hash,
+        };
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.xml", "settings", checksum_str("  <generated />\n"));
+        let (plan, hosts) = managed_region_plan(Some(host), &manifest, &spec);
+
+        assert_eq!(
+            plan.refusals(),
+            &["Refused to manage config.xml [settings]: managed region 'settings' in 'config.xml' has XML marker-shaped lines after an XML tokenization failure, so \
+               absence cannot be proven. This region was left unchanged; other regions in the same file and other artifacts may still be updated. Restore the catalog's \
+               previous comment syntax, or deliberately remove the old marker lines and their generated body before retrying with the new syntax."
+                .to_owned()]
+        );
+        assert_eq!(hosts.cached("config.xml").as_deref(), Some(host));
+    }
+
+    #[test]
+    fn deleted_live_region_markers_allow_regeneration_in_the_declared_syntax() {
+        for (host, syntax, path) in [
+            ("<root>\n</root>\n", CommentSyntax::Xml, "config.xml"),
+            ("user content\n", CommentSyntax::SlashSlash, "config.txt"),
+        ] {
+            let spec = RegionSpec {
+                host: HostSelector::Path(path.to_owned()),
+                id: RegionId::new("settings"),
+                body: "generated\n".to_owned(),
+                syntax,
+            };
+            let mut manifest = Manifest::default();
+            manifest.set_region(path, "settings", checksum_str("old generated\n"));
+            let (plan, _) = managed_region_plan(Some(host), &manifest, &spec);
+
+            assert!(plan.refusals().is_empty(), "{:?}", plan.refusals());
+            assert_eq!(plan.items()[0].decision, Decision::Write);
+            assert!(plan.items()[0].spliced_host.as_deref().unwrap().contains("anvil-managed: settings"));
+        }
+    }
+
+    #[test]
+    fn existing_xml_region_outside_the_document_root_is_refused() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("config.xml".to_owned()),
+            id: RegionId::new("settings"),
+            body: "  <setting name=\"generated\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.xml", "settings", checksum_str(""));
+        for host in [
+            "<!-- >>> anvil-managed: settings -->\n<!-- <<< anvil-managed: settings -->\n<configuration>\n</configuration>\n",
+            "<configuration>\n</configuration>\n<!-- >>> anvil-managed: settings -->\n<!-- <<< anvil-managed: settings -->\n",
+        ] {
+            let (plan, hosts) = managed_region_plan(Some(host), &manifest, &spec);
+
+            assert_eq!(
+                plan.refusals(),
+                &["Refused to manage config.xml [settings]: the existing XML managed region is outside the document root. This region was left unchanged; other regions \
+                   in the same file and other artifacts may still be updated. Create or restore a well-formed XML host with its closing document-root element on its own \
+                   line so anvil can insert the managed region inside the root, then retry."
+                    .to_owned()]
+            );
+            assert_eq!(hosts.cached("config.xml").as_deref(), Some(host));
+        }
+    }
+
+    #[test]
+    fn existing_xml_region_may_touch_the_document_root_boundaries() {
+        let host = "<configuration>\n<!-- >>> anvil-managed: settings -->\n\
+                    <!-- <<< anvil-managed: settings -->\n</configuration>\n";
+        let spec = RegionSpec {
+            host: HostSelector::Path("config.xml".to_owned()),
+            id: RegionId::new("settings"),
+            body: String::new(),
+            syntax: CommentSyntax::Xml,
+        };
+        let mut manifest = Manifest::default();
+        manifest.set_region("config.xml", "settings", checksum_str(""));
+        let (plan, _) = managed_region_plan(Some(host), &manifest, &spec);
+
+        assert!(plan.refusals().is_empty());
+        assert_eq!(plan.items()[0].decision, Decision::InSync);
+    }
+
+    #[test]
+    fn xml_region_containment_includes_exact_root_boundaries() {
+        let root = crate::region::XmlRootBounds {
+            opening_end: 10,
+            closing_start: 20,
+            closing_line_start: Some(20),
+        };
+        assert!(region_is_inside_xml_root(10, 20, root));
+        assert!(region_is_inside_xml_root(11, 19, root));
+        assert!(!region_is_inside_xml_root(9, 20, root));
+        assert!(!region_is_inside_xml_root(10, 21, root));
+    }
+
+    #[test]
+    fn compact_xml_root_refuses_region_introduction() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("dirs.proj".to_owned()),
+            id: RegionId::new("projects"),
+            body: "  <Project Include=\"generated.proj\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let host = "<Project></Project>\n";
+        let (plan, hosts) = managed_region_plan(Some(host), &Manifest::default(), &spec);
+
+        assert_eq!(
+            plan.refusals(),
+            &["Refused to manage dirs.proj [projects]: the XML host has no complete-line closing root element, so a safe insertion point cannot be established. \
+               This region was left unchanged; other regions in the same file and other artifacts may still be updated. Create or restore a well-formed XML host \
+               with its closing document-root element on its own line so anvil can insert the managed region inside the root, then retry."
+                .to_owned()]
+        );
+        assert_eq!(hosts.cached("dirs.proj").as_deref(), Some(host));
+    }
+
+    #[test]
+    fn missing_xml_host_refuses_region_introduction() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("dirs.proj".to_owned()),
+            id: RegionId::new("projects"),
+            body: "  <Project Include=\"generated.proj\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let (plan, hosts) = managed_region_plan(None, &Manifest::default(), &spec);
+
+        assert_eq!(
+            plan.refusals(),
+            &["Refused to manage dirs.proj [projects]: the XML host does not exist, so its document root and a safe insertion point cannot be established. This region \
+               was left unchanged; other regions in the same file and other artifacts may still be updated. Create or restore a well-formed XML host with its closing \
+               document-root element on its own line so anvil can insert the managed region inside the root, then retry."
+                .to_owned()]
+        );
+        assert_eq!(hosts.cached("dirs.proj"), None);
+    }
+
+    #[test]
+    fn xml_insertion_ignores_project_close_text_inside_trailing_comment() {
+        let spec = RegionSpec {
+            host: HostSelector::Path("dirs.proj".to_owned()),
+            id: RegionId::new("projects"),
+            body: "  <Project Include=\"generated.proj\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let host = "<Project>\n</Project>\n<!--\n</Project>\n-->\n";
+        let (plan, _) = managed_region_plan(Some(host), &Manifest::default(), &spec);
+
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some(
+                "<Project>\n\n<!-- >>> anvil-managed: projects -->\n  <Project Include=\"generated.proj\" />\n<!-- <<< anvil-managed: projects -->\n\n</Project>\n<!--\n</Project>\n-->\n"
+            )
+        );
+    }
+
+    #[test]
+    fn xml_region_ids_that_match_toml_special_cases_still_insert_inside_root() {
+        for id in ["anvil-rust-lints", "anvil-delta", "anvil-spellcheck-root"] {
+            assert_eq!(
+                region_placement(id, CommentSyntax::Xml, Some("<Project>\n</Project>\n")),
+                Ok(RegionPlacement::At("<Project>\n".len()))
+            );
+        }
+        let spec = RegionSpec {
+            host: HostSelector::Path("dirs.proj".to_owned()),
+            id: RegionId::new("anvil-rust-lints"),
+            body: "  <Project Include=\"generated.proj\" />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let (plan, _) = managed_region_plan(Some("<Project>\n</Project>\n"), &Manifest::default(), &spec);
+        let spliced = plan.items()[0].spliced_host.as_deref().unwrap();
+        assert!(spliced.find("anvil-managed").unwrap() < spliced.find("</Project>").unwrap());
+
+        let delta_spec = RegionSpec {
+            host: HostSelector::Path("config.xml".to_owned()),
+            id: RegionId::new(DELTA_REGION_ID),
+            body: "  <generated />\n".to_owned(),
+            syntax: CommentSyntax::Xml,
+        };
+        let (plan, _) = managed_region_plan(Some("<root>\n</root>\n"), &Manifest::default(), &delta_spec);
+        assert!(plan.refusals().is_empty(), "{:?}", plan.refusals());
+        assert!(plan.items()[0].spliced_host.as_deref().unwrap().contains("<generated />"));
     }
 
     /// A region that has lost one of its sentinels still holds a body anvil
@@ -1862,10 +3355,23 @@ mod tests {
     #[test]
     fn unpaired_markers_are_refused_rather_than_unmanaged() {
         use crate::catalog::{CliMeta, RegionId};
-        for syntax in [CommentSyntax::Hash, CommentSyntax::SlashSlash] {
-            let prefix = if syntax == CommentSyntax::Hash { "#" } else { "//" };
-            let open = format!("{prefix} >>> anvil-managed: repair\r\n");
-            let close = format!("{prefix} <<< anvil-managed: repair\r\n");
+        for (syntax, open, close) in [
+            (
+                CommentSyntax::Hash,
+                "# >>> anvil-managed: repair\r\n",
+                "# <<< anvil-managed: repair\r\n",
+            ),
+            (
+                CommentSyntax::SlashSlash,
+                "// >>> anvil-managed: repair\r\n",
+                "// <<< anvil-managed: repair\r\n",
+            ),
+            (
+                CommentSyntax::Xml,
+                "<!-- >>> anvil-managed: repair -->\r\n",
+                "<!-- <<< anvil-managed: repair -->\r\n",
+            ),
+        ] {
             let catalog = Catalog::builder(CliMeta::new("anvil"))
                 .with_artifact(Artifact::region(RegionSpec {
                     host: HostSelector::Path("host.txt".to_owned()),
@@ -1919,6 +3425,224 @@ mod tests {
                 assert_eq!(fs::read_to_string(&path).unwrap(), input);
             }
         }
+    }
+
+    #[test]
+    fn retired_xml_region_is_removed_with_surrounding_content_preserved() {
+        let host = "<Project>\n<!-- >>> anvil-managed: projects -->\n  <Project Include=\"generated.proj\" />\n<!-- <<< anvil-managed: projects -->\n  <Target Name=\"User\" />\n</Project>\n";
+        let mut previous = Manifest::default();
+        previous.set_region("dirs.proj", "projects", checksum_str("  <Project Include=\"generated.proj\" />\n"));
+        let mut hosts = memory_hosts();
+        hosts.set("dirs.proj", host.to_owned());
+        hosts.newlines.insert("dirs.proj".to_owned(), crate::region::text_newline(host));
+        let mut plan = Plan::default();
+        plan_removals(
+            Path::new("in-memory-managed-region-tests"),
+            &previous,
+            &mut plan,
+            &mut hosts,
+            &ComposedHosts::default(),
+        )
+        .unwrap();
+
+        assert!(plan.refusals().is_empty());
+        assert_eq!(plan.items()[0].decision, Decision::Remove);
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some("<Project>\n  <Target Name=\"User\" />\n</Project>\n")
+        );
+    }
+
+    #[test]
+    fn retirement_uses_recorded_checksum_to_disambiguate_marker_syntax() {
+        let host = "# >>> anvil-managed: retired\nhash body\n# <<< anvil-managed: retired\n\
+                    // >>> anvil-managed: retired\nslash body\n// <<< anvil-managed: retired\n";
+        let mut previous = Manifest::default();
+        previous.set_region("host.txt", "retired", checksum_str("slash body\n"));
+        let mut hosts = memory_hosts();
+        hosts.set("host.txt", host.to_owned());
+        hosts.newlines.insert("host.txt".to_owned(), crate::region::text_newline(host));
+        let mut plan = Plan::default();
+
+        plan_removals(
+            Path::new("in-memory-managed-region-tests"),
+            &previous,
+            &mut plan,
+            &mut hosts,
+            &ComposedHosts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.items()[0].decision, Decision::Remove);
+        assert_eq!(
+            plan.items()[0].spliced_host.as_deref(),
+            Some("# >>> anvil-managed: retired\nhash body\n# <<< anvil-managed: retired\n")
+        );
+    }
+
+    #[test]
+    fn retirement_refuses_complete_and_malformed_evidence_in_different_syntaxes() {
+        for malformed in [
+            "// >>> anvil-managed: retired\n// >>> anvil-managed: retired\nowned body\n// <<< anvil-managed: retired\n",
+            "// >>> anvil-managed: retired\nowned body\n",
+        ] {
+            let host = format!("# >>> anvil-managed: retired\n# <<< anvil-managed: retired\n{malformed}");
+            let mut hosts = memory_hosts();
+            hosts.set("host.txt", host);
+
+            assert_eq!(
+                recorded_region_syntax(
+                    Path::new("in-memory-managed-region-tests"),
+                    &mut hosts,
+                    "host.txt",
+                    "retired",
+                    &checksum_str("owned body\n"),
+                )
+                .unwrap_err()
+                .to_string(),
+                "managed region 'retired' in 'host.txt' has ambiguous marker lines in multiple comment syntaxes"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_retirement_refuses_only_that_region_and_plans_unrelated_artifacts() {
+        let host = "# >>> anvil-managed: retired\nsame body\n# <<< anvil-managed: retired\n\
+                    // >>> anvil-managed: retired\nsame body\n// <<< anvil-managed: retired\n";
+        let mut previous = Manifest::default();
+        previous.set_region("host.txt", "retired", checksum_str("same body\n"));
+        let catalog = Catalog::builder(CliMeta::new("anvil"))
+            .with_artifact(Artifact::region(campaign_region("other.txt", "unrelated", "generated\n")))
+            .build()
+            .unwrap();
+        let mut hosts = memory_hosts();
+        hosts.set("host.txt", host.to_owned());
+        hosts.set("other.txt", String::new());
+
+        let plan = build_plan_with_hosts(
+            Path::new("in-memory-managed-region-tests"),
+            &Workspace {
+                members: Vec::new(),
+                has_workspace_table: false,
+            },
+            &previous,
+            &[],
+            &catalog,
+            &mut hosts,
+        )
+        .unwrap();
+
+        assert_eq!(plan.refusals().len(), 1);
+        assert_eq!(
+            plan.refusals()[0],
+            "Refused to manage host.txt [retired]: managed region 'retired' in 'host.txt' has multiple marker syntaxes whose bodies match the recorded checksum. \
+             This region was left unchanged; other regions in the same file and other artifacts may still be updated. Identify the marker pair whose body matches \
+             the recorded generated content and remove only competing marker lines while preserving their bodies. If XML tokenization failed, repair the \
+             repository-owned XML first so anvil can inspect the complete host, then retry."
+        );
+        assert!(plan.items().iter().any(|item| {
+            item.target
+                == Target::Region {
+                    host: "other.txt".to_owned(),
+                    id: "unrelated".to_owned(),
+                }
+                && item.decision == Decision::Write
+        }));
+        let recorded = checksum_str("same body\n");
+        assert_eq!(
+            plan.projected_manifest(&previous).region_checksum("host.txt", "retired"),
+            Some(recorded.as_str())
+        );
+    }
+
+    #[test]
+    fn retirement_refuses_multiple_checksum_matching_syntaxes() {
+        let host = "# >>> anvil-managed: retired\nsame body\n# <<< anvil-managed: retired\n\
+                    // >>> anvil-managed: retired\nsame body\n// <<< anvil-managed: retired\n";
+        let mut hosts = memory_hosts();
+        hosts.set("host.txt", host.to_owned());
+
+        assert_eq!(
+            recorded_region_syntax(
+                Path::new("in-memory-managed-region-tests"),
+                &mut hosts,
+                "host.txt",
+                "retired",
+                &checksum_str("same body\n"),
+            )
+            .unwrap_err()
+            .to_string(),
+            "managed region 'retired' in 'host.txt' has multiple marker syntaxes whose bodies match the recorded checksum"
+        );
+    }
+
+    #[test]
+    fn retirement_refuses_when_xml_tokenization_hides_marker_lines() {
+        let host = "<root>\n<broken attr=>\n<!-- >>> anvil-managed: settings -->\n  <generated />\n<!-- <<< anvil-managed: settings -->\n</root>\n";
+        let mut hosts = memory_hosts();
+        hosts.set("config.xml", host.to_owned());
+
+        assert_eq!(
+            recorded_region_syntax(
+                Path::new("in-memory-managed-region-tests"),
+                &mut hosts,
+                "config.xml",
+                "settings",
+                &checksum_str("  <generated />\n"),
+            )
+            .unwrap_err()
+            .to_string(),
+            "managed region 'settings' in 'config.xml' has XML marker-shaped lines after an XML tokenization failure, so absence cannot be proven"
+        );
+        assert_eq!(hosts.cached("config.xml").as_deref(), Some(host));
+    }
+
+    #[test]
+    fn retirement_inference_refusal_explains_malformed_xml_recovery() {
+        let host = "<root>\n<broken attr=>\n<!-- >>> anvil-managed: settings -->\n  <generated />\n<!-- <<< anvil-managed: settings -->\n</root>\n";
+        let mut previous = Manifest::default();
+        previous.set_region("config.xml", "settings", checksum_str("  <generated />\n"));
+        let mut hosts = memory_hosts();
+        hosts.set("config.xml", host.to_owned());
+        let mut plan = Plan::default();
+
+        plan_removals(
+            Path::new("in-memory-managed-region-tests"),
+            &previous,
+            &mut plan,
+            &mut hosts,
+            &ComposedHosts::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.refusals(),
+            &["Refused to manage config.xml [settings]: managed region 'settings' in 'config.xml' has XML marker-shaped lines after an XML tokenization failure, so \
+               absence cannot be proven. This region was left unchanged; other regions in the same file and other artifacts may still be updated. Identify the marker \
+               pair whose body matches the recorded generated content and remove only competing marker lines while preserving their bodies. If XML tokenization failed, \
+               repair the repository-owned XML first so anvil can inspect the complete host, then retry."
+                .to_owned()]
+        );
+    }
+
+    #[test]
+    fn retirement_ignores_xml_marker_shaped_text_inside_toml_strings() {
+        let host = "# >>> anvil-managed: settings\nowned = true\n# <<< anvil-managed: settings\n\
+                    text = '''\n<!-- >>> anvil-managed: settings -->\nuser text\n<!-- <<< anvil-managed: settings -->\n'''\n";
+        let mut hosts = memory_hosts();
+        hosts.set("config.toml", host.to_owned());
+
+        assert_eq!(
+            recorded_region_syntax(
+                Path::new("in-memory-managed-region-tests"),
+                &mut hosts,
+                "config.toml",
+                "settings",
+                &checksum_str("owned = true\n"),
+            )
+            .unwrap(),
+            CommentSyntax::Hash
+        );
     }
 
     #[cfg_attr(miri, ignore = "uses filesystem")]
@@ -2120,7 +3844,165 @@ mod tests {
     }
 
     fn empty_catalog() -> Catalog {
-        Catalog::builder(CliMeta::new("anvil")).build().unwrap()
+        Catalog::builder(test_cli()).build().unwrap()
+    }
+
+    fn campaign_region(host: &str, id: &'static str, body: &str) -> RegionSpec {
+        RegionSpec {
+            host: HostSelector::Path(host.into()),
+            id: RegionId::new(id),
+            body: body.into(),
+            syntax: CommentSyntax::Hash,
+        }
+    }
+
+    #[cfg_attr(miri, ignore = "uses filesystem; miri isolation forbids it")]
+    #[test]
+    fn planning_propagates_every_case_resolution_failure_boundary() {
+        let tmp = empty_workspace();
+        fs::write(tmp.path().join("blocked"), "").expect("blocking path exists");
+        let workspace = workspace::load_workspace(tmp.path()).expect("fixture workspace loads");
+        for artifact in [
+            Artifact::owned_file("blocked/file", "body"),
+            Artifact::region(campaign_region("blocked/host", "region", "body")),
+        ] {
+            let catalog = Catalog::builder(CliMeta::new("anvil"))
+                .with_artifact(artifact)
+                .build()
+                .expect("fixture catalog is valid");
+            build_plan(tmp.path(), &workspace, &Manifest::default(), &[], &catalog)
+                .expect_err("owned and live region resolution errors propagate through planning");
+        }
+        let mut manifest = Manifest::default();
+        manifest.set_region("blocked/host", "retired", "checksum");
+        build_plan(tmp.path(), &workspace, &manifest, &[], &empty_catalog()).expect_err("retired marker resolution errors propagate");
+        for regions in [false, true] {
+            let mut manifest = Manifest::default();
+            if regions {
+                manifest.set_region("blocked/host", "retired", "checksum");
+            } else {
+                manifest.files.insert("blocked/file".into(), "checksum".into());
+                build_plan(tmp.path(), &workspace, &manifest, &[], &empty_catalog())
+                    .expect_err("the full plan propagates removal failures");
+            }
+            plan_removals(
+                tmp.path(),
+                &manifest,
+                &mut Plan::default(),
+                &mut HostTextCache::default(),
+                &ComposedHosts::default(),
+            )
+            .expect_err("retired file/region resolution errors propagate");
+        }
+        push_region_at(
+            tmp.path(),
+            &Manifest::default(),
+            &mut Plan::default(),
+            &mut HostTextCache::default(),
+            &mut ComposedHosts::default(),
+            "blocked/host",
+            &campaign_region("blocked/host", "region", "body"),
+        )
+        .expect_err("single-host region resolution errors propagate");
+    }
+
+    #[cfg_attr(miri, ignore = "uses filesystem; miri isolation forbids it")]
+    #[test]
+    fn live_region_discovery_continues_after_owned_file_artifacts() {
+        let tmp = empty_workspace();
+        let workspace = workspace::load_workspace(tmp.path()).expect("fixture workspace loads");
+        let catalog = Catalog::builder(CliMeta::new("anvil"))
+            .with_artifact(Artifact::owned_file("owned", "body"))
+            .with_artifact(Artifact::region(campaign_region("host", "region", "body")))
+            .build()
+            .expect("fixture catalog is valid");
+        assert_eq!(
+            live_region_keys(tmp.path(), &workspace, &catalog, &HostTextCache::default()).expect("region discovery succeeds"),
+            BTreeSet::from([("host".to_owned(), "region".to_owned())])
+        );
+    }
+
+    #[test]
+    fn manifest_comparison_preserves_read_errors_absence_and_line_ending_equivalence() {
+        let error = manifest_matches(Err(ohno::app_err!("lock read unavailable")), "expected").expect_err("lock read errors propagate");
+        assert!(error.to_string().contains("lock read unavailable"), "{error}");
+        assert!(!manifest_matches(Ok(None), "").expect("absent lock is not current"));
+        assert!(manifest_matches(Ok(Some("same\r\n".into())), "same\n").expect("line endings are normalized"));
+        assert!(!manifest_matches(Ok(Some("other\n".into())), "same\n").expect("different locks are not current"));
+    }
+
+    #[test]
+    fn emptied_owned_regions_remain_retiring_after_the_checksum_changes() {
+        let text = "# >>> anvil-managed: retired\n \t\n# <<< anvil-managed: retired\n";
+        let mut previous = Manifest::default();
+        previous.set_region("host", "retired", "original-render-checksum");
+        let retiring = ComposedHosts::default().retiring_regions(&previous, "host", text, CommentSyntax::Hash);
+        assert_eq!(retiring, BTreeSet::from(["retired".to_owned()]));
+    }
+
+    #[cfg_attr(miri, ignore = "uses filesystem; miri isolation forbids it")]
+    #[test]
+    fn retirement_skips_refused_hosts_but_composes_all_later_removals_in_cache() {
+        let tmp = empty_workspace();
+        let body = "old\n";
+        let text =
+            "# >>> anvil-managed: first\nold\n# <<< anvil-managed: first\n# >>> anvil-managed: second\nold\n# <<< anvil-managed: second\n";
+        write(&tmp.path().join("later"), text);
+        write(&tmp.path().join("blocked"), text);
+        let mut previous = Manifest::default();
+        previous.set_region("blocked", "first", checksum_str(body));
+        previous.set_region("later", "first", checksum_str(body));
+        previous.set_region("later", "second", checksum_str(body));
+        let mut composed = ComposedHosts::default();
+        composed
+            .states
+            .insert("blocked".into(), ComposedHostState::Unsafe("refused".into()));
+        let mut plan = Plan::default();
+        let mut hosts = HostTextCache::default();
+        plan_removals(tmp.path(), &previous, &mut plan, &mut hosts, &composed).expect("nonrefused regions retire");
+        assert_eq!(plan.items().len(), 2);
+        assert!(plan.items().iter().all(|item| item.decision == Decision::Remove));
+        let remaining = hosts.cached("later").expect("removal caches the resulting host");
+        assert!(!remaining.contains("anvil-managed"));
+        assert!(!remaining.contains("old"));
+        assert!(!hosts.texts.contains_key("blocked"));
+    }
+
+    #[cfg_attr(miri, ignore = "uses filesystem; miri isolation forbids it")]
+    #[test]
+    fn edited_legacy_lints_emit_one_refusal_for_all_replacement_regions() {
+        let tmp = empty_workspace();
+        let manifest_path = tmp.path().join("Cargo.toml");
+        let mut text = fs::read_to_string(&manifest_path).expect("workspace manifest exists");
+        text.push_str("# >>> anvil-managed: anvil-workspace-lints\n[workspace.lints]\nrust.changed = 'warn'\n# <<< anvil-managed: anvil-workspace-lints\n");
+        write(&manifest_path, &text);
+        let mut manifest = Manifest::default();
+        manifest.set_region("Cargo.toml", "anvil-workspace-lints", "not-the-current-checksum");
+        manifest.save(tmp.path()).expect("legacy ownership is recorded");
+        let catalog = Catalog::builder(CliMeta::new("anvil"))
+            .with_artifact(Artifact::region(campaign_region(
+                "Cargo.toml",
+                "anvil-workspace-rust-lints",
+                "[workspace.lints.rust]\nchanged='warn'\n",
+            )))
+            .with_artifact(Artifact::region(campaign_region(
+                "Cargo.toml",
+                "anvil-workspace-clippy-lints",
+                "[workspace.lints.clippy]\nother='warn'\n",
+            )))
+            .build()
+            .expect("replacement catalog is valid");
+        let result = run_update(
+            &catalog,
+            &Cli {
+                dry_run: true,
+                ..local_only()
+            },
+            tmp.path(),
+        )
+        .expect("edited legacy contents are a refusal, not a run error");
+        assert_eq!(result.plan.refusals().len(), 1);
+        assert_eq!(fs::read_to_string(&manifest_path).expect("host remains readable"), text);
     }
 
     // Command-boundary and error-propagation contracts.
@@ -2408,11 +4290,9 @@ mod tests {
         assert!(composed.reported.contains(declared.path));
     }
 
-    #[cfg_attr(miri, ignore = "uses filesystem; miri isolation forbids it")]
     #[test]
     fn malformed_marker_refusals_distinguish_live_and_retired_regions() {
-        let tmp = TempDir::new().unwrap();
-        write(&tmp.path().join("host.txt"), "# >>> anvil-managed: test\ngenerated\n");
+        let text = "# >>> anvil-managed: test\ngenerated\n";
 
         for (retiring, expected, rejected) in [
             (
@@ -2427,11 +4307,13 @@ mod tests {
             ),
         ] {
             let mut plan = Plan::default();
+            let mut hosts = memory_hosts();
+            hosts.set("host.txt", text.to_owned());
             assert!(
                 !repair_or_refuse(
-                    tmp.path(),
+                    Path::new("workspace"),
                     &mut plan,
-                    &mut HostTextCache::default(),
+                    &mut hosts,
                     "host.txt",
                     "test",
                     CommentSyntax::Hash,
@@ -2443,6 +4325,40 @@ mod tests {
             assert!(refusal.contains(expected), "{refusal}");
             assert!(!refusal.contains(rejected), "{refusal}");
         }
+    }
+
+    #[test]
+    fn planning_a_live_region_reports_live_marker_refusal() {
+        let text = "# >>> anvil-managed: test\ngenerated\n";
+        let mut hosts = memory_hosts();
+        hosts.set("host.txt", text.to_owned());
+        let spec = RegionSpec {
+            host: HostSelector::Path("host.txt".to_owned()),
+            id: crate::catalog::RegionId::new("test"),
+            body: "replacement\n".to_owned(),
+            syntax: CommentSyntax::Hash,
+        };
+        let mut plan = Plan::default();
+
+        push_region_at(
+            Path::new("workspace"),
+            &Manifest::default(),
+            &mut plan,
+            &mut hosts,
+            &mut ComposedHosts::default(),
+            "host.txt",
+            &spec,
+        )
+        .unwrap();
+
+        assert_eq!(plan.refusals().len(), 1);
+        let refusal = &plan.refusals()[0];
+        assert!(
+            refusal.contains("this region's marker lines do not form a matching pair"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("retired managed region"), "{refusal}");
+        assert_eq!(hosts.cached("host.txt").as_deref(), Some(text));
     }
 
     // Lock ownership, workspace lookup, and process-exit contracts.

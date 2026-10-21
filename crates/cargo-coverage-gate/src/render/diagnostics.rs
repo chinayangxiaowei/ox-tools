@@ -104,6 +104,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_diagnostics_are_skipped_but_single_lines_are_displayed() {
+        let mut fixture = outcome(Status::Fail);
+        fixture.diagnostics = vec![
+            LineDiagnostic {
+                path: "empty.rs".into(),
+                lines: Vec::new(),
+            },
+            LineDiagnostic {
+                path: "one.rs".into(),
+                lines: vec![42],
+            },
+        ];
+        let displayed = displayed_diagnostics(&fixture);
+        assert_eq!(displayed, vec![(std::path::Path::new("one.rs"), &[42_u32][..])]);
+    }
+
+    #[test]
     fn line_ranges_compress_only_adjacent_lines() {
         assert_eq!(format_line_ranges(&[]), "");
         assert_eq!(format_line_ranges(&[7]), "7");
@@ -133,6 +150,34 @@ mod tests {
         assert_eq!(displayed.len(), 1);
         assert_eq!(displayed[0].0, std::path::Path::new("first.rs"));
         assert_eq!(displayed[0].1, (1..=100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_last_diagnostic_slot_is_filled_after_an_empty_entry() {
+        let diagnostics = [
+            LineDiagnostic {
+                path: "first.rs".into(),
+                lines: (1..=99).collect(),
+            },
+            LineDiagnostic {
+                path: "empty.rs".into(),
+                lines: Vec::new(),
+            },
+            LineDiagnostic {
+                path: "last.rs".into(),
+                lines: vec![100, 101],
+            },
+        ];
+
+        let displayed = displayed_diagnostics_from(&diagnostics);
+
+        assert_eq!(
+            displayed,
+            vec![
+                (std::path::Path::new("first.rs"), diagnostics[0].lines.as_slice()),
+                (std::path::Path::new("last.rs"), &[100_u32][..]),
+            ]
+        );
     }
 
     #[test]

@@ -395,7 +395,8 @@
 //! The campaign establishes a compiler-viable mutant schema before any mutant is executed.
 //! `cargo check` examines the instrumented packages together and compiler-rejected mutants are
 //! withdrawn until the schema checks; a code-generating build then produces the converged test
-//! binaries. A code-generation or linking failure uses the same bounded convergence rules.
+//! binaries. Packages without library targets work both on their own and alongside library packages
+//! in a workspace run. A code-generation or linking failure uses the same bounded convergence rules.
 //! `--build-timeout` bounds each compiler invocation, while
 //! `--build-timeout-multiplier` bounds later convergence rounds relative to the first.
 //!
@@ -416,8 +417,9 @@
 //! cache after taking the same lock as a run. It leaves published reports under
 //! `target/cargo-gamma`, checked-in hints and source suppressions untouched.
 //!
-//! As soon as a measured run acquires its campaign cache, it truncates `gamma-progress.log` and
-//! `gamma-selection.jsonl`. Every mutant verdict is appended and flushed to the progress journal as
+//! As soon as a fresh measured run acquires its campaign cache, it truncates `gamma-progress.log` and
+//! `gamma-selection.jsonl`. Testing-only resume preserves these logs without replaying their previous
+//! verdict lines. Every new mutant verdict is appended and flushed to the progress journal as
 //! it arrives, using the console's outcome-line format but without color or redraw escapes. Unlike
 //! the console, the journal includes ordinary killed mutants as well as survivors, timeouts, memory
 //! exhaustion, flakes and uncovered mutants. The JSON Lines selection journal is transient,
@@ -1302,16 +1304,20 @@
 //! cargo gamma hints                     # update gamma-hints.yaml
 //! ```
 //!
-//! Later runs read `gamma-hints.yaml` automatically without any command-line flags. Three
-//! kinds of information are promoted into the hints file, and none can change an answer:
+//! Later runs read `gamma-hints.yaml` automatically without any command-line flags. Inferred tests
+//! are candidates proposed from related items, files, or observed reachability; an exact killer hint
+//! identifies the previous killer for the same mutant. Three kinds of information are promoted into
+//! the hints file, and none can change an answer:
 //!
-//! - **Killer hints** — which test caught each mutant. Canonical binary order is preserved, and the
-//!   named test narrows its own binary only when filtering cannot replace another outcome. It is run
-//!   rather than believed, so a stale hint costs one filtered process before falling back to the
-//!   standard whole-binary sweep.
-//! - **Generalized scheduling hints** — ranked candidate tests for an item, candidate binaries for
+//! - **Killer hints** — which test caught each mutant. The named test is tried before inferred tests,
+//!   regardless of its binary's position. A confirmed later-binary kill skips inferred probes but
+//!   waits for earlier canonical outcomes. It is run rather than believed, so a stale hint falls
+//!   back to inferred selection and the standard whole-binary sweep. Duplicate targeted attempts
+//!   are skipped without removing confirmations or necessary whole-binary fallback.
+//! - **Test-selection hints** — ranked candidate tests for an item, candidate binaries for
 //!   a source file, and test sets observed reaching a stable source site. Every candidate is run
-//!   again and falls back conservatively when stale; no prior verdict is carried forward.
+//!   again as inferred tests and falls back conservatively when stale; no prior verdict is carried
+//!   forward. The persisted section retains its `generalized` name for compatibility.
 //! - **Build order** — which mutants failed to compile for whoever promoted the file. These are *not*
 //!   carried as verdicts. They are spliced in and offered to the compiler first, on their own, so a
 //!   mutant that really is unviable is blamed in a single probe round without another mutant's error
@@ -1336,7 +1342,7 @@
 //! ### Running only the tests that reach the mutant
 //!
 //! By default gamma skips the reachability census and runs complete reachable test binaries after
-//! exact and generalized test hints have been tried. Pass `--optimize-test-execution` to
+//! exact hints and inferred tests have been tried. Pass `--optimize-test-execution` to
 //! experimentally narrow mutants to the test cases observed executing their sites:
 //!
 //! ```bash
@@ -1398,6 +1404,25 @@
 //! uncovered mutant is evaluated again. A previous killer is tried first, but its result is checked
 //! and the ordinary suite follows when it no longer kills the mutant.
 //!
+//! ### Resuming interrupted testing
+//!
+//! Once mutant testing starts, each settled verdict is persisted before its progress is reported.
+//! After Ctrl+C or a host restart, continue that same campaign with:
+//!
+//! ```bash
+//! cargo gamma run --resume-testing
+//! ```
+//!
+//! Resume reuses the copied, instrumented workspace and compiled tests without rebuilding or
+//! repeating settled mutants. Only unfinished work runs again. The original selection and testing
+//! settings stay frozen, even if the live source, hints, or suppressions change. Missing, damaged,
+//! incompatible, completed, or pre-testing state is an error, not a request to start over.
+//! Campaigns started before this feature do not contain the required checkpoint.
+//!
+//! `cargo gamma hints`, `cargo gamma suppress`, and `cargo gamma unsuppress` also work after an
+//! interruption. Hints and suppressions use recorded partial evidence; pending mutants are not
+//! treated as verdicts. Use the same `--cache-dir` when a campaign used a redirected cache.
+//!
 //! ### What a run remembers
 //!
 //! Three things carry knowledge from one run to the next, and they differ in exactly one way that
@@ -1437,7 +1462,8 @@
 //! replacement.
 //!
 //! A run adopts only compiler unviability under a matching build context. Test outcomes are
-//! observations that can vary even when every captured input is unchanged, so they are never reused.
+//! observations that can vary even when every captured input is unchanged, so a new campaign never
+//! reuses them. Testing-only resume instead continues the same frozen campaign.
 //!
 //! **A skip directive is not a cache and must never be treated as one.**
 //! `cargo gamma suppress --apply` writes a suppression directive into the source, where it is
@@ -1699,7 +1725,8 @@ use std::{env, process};
 use cargo_gamma_lib::run;
 use real_host::RealHost;
 
-#[cfg(not(miri))]
+// `rallocator` supports only Linux and Windows hosts; others use the system allocator.
+#[cfg(all(not(miri), any(target_os = "linux", windows)))]
 rallocator::rallocator!();
 
 #[cfg_attr(coverage_nightly, coverage(off))]

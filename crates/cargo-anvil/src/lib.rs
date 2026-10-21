@@ -349,6 +349,13 @@
 //! just anvil-container cargo build
 //! ```
 //!
+//! `GITHUB_TOKEN` is not forwarded by default, and the launcher never acquires
+//! host GitHub CLI credentials. To use an explicitly supplied token, run
+//! `just anvil-container --github-token just anvil-aprz` (or omit the command
+//! for an authenticated shell). A missing token fails before engine resolution.
+//! Only use credentials with reviewed, trusted code: recipes and hooks run on
+//! the host, and opt-in prevents accidental exposure, not malicious code.
+//!
 //! The image contains the same tool versions used by the generated checks.
 //! Its tag is derived from the Dockerfile and its ignore file, the generated
 //! recipe tree, the declared root MSRV, and a root `rust-toolchain` file where
@@ -450,7 +457,7 @@ use std::process::ExitCode;
 // is deliberately not surfaced at the crate root.
 pub use anvil::artifacts;
 pub use backend::Backend;
-pub use catalog::{Artifact, Catalog, CatalogBuilder, CliMeta, HostSelector, OwnedFileSpec, RegionId, RegionSpec};
+pub use catalog::{Artifact, Catalog, CatalogBuilder, CliMeta, HostSelector, OwnedFileSpec, RegionId, RegionSpec, TomlArrayRegionSpec};
 pub use region::CommentSyntax;
 
 /// One-call entry point for a tool built on the anvil engine.
