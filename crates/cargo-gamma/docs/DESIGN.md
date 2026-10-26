@@ -355,6 +355,11 @@ assignment operators. Variables, constants, and expressions remain candidates.
 Comparisons inside a match arm's `if` guard receive the same relational
 mutations as comparisons elsewhere, while the pattern remains untouched.
 
+The default mutator selection includes whole-body `Some(value)` replacements
+for `Option<T>` returns when Gamma can construct a value of `T`. The
+`@pedantic` selector continues to select only this mutator for focused runs
+and existing scripts.
+
 Guard branches duplicate source text rather than eagerly evaluating and binding both alternatives.
 Typed runtime helpers preserve expected-type inference and evaluate their operand once. When an
 expression guard would shorten a borrowed temporary's lifetime, instrumentation lifts the edit

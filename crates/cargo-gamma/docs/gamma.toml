@@ -40,8 +40,8 @@
 # can carry a comment explaining why it is here; the entries are joined with commas and parsed by
 # exactly the same code that parses the flag.
 #
-# Default: the main catalog (equivalently, the `@default` preset). Add `@pedantic` explicitly for
-# valid but commonly low-yield mutations.
+# Default: the main catalog (equivalently, the `@default` preset), including `fn_value.some`.
+# Select `@pedantic` alone only for a focused run of `Some(value)` replacements.
 #
 # mutators = [
 #     "@default",
