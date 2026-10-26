@@ -2988,7 +2988,7 @@ fn published_candidate<T>(identity: T, order: u64) -> RankedCandidate<T> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use core::iter::once;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::fs;
 
     use camino::Utf8PathBuf;
