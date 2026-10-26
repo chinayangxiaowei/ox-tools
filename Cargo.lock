@@ -481,8 +481,10 @@ dependencies = [
  "constant_time_eq",
  "csv",
  "env_logger",
+ "fakeable",
  "fetch",
  "flate2",
+ "future_assert",
  "futures",
  "futures-util",
  "http-body-util",
@@ -1324,6 +1326,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fakeable"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "178b3df39288495c873af881414024b135b7943b4f6ee78bb1880eae74017822"
+dependencies = [
+ "fakeable_impl",
+]
+
+[[package]]
+name = "fakeable_impl"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "593c147523dbb19ab7ceed9cb0b085beaa12800c5b36cf9f3df94f34887d2f16"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "fast_time"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1539,6 +1561,12 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "future_assert"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fc599e8245c5b3f3950c04e679e43fdebfd9c799f3946f44ab17017c11d5474"
 
 [[package]]
 name = "futures"
