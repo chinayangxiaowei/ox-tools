@@ -2258,7 +2258,7 @@ mod tests {
             );
             assert_eq!(host.out(), "");
             assert_eq!(host.err(), expected.map_or_else(String::new, |gate| format!(
-                "error: no mutant counted toward {gate}, so it was never evaluated; check that the selection — `--in-diff`, `--exclude-file`, `--shard-count`/`--shard-index`, `--incremental` — leaves something to test\n"
+                "error: no mutant counted toward {gate}, so it was never evaluated; check that the selection — `--in-diff`, `--exclude-file`, `--re`, `--shard-count`/`--shard-index`, `--incremental` — leaves something to test\n"
             )));
         }
     }

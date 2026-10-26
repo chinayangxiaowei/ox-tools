@@ -4176,6 +4176,7 @@ mod tests {
     #[test]
     fn public_output_does_not_discard_an_explicit_memory_ceiling() {
         let request = MemoryRequest {
+            calibrating: false,
             meter: true,
             limit: Some(1),
         };
