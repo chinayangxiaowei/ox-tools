@@ -181,6 +181,7 @@ fn valid_resource_name(name: &str) -> bool {
 
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // #[gamma::skip(literal.int_decrement, literal.int_increment, literal.int_to_zero, reason = "the saturating allocation estimate changes capacity only; every byte still appends its two hex digits")]
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
 
     for byte in bytes {
@@ -246,6 +247,7 @@ enum Previous {
     Other,
     Expression,
     Operator,
+    Prefix,
 }
 
 impl Previous {
@@ -265,7 +267,7 @@ impl Previous {
 #[doc(hidden)]
 pub(super) const NESTING_LIMIT: usize = 64;
 
-/// How many expression-path links are allowed per delimiter nesting level.
+/// The expression-path budget per allowed delimiter level, and the cost of entering a group.
 ///
 /// This stays in step with `cargo_gamma_lib::parse::nesting`: operators, casts, calls, indexes,
 /// field and method access, try links, and `else` arms all add recursive expression shape.
@@ -280,18 +282,34 @@ struct Frame {
     iter: proc_macro2::token_stream::IntoIter,
     depth: usize,
     links: usize,
+    base: usize,
+    peak: usize,
     ladders: usize,
     awaiting_else: bool,
     previous: Previous,
 }
 
 impl Frame {
+    fn new(stream: TokenStream, depth: usize, base: usize) -> Self {
+        Self {
+            iter: stream.into_iter(),
+            depth,
+            links: base,
+            base,
+            peak: base,
+            ladders: 0,
+            awaiting_else: false,
+            previous: Previous::Other,
+        }
+    }
+
     fn exceeds_chain_limit(&self, limit: usize) -> bool {
-        self.links > limit || self.ladders > limit
+        self.links > limit || self.base.saturating_add(self.ladders) > limit
     }
 
     fn add_link(&mut self, limit: usize) -> bool {
         self.links += 1;
+        self.peak = self.peak.max(self.links);
         self.exceeds_chain_limit(limit)
     }
 
@@ -314,7 +332,8 @@ impl Frame {
 /// through to overflow the stack instead of producing this guard's diagnostic. `ladders` counts
 /// every `else` that follows a completed group at the same level, mirroring
 /// `cargo_gamma_engine::parse::nesting`'s `ladders` counter and bounded by the same chain limit
-/// as every other expression-path chain this walk already tracks.
+/// as every other expression-path chain this walk already tracks. Child groups inherit the
+/// enclosing path and return their peak rather than restarting these counters at zero.
 ///
 /// Exposed (hidden from docs) so `cargo-gamma-lib`'s agreement test can drive this scanner with
 /// the same source-text corpus it drives `cargo_gamma_engine::parse::exceeds_nesting_limit` with —
@@ -324,16 +343,9 @@ impl Frame {
 #[must_use]
 pub(super) fn exceeds_nesting_limit(stream: &TokenStream, limit: usize) -> bool {
     let chain_limit = limit.saturating_mul(CHAIN_FACTOR);
-    let mut frames = vec![Frame {
-        iter: stream.clone().into_iter(),
-        depth: 0,
-        links: 0,
-        ladders: 0,
-        awaiting_else: false,
-        previous: Previous::Other,
-    }];
+    let mut frames = vec![Frame::new(stream.clone(), 0, 0)];
 
-    while let Some(mut frame) = frames.pop() {
+    'walk: while let Some(mut frame) = frames.pop() {
         while let Some(tree) = frame.iter.next() {
             match tree {
                 TokenTree::Group(group) => {
@@ -347,26 +359,26 @@ pub(super) fn exceeds_nesting_limit(stream: &TokenStream, limit: usize) -> bool 
                     }
 
                     let next_depth = frame.depth + 1;
+                    // Blocks start a sibling body after their condition. Other groups continue
+                    // the enclosing expression path, including prefix operators before them.
+                    let inherited = if group.delimiter() == Delimiter::Brace && frame.previous != Previous::Prefix {
+                        frame.base
+                    } else {
+                        frame.links
+                    }
+                    .saturating_add(CHAIN_FACTOR);
 
-                    if next_depth > limit {
+                    if next_depth > limit || inherited > chain_limit {
                         return true;
                     }
 
                     // A complete group can be the receiver of the next call or index, or the `{ }`
-                    // block an `else` ladder continues from. The child gets a fresh expression
-                    // path because only links at the same token-stream level share one chain.
+                    // block an `else` ladder continues from.
                     frame.awaiting_else = group.delimiter() == Delimiter::Brace;
                     frame.previous = Previous::Expression;
                     frames.push(frame);
-                    frames.push(Frame {
-                        iter: group.stream().into_iter(),
-                        depth: next_depth,
-                        links: 0,
-                        ladders: 0,
-                        awaiting_else: false,
-                        previous: Previous::Other,
-                    });
-                    break;
+                    frames.push(Frame::new(group.stream(), next_depth, inherited));
+                    continue 'walk;
                 }
 
                 TokenTree::Ident(ident) if ident == "as" => {
@@ -398,7 +410,7 @@ pub(super) fn exceeds_nesting_limit(stream: &TokenStream, limit: usize) -> bool 
                         // An operand after an expression begins a new chain across statement and
                         // keyword boundaries. Keep `ladders`: an `else if` condition resets
                         // `links`, while the separate ladder count must span every arm.
-                        frame.links = 0;
+                        frame.links = frame.base;
                     }
 
                     frame.previous = Previous::Expression;
@@ -421,19 +433,23 @@ pub(super) fn exceeds_nesting_limit(stream: &TokenStream, limit: usize) -> bool 
                     }
 
                     if matches!(punct.as_char(), ',' | ';') {
-                        // #[gamma::skip(assign_value.default, reason = "usize::default() is zero, so replacing this reset is behavior-identical")]
-                        frame.links = 0;
-                        // #[gamma::skip(assign_value.default, reason = "usize::default() is zero, so replacing this reset is behavior-identical")]
+                        frame.links = frame.base;
                         frame.ladders = 0;
                     }
 
                     frame.previous = if matches!(punct.as_char(), '?' | '>') {
                         Previous::Operator
+                    } else if matches!(punct.as_char(), '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '!' | '<' | '=') {
+                        Previous::Prefix
                     } else {
                         Previous::Other
                     };
                 }
             }
+        }
+        if let Some(parent) = frames.last_mut() {
+            parent.links = parent.links.max(frame.peak);
+            parent.peak = parent.peak.max(frame.peak);
         }
     }
 
@@ -668,7 +684,9 @@ pub(super) const MOST_FACTOR: f64 = 1e6;
 
 /// Checks a multiplier is positive, finite, and small enough to scale a baseline without overflow.
 fn is_bounded_multiplier(value: f64) -> bool {
-    value > 0.0 && value.is_finite() && value <= MOST_FACTOR
+    // #[gamma::skip(logical.and_remove_right, reason = "the following finite upper bound rejects positive infinity, and the positive comparison rejects NaN and negative infinity; removing is_finite cannot change the final result")]
+    let positive_finite = value > 0.0 && value.is_finite();
+    positive_finite && value <= MOST_FACTOR
 }
 
 /// Returns whether an argument is written as a bare number rather than as a key or a selector.
@@ -973,6 +991,161 @@ fn error(message: &str) -> TokenStream {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cumulative_group_and_unary_paths_share_an_exact_budget() {
+        for (outer, inner, close_inner, close_outer) in [("(", "(", ")", ")"), ("[", "{", "}", "]"), ("{", "(", ")", "}")] {
+            let boundary = format!("!!!!{outer}!!!!{inner}true{close_inner}{close_outer}");
+            let overflow = format!("!{boundary}");
+            assert!(!exceeds_nesting_limit(&stream(&boundary), 4), "{boundary}");
+            assert!(exceeds_nesting_limit(&stream(&overflow), 4), "{overflow}");
+        }
+        for separator in [",", ";"] {
+            let boundary = format!("!!!!(!!!!true{separator}!!!!false)");
+            let overflow = format!("!!!!(!!!!true{separator}!!!!!false)");
+            assert!(!exceeds_nesting_limit(&stream(&boundary), 3), "{boundary}");
+            assert!(exceeds_nesting_limit(&stream(&overflow), 3), "{overflow}");
+        }
+        assert!(!exceeds_nesting_limit(&stream("(!!!!true).field"), 3));
+        assert!(exceeds_nesting_limit(&stream("(!!!!!!!!true).field"), 3));
+    }
+
+    #[test]
+    fn cumulative_paths_are_rejected_before_stated_or_resource_parsing() {
+        // Group depth stays below NESTING_LIMIT, but each level contributes both its unary run
+        // and CHAIN_FACTOR for the delimiter. Their combined cost exceeds the public path
+        // allowance NESTING_LIMIT * CHAIN_FACTOR, isolating cumulative rather than depth rejection.
+        let expression = format!("{}true{}", "!!!!!!!!!!!!!(".repeat(16), ")".repeat(16));
+        let output = value(stream(&expression), stream("fn fixture() -> bool { true }")).to_string();
+        assert!(output.contains("expression nests too deeply to be safely parsed"), "{output}");
+        assert!(output.ends_with("fn fixture () -> bool { true }"), "{output}");
+
+        let output = resource(stream(&expression), stream("#[test] fn fixture() {}")).to_string();
+        assert!(
+            output.contains("resource arguments nest too deeply to be safely parsed"),
+            "{output}"
+        );
+        let item = format!("#[test] fn fixture() {{ {expression}; }}");
+        let output = resource(stream("\"cargo\""), stream(&item)).to_string();
+        assert!(output.contains("resource item nests too deeply to be safely parsed"), "{output}");
+        let output = value(stream("true"), stream(&item)).to_string();
+        assert!(output.contains("item nests too deeply to be safely parsed"), "{output}");
+
+        let item = stream("fn fixture() -> bool { !!(!!{ !!(true) }) }");
+        let expected = item.to_string();
+        assert_eq!(value(stream("!!(!!{ !!(true) })"), item).to_string(), expected);
+        let output = resource(stream("\"cargo\""), stream("#[test] fn fixture() { !!(!!{ !!(true) }); }")).to_string();
+        assert!(!output.contains("compile_error"), "{output}");
+        assert!(output.contains("__cargo_gamma_resource_636172676f_test_"), "{output}");
+    }
+
+    #[test]
+    fn completed_group_peaks_reach_enclosing_postfix_expressions() {
+        for (source, limit, exceeds) in [
+            ("((value.a.b.c)).d", 3, false),
+            ("((value.a.b.c.d)).e", 3, true),
+            ("(((value.a.b.c))).d", 4, false),
+            ("(((value.a.b.c.d))).e", 4, true),
+        ] {
+            assert_eq!(exceeds_nesting_limit(&stream(source), limit), exceeds, "{source}");
+        }
+    }
+
+    #[test]
+    fn resource_diagnostics_keep_exact_reason_and_attribute_name() {
+        for (arguments, expected) in [
+            ("7", "expected one string literal, as in `#[gamma::resource(\"cargo-subprocess\")]`"),
+            (
+                "\"7invalid\"",
+                "resource name must start with an ASCII letter and contain only ASCII letters, digits, `.`, `_`, or `-`",
+            ),
+        ] {
+            let output = resource(stream(arguments), stream("#[test] fn fixture() {}"));
+            let syntax = syn::parse2::<syn::File>(output).expect("diagnostic output is valid Rust items");
+            let syn::Item::Macro(error) = &syntax.items[0] else {
+                panic!("the invalid resource starts with compile_error");
+            };
+            let message = syn::parse2::<syn::LitStr>(error.mac.tokens.clone()).expect("compile_error contains one literal");
+            assert_eq!(message.value(), format!("#[gamma::resource]: {expected}"));
+        }
+    }
+
+    #[test]
+    fn resource_nesting_limits_distinguish_the_boundary_from_one_group_too_many() {
+        for depth in [NESTING_LIMIT - 1, NESTING_LIMIT, NESTING_LIMIT + 1] {
+            let attr = stream(&format!("{}\"cargo\"{}", "(".repeat(depth), ")".repeat(depth)));
+            let output = resource(attr, stream("#[test] fn fixture() {}")).to_string();
+            let expected = if depth > NESTING_LIMIT {
+                "resource arguments nest too deeply to be safely parsed"
+            } else {
+                "expected one string literal"
+            };
+            assert!(output.contains(expected), "depth {depth}: {output}");
+
+            let body_depth = depth - 1;
+            let item = stream(&format!(
+                "#[test] fn fixture() {{ {}1{}; }}",
+                "(".repeat(body_depth),
+                ")".repeat(body_depth)
+            ));
+            let output = resource(stream("\"cargo\""), item).to_string();
+            if depth > NESTING_LIMIT {
+                assert!(output.contains("resource item nests too deeply to be safely parsed"), "{output}");
+            } else {
+                assert!(!output.contains("compile_error"), "depth {depth}: {output}");
+            }
+        }
+    }
+
+    #[test]
+    fn expression_chain_budget_is_exact_and_resets_between_operands() {
+        for (source, exceeds) in [
+            ("a + b + c + d + e", false),
+            ("a + b + c + d + e + f", true),
+            ("(a + b + c + d + e)", true),
+            ("a.b.c.d.e", false),
+            ("a.b.c.d.e.f", true),
+            ("a[a][b][c][d]", true),
+            ("a[a][b][c][d][e]", true),
+            ("a b c d e", false),
+            ("a + b + c + d + e; f + g + h + i + j", false),
+            ("a + b + c + d + e, f + g + h + i + j", false),
+            ("a as A as B as C as D", false),
+            ("a as A as B as C as D as E", true),
+        ] {
+            assert_eq!(exceeds_nesting_limit(&stream(source), 1), exceeds, "{source}");
+        }
+    }
+
+    #[test]
+    fn fractional_timeout_multipliers_and_const_trait_methods_obey_the_contract() {
+        for value in [0.01, 0.5, 1.0, MOST_FACTOR] {
+            assert!(is_bounded_multiplier(value), "{value}");
+        }
+        for value in [0.0, -0.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, MOST_FACTOR + 1.0] {
+            assert!(!is_bounded_multiplier(value), "{value}");
+        }
+        assert!(validate_value(stream("1"), &stream("fn method(&self) -> u32;")).is_err());
+        let error = validate_value(stream("1"), &stream("const fn method(&self) -> u32 { 2 }"))
+            .expect_err("const trait methods cannot contain a runtime guard");
+        assert!(error.contains("expected a function that can carry a mutant"), "{error}");
+    }
+
+    #[test]
+    fn empty_argument_segments_preserve_the_exact_diagnostic() {
+        for (arguments, position) in [
+            (",", "contain"),
+            ("arith,", "end with"),
+            (",arith", "contain"),
+            ("arith,,literal", "contain"),
+        ] {
+            assert_eq!(
+                validate(stream(arguments)),
+                Err(format!("attribute arguments must not {position} an empty comma-delimited segment")),
+                "{arguments}"
+            );
+        }
+    }
 
     /// Parses test input the way `rustc` would hand it to a proc macro.
     fn stream(source: &str) -> TokenStream {
@@ -1892,6 +2065,8 @@ mod tests {
             iter: empty.clone().into_iter(),
             depth: 0,
             links: 7,
+            base: 0,
+            peak: 7,
             ladders: 0,
             awaiting_else: false,
             previous: Previous::Other,
@@ -1900,6 +2075,8 @@ mod tests {
             iter: empty.into_iter(),
             depth: 0,
             links: 0,
+            base: 0,
+            peak: 0,
             ladders: 7,
             awaiting_else: false,
             previous: Previous::Other,
@@ -1915,6 +2092,8 @@ mod tests {
             iter: TokenStream::new().into_iter(),
             depth: 0,
             links: 0,
+            base: 0,
+            peak: 0,
             ladders: 7,
             awaiting_else: true,
             previous: Previous::Other,
@@ -1942,6 +2121,30 @@ mod tests {
 
         assert!(!exceeds_nesting_limit(&stream(&at_limit), NESTING_LIMIT));
         assert!(exceeds_nesting_limit(&stream(&over_limit), NESTING_LIMIT));
+    }
+
+    #[test]
+    fn block_arguments_do_not_add_a_postfix_call_link() {
+        for expression in ["if value.field.field.field.field {}", "if value.field.field.field.field { body }"] {
+            assert!(!exceeds_nesting_limit(&stream(expression), 1), "{expression}");
+        }
+        assert!(exceeds_nesting_limit(&stream("if value.field.field.field.field() {}"), 1));
+    }
+
+    #[test]
+    fn new_operands_restart_with_the_whole_chain_budget() {
+        for expression in ["return value.a.b.c.d", "break value.a.b.c.d"] {
+            assert!(!exceeds_nesting_limit(&stream(expression), 1), "{expression}");
+        }
+        assert!(exceeds_nesting_limit(&stream("return value.a.b.c.d.e"), 1));
+    }
+
+    #[test]
+    fn punctuation_without_a_receiver_does_not_spend_a_postfix_link() {
+        for expression in ["value.a.b.c = .other", "value.a.b.c + ?other"] {
+            assert!(!exceeds_nesting_limit(&stream(expression), 1), "{expression}");
+        }
+        assert!(exceeds_nesting_limit(&stream("value.a.b.c.d.other"), 1));
     }
 
     #[test]
@@ -1985,7 +2188,7 @@ mod tests {
             );
         }
 
-        let assignment_groups = format!("value{}", " = ()".repeat(links));
+        let assignment_groups = format!("value{}", " = value".repeat(links));
         assert!(
             !exceeds_nesting_limit(&stream(&assignment_groups), NESTING_LIMIT),
             "non-postfix punctuation made following groups part of the expression chain"
@@ -2107,5 +2310,115 @@ mod tests {
                 "{tokens} must remain shallow"
             );
         }
+    }
+
+    #[test]
+    fn campaign_regression_macro_token_fragments_end_previous_else_ladders() {
+        // Macro bodies are opaque token fragments, not necessarily complete Rust expressions.
+        let ladder = format!(
+            "if condition {{}}{}",
+            " else if condition {}".repeat(NESTING_LIMIT * CHAIN_FACTOR - 5)
+        );
+        let item = stream("fn fixture() -> u8 { 1 }");
+        for separator in ["{}", "as", "next", "=>"] {
+            let expression = stream(&format!("tokens! {{ {ladder} {separator} else {{}} }}"));
+            assert!(matches!(syn::parse2::<Expr>(expression.clone()).unwrap(), Expr::Macro(_)));
+            assert_eq!(validate_value(expression, &item), Ok(()), "{separator}");
+        }
+        let overflow = stream(&format!("tokens! {{ {ladder} else {{}} }}"));
+        assert_eq!(
+            validate_value(overflow, &item),
+            Err("expression nests too deeply to be safely parsed".to_owned())
+        );
+    }
+
+    #[test]
+    fn campaign_regression_macro_fragment_commas_restart_an_incomplete_else_ladder() {
+        let ladder = format!(
+            "if condition {{}}{}",
+            " else if condition {}".repeat(NESTING_LIMIT * CHAIN_FACTOR - 6)
+        );
+        let expression = stream(&format!("tokens! {{ {ladder} else , {{}} else {{}} }}"));
+        assert!(matches!(syn::parse2::<Expr>(expression.clone()).unwrap(), Expr::Macro(_)));
+        assert_eq!(validate_value(expression, &stream("fn fixture() -> u8 { 1 }")), Ok(()));
+    }
+
+    #[test]
+    fn campaign_regression_else_does_not_make_a_macro_fragment_group_postfix() {
+        let at_limit = format!(
+            "tokens! {{ if condition {{ {}value }} else (value) }}",
+            "!".repeat(NESTING_LIMIT * CHAIN_FACTOR - 14)
+        );
+        let over_limit = format!(
+            "tokens! {{ if condition {{ {}value }} else (value) }}",
+            "!".repeat(NESTING_LIMIT * CHAIN_FACTOR - 13)
+        );
+        let item = stream("fn fixture() -> u8 { 1 }");
+        let expression = stream(&at_limit);
+        assert!(matches!(syn::parse2::<Expr>(expression.clone()).unwrap(), Expr::Macro(_)));
+        assert_eq!(validate_value(expression, &item), Ok(()));
+        assert_eq!(
+            validate_value(stream(&over_limit), &item),
+            Err("expression nests too deeply to be safely parsed".to_owned())
+        );
+    }
+
+    #[test]
+    fn module_resource_replacement_preserves_source_span_and_untouched_tokens() {
+        let item = stream("\n\nmod fixture {\n    fn retained() {}\n}\n");
+        let original = item
+            .clone()
+            .into_iter()
+            .find_map(|token| match token {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => Some(group.span()),
+                _ => None,
+            })
+            .expect("the inline module has a body");
+        let output = marker_inside_module(item, &stream("const MARKER: () = ();")).expect("an inline body accepts a marker");
+        let body = output
+            .into_iter()
+            .find_map(|token| match token {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => Some(group),
+                _ => None,
+            })
+            .expect("the replacement keeps the module body");
+        assert_eq!(body.span().start(), original.start());
+        assert_eq!(body.span().end(), original.end());
+        assert!(body.stream().to_string().starts_with("fn retained"));
+        assert!(body.stream().to_string().ends_with("const MARKER : () = () ;"));
+    }
+
+    #[test]
+    fn malformed_attribute_prefixes_do_not_hide_a_later_value_attribute() {
+        assert!(states_a_value(&stream("# # [gamma::value(1)] fn f() { 2 }")));
+        for source in ["# (gamma::value(1)) fn f() { 2 }", "# {gamma::value(1)} fn f() { 2 }"] {
+            assert!(!states_a_value(&stream(source)), "{source}");
+        }
+        for constant in [false, true] {
+            let source = if constant {
+                "const fn method(&self) -> u32;"
+            } else {
+                "fn method(&self) -> u32;"
+            };
+            let parsed = parse_function(&stream(source)).expect("trait declarations parse");
+            assert_eq!(parsed.constant, constant);
+            assert!(!parsed.has_a_body());
+        }
+    }
+
+    #[test]
+    fn nested_expression_frames_inherit_the_enclosing_path_budget() {
+        let limit = 2;
+        let links = limit * CHAIN_FACTOR;
+        let chain = format!("receiver{}", ".field".repeat(links - CHAIN_FACTOR));
+        assert!(!exceeds_nesting_limit(&stream(&format!("({chain})")), limit));
+        assert!(!exceeds_nesting_limit(&stream(&format!("({chain}), ({chain})")), limit));
+        assert!(exceeds_nesting_limit(&stream(&format!("({chain}.extra)")), limit));
+        assert!(!exceeds_nesting_limit(&stream("(receiver) else receiver"), limit));
+        let leading_else = "(else if false {} else {})";
+        assert!(
+            !exceeds_nesting_limit(&stream(leading_else), limit + 1),
+            "a child's leading else is not attached to a parent brace"
+        );
     }
 }

@@ -86,8 +86,8 @@ fn core_tools_available() -> bool {
 }
 
 /// A scratch directory prepended to `PATH` that holds pwsh command shims
-/// (`<name>.ps1`) used to make the recipe's `cargo` / `rustup` calls observable
-/// -- or to prove they never happen. pwsh resolves a bare `cargo`/`rustup` to
+/// (`<name>.ps1`) used to make the recipe's `cargo` / `cargo-delta` / `rustup` calls
+/// observable -- or to prove they never happen. pwsh resolves a bare command to
 /// the `.ps1` on PATH cross-platform, so the emitted recipes call the shim
 /// instead of the real tool. Kept in its own `TempDir` (not the workspace) so
 /// the shims never surface in the workspace's `git status` -- which the recipe's
@@ -114,9 +114,10 @@ impl ShimBin {
         Self { _dir: dir, path, log }
     }
 
-    /// A `cargo` shim that records every invocation to `ANVIL_TEST_LOG` and then
-    /// fails hard (exit 97). Used to assert a recipe path never shells out to
-    /// cargo-delta: any call both fails the recipe and leaves a log entry.
+    /// `cargo` and `cargo-delta` shims that record every invocation to
+    /// `ANVIL_TEST_LOG` and then fail hard (exit 97). Used to assert a recipe
+    /// path never shells out to cargo-delta through either invocation form:
+    /// any call both fails the recipe and leaves a log entry.
     ///
     /// 97 is an arbitrary recognizable test-only sentinel: no assertion checks
     /// for it specifically (callers verify the log is empty / the recipe
@@ -124,12 +125,10 @@ impl ShimBin {
     /// distinct from the recipe contract exit codes (1/2) so an unexpected
     /// failure surfacing this code is obviously the tripwire firing.
     fn tripwire_cargo() -> Self {
-        Self::new(&[(
-            "cargo.ps1",
-            "if ($env:ANVIL_TEST_LOG) { Add-Content -LiteralPath $env:ANVIL_TEST_LOG -Value ($args -join ' ') }\n\
-             [Console]::Error.WriteLine('cargo tripwire: unexpected cargo invocation: ' + ($args -join ' '))\n\
-             exit 97\n",
-        )])
+        let body = "if ($env:ANVIL_TEST_LOG) { Add-Content -LiteralPath $env:ANVIL_TEST_LOG -Value ($args -join ' ') }\n\
+                    [Console]::Error.WriteLine('impact computation tripwire: unexpected ' + $MyInvocation.MyCommand.Name + ' invocation: ' + ($args -join ' '))\n\
+                    exit 97\n";
+        Self::new(&[("cargo.ps1", body), ("cargo-delta.ps1", body)])
     }
 
     /// The lines logged by the shims so far (empty when nothing was invoked).
@@ -279,6 +278,105 @@ fn run_impact(root: &Path) -> String {
         );
     }
     combined
+}
+
+#[test]
+fn baseline_creation_and_partial_cleanup_share_the_same_finally_scope() {
+    let recipe = include_str!("../templates/justfiles/anvil/impact.just");
+    let creation = recipe
+        .split_once("        $env:GIT_LFS_SKIP_SMUDGE = '1'\n")
+        .unwrap()
+        .1
+        .split_once("            if (-not (Test-Path (Join-Path $wt 'Cargo.toml'))) {")
+        .unwrap()
+        .0;
+    assert_eq!(
+        creation,
+        concat!(
+            "        $baselineFailed = $false\n",
+            "        try {\n",
+            "            $worktreeOutput = @(git worktree add --detach $wt $baseSha 2>&1)\n",
+            "            if ($LASTEXITCODE -ne 0) {\n",
+            "                throw \"anvil-impact: failed to create baseline worktree at ${wt}: $($worktreeOutput -join [Environment]::NewLine)\"\n",
+            "            }\n",
+        )
+    );
+    let cleanup = recipe
+        .split_once("\n        } finally {\n")
+        .unwrap()
+        .1
+        .split_once("\n    }\n\n    # --- Current snapshot:")
+        .unwrap()
+        .0;
+    insta::assert_snapshot!("baseline_worktree_cleanup", cleanup);
+}
+
+#[test]
+fn baseline_cleanup_emits_the_error_precedence_contract() {
+    let recipe = include_str!("../templates/justfiles/anvil/impact.just");
+    let boundary = recipe
+        .split_once("                Set-Content -LiteralPath $baselineJson -Value $baseSnap -Encoding UTF8\n")
+        .unwrap()
+        .1
+        .split_once("            $cleanupFailures = ")
+        .unwrap()
+        .0;
+    assert_eq!(
+        boundary,
+        concat!(
+            "                Set-Content -LiteralPath $baselineKeyFile -Value $baselineKey -Encoding UTF8 -NoNewline\n",
+            "            }\n",
+            "        } catch {\n",
+            "            $baselineFailed = $true\n",
+            "            throw\n",
+            "        } finally {\n",
+        )
+    );
+    let policy = recipe
+        .split_once("            if ($cleanupFailures.Count -gt 0) {\n")
+        .unwrap()
+        .1
+        .split_once("\n    }\n\n    # --- Current snapshot:")
+        .unwrap()
+        .0;
+    assert_eq!(
+        policy,
+        concat!(
+            "                $cleanupMessage = \"anvil-impact: baseline cleanup failed: $($cleanupFailures -join '; ')\"\n",
+            "                if ($baselineFailed) {\n",
+            "                    Write-Warning -Message $cleanupMessage -WarningAction Continue\n",
+            "                } else {\n",
+            "                    throw $cleanupMessage\n",
+            "                }\n",
+            "            }\n",
+            "        }",
+        )
+    );
+}
+
+#[test]
+fn baseline_registration_emits_platform_separator_normalization() {
+    let registration = include_str!("../templates/justfiles/anvil/impact.just")
+        .lines()
+        .find(|line| line.trim_start().starts_with("$registeredPath = "))
+        .unwrap();
+    assert_eq!(
+        registration.trim(),
+        "$registeredPath = 'worktree ' + $wt.Replace([System.IO.Path]::DirectorySeparatorChar, [char] '/')",
+    );
+}
+
+#[test]
+fn baseline_worktree_names_do_not_reuse_abandoned_process_paths() {
+    let allocation = include_str!("../templates/justfiles/anvil/impact.just")
+        .lines()
+        .find(|line| line.trim_start().starts_with("$wt = "))
+        .expect("the embedded impact recipe assigns its baseline path to $wt");
+    assert_eq!(
+        allocation.trim(),
+        r#"$wt = Join-Path $tmpRoot "anvil-baseline-$PID-$([System.Guid]::NewGuid().ToString('N'))""#,
+        "each allocation must ask for a fresh GUID, not reuse a PID-only path"
+    );
 }
 
 #[test]
@@ -1001,37 +1099,6 @@ fn impact_falls_back_to_full_workspace_when_base_has_no_workspace() {
     );
 }
 
-/// Write a fake `cargo` into `dir` that appends its argv (one invocation per
-/// line) to `log` and exits 0, so a check recipe's tool invocation can be
-/// observed without running real cargo. `dir` is meant to be prepended to
-/// PATH via [`path_with_prefix`].
-fn fake_cargo(dir: &Path, log: &Path) {
-    fs::create_dir_all(dir).unwrap();
-    #[cfg(windows)]
-    {
-        // Script shims receive the inline argument-array expression as one
-        // nested array, whereas native Cargo flattens it. Normalize the shim
-        // input before recording the native-process argv contract.
-        let script = format!(
-            "$effectiveArgs = @()\n\
-             foreach ($argument in $args) {{\n\
-             \x20   if ($argument -is [Array]) {{ $effectiveArgs += @($argument) }} else {{ $effectiveArgs += $argument }}\n\
-             }}\n\
-             Add-Content -LiteralPath '{}' -Value ($effectiveArgs -join ' ')\n\
-             exit 0\n",
-            log.display()
-        );
-        fs::write(dir.join("cargo.ps1"), script).unwrap();
-    }
-    #[cfg(unix)]
-    {
-        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n", log.display());
-        let path = dir.join("cargo");
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
 /// The process `PATH` with `dir` prepended, so an executable in `dir` shadows
 /// the same-named tool elsewhere on PATH.
 fn path_with_prefix(dir: &Path) -> OsString {
@@ -1052,7 +1119,7 @@ fn scoped_check_consumes_cached_package_list_and_skips_on_sentinel() {
     // checks all use: a scoped check resolves its tier from the downloaded
     // target/anvil/impact cache, splits the `--package name@version` list, and
     // passes it to its cargo tool -- and short-circuits (never invoking the
-    // tool) on the `--skip` sentinel. `anvil-examples` stands in for the
+    // tool) on the `--skip` sentinel. `anvil-bench` stands in for the
     // family; a fake `cargo` on PATH captures the argv the recipe builds. This
     // guards the PowerShell capture/splitting/short-circuit path that static
     // text-presence assertions on the emitted recipe cannot.
@@ -1071,29 +1138,33 @@ fn scoped_check_consumes_cached_package_list_and_skips_on_sentinel() {
 
     let bin = root.join(".fakebin");
     let log = root.join("cargo-argv.log");
-    fake_cargo(&bin, &log);
+    let metadata = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alpha-beta-metadata.json");
+    fake_cargo_with_metadata(&bin, &log, &metadata);
     let path = path_with_prefix(&bin);
+    // The cached `--package alpha@0.1.0` list reaches Cargo as the
+    // equivalent unambiguous workspace-exclude selection.
+    let selection = "--workspace --exclude beta";
 
     // consume mode: anvil-impact no-ops (no snapshot / cargo-delta), so the
-    // ONLY cargo invocation is the recipe's own `cargo build` -- captured by
-    // the shim.
-    let out = just_cmd(root, &["anvil-examples"])
+    // ONLY logged cargo invocation is the recipe's own `cargo bench` --
+    // captured by the shim.
+    let out = just_cmd(root, &["anvil-bench"])
         .env("ANVIL_IMPACT", "consume")
         .env("PATH", &path)
         .output()
         .unwrap();
     let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success(), "scoped anvil-examples run failed:\n{combined}");
+    assert!(out.status.success(), "scoped anvil-bench run failed:\n{combined}");
     let argv = fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        argv.contains("build") && argv.contains(&affected) && argv.contains("--examples"),
-        "the cached --package list must reach the tool; captured argv:\n{argv}\nexpected to contain: build ... {affected} ... --examples"
+        argv.contains("bench") && argv.contains(selection) && argv.contains("--no-run"),
+        "the cached package list must reach the tool; captured argv:\n{argv}\nexpected to contain: bench ... {selection} ... --no-run"
     );
 
     // The `--skip` sentinel must short-circuit: the tool is never invoked.
     fs::write(impact_dir.join("include_affected.txt"), "--skip").unwrap();
     fs::write(&log, "").unwrap();
-    let skipped = just_cmd(root, &["anvil-examples"])
+    let skipped = just_cmd(root, &["anvil-bench"])
         .env("ANVIL_IMPACT", "consume")
         .env("PATH", &path)
         .output()
@@ -1103,11 +1174,11 @@ fn scoped_check_consumes_cached_package_list_and_skips_on_sentinel() {
         String::from_utf8_lossy(&skipped.stdout),
         String::from_utf8_lossy(&skipped.stderr)
     );
-    assert!(skipped.status.success(), "skipped anvil-examples run failed:\n{skip_combined}");
+    assert!(skipped.status.success(), "skipped anvil-bench run failed:\n{skip_combined}");
     let argv_skip = fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        !argv_skip.contains("build"),
-        "the --skip sentinel must short-circuit the tool (no cargo build); captured argv:\n{argv_skip}"
+        argv_skip.trim().is_empty(),
+        "the --skip sentinel must short-circuit the tool; captured argv:\n{argv_skip}"
     );
 }
 
@@ -1120,11 +1191,12 @@ fn msrv_test_uses_affected_packages_for_both_feature_modes_and_skips_without_msr
     let root = tmp.path();
     // Inject the checked-in cache directly; neither copy it nor compute impact.
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/msrv-impact-cache");
-    let affected = "--package alpha@0.1.0";
+    let affected = "--workspace --exclude beta";
 
     let bin = root.join(".fakebin");
     let log = root.join("cargo-argv.log");
-    fake_cargo(&bin, &log);
+    let metadata = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alpha-beta-metadata.json");
+    fake_cargo_with_metadata(&bin, &log, &metadata);
     let path = path_with_prefix(&bin);
     let run_msrv = || {
         just_cmd(root, &["anvil-msrv-test"])
@@ -1197,6 +1269,7 @@ fn fake_cargo_with_metadata(dir: &Path, log: &Path, metadata_json: &Path) {
              \x20   if ($argument -is [Array]) {{ $effectiveArgs += @($argument) }} else {{ $effectiveArgs += $argument }}\n\
              }}\n\
              if ($effectiveArgs -contains 'metadata') {{ Get-Content -Raw -LiteralPath '{meta}'; exit 0 }}\n\
+             if ($effectiveArgs -contains 'install' -and $effectiveArgs -contains '--list') {{ 'cargo-each v99.0.0:'; exit 0 }}\n\
              Add-Content -LiteralPath '{log}' -Value ($effectiveArgs -join ' ')\n\
              exit 0\n",
             meta = metadata_json.display(),
@@ -1207,7 +1280,7 @@ fn fake_cargo_with_metadata(dir: &Path, log: &Path, metadata_json: &Path) {
     #[cfg(unix)]
     {
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in +*) shift ;; esac\nif [ \"$1\" = metadata ]; then cat '{meta}'; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n",
+            "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = metadata ]; then cat '{meta}'; exit 0; fi; done\nif (case \"$1\" in +*) shift;; esac; [ \"$1\" = install ] && [ \"$2\" = --list ]); then echo 'cargo-each v99.0.0:'; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n",
             meta = metadata_json.display(),
             log = log.display()
         );
@@ -1226,11 +1299,12 @@ fn loom_runs_declared_targets_in_full_workspace_mode() {
     // Regression guard for the loom `--workspace` path: `anvil-loom` parses its
     // own package set from `cargo metadata`, and a prior bug turned the
     // unscoped `--workspace` value into an empty affected set that silently
-    // skipped every loom target. The representative anvil-examples/`--skip`
+    // skipped every loom target. The representative anvil-bench/`--skip`
     // test can't catch this bespoke parsing. Here a fake `cargo metadata`
     // reports a crate with a `required-features = ["loom"]` test target; run
     // under ANVIL_IMPACT=off (so the tier resolves to --workspace), loom must
-    // detect that target and invoke `cargo test -p <pkg> --test <target>`.
+    // detect that target and invoke `cargo each --package <spec> -- cargo test
+    // --package {cargo-spec} --test <target>`.
     let tmp = workspace_at_base();
     let root = tmp.path();
 
@@ -1260,7 +1334,7 @@ fn loom_runs_declared_targets_in_full_workspace_mode() {
     assert!(out.status.success(), "anvil-loom (full-workspace) run failed:\n{combined}");
     let argv = fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        argv.contains("test") && argv.contains("-p gamma") && argv.contains("--test loomtest"),
+        argv.contains("each --package gamma@0.1.0") && argv.contains("test --package {cargo-spec}") && argv.contains("--test loomtest"),
         "loom must run the declared loom target in full-workspace mode; captured argv:\n{argv}"
     );
 }
@@ -1481,6 +1555,93 @@ fn consume_without_downloaded_cache_fails_loudly() {
         shim.log_lines().is_empty(),
         "consume must not invoke cargo-delta on any path, but did: {:?}",
         shim.log_lines()
+    );
+}
+
+#[test]
+#[serial]
+fn consume_input_override_reads_complete_cache_and_fails_closed() {
+    if !core_tools_available() {
+        return;
+    }
+    let tmp = workspace();
+    let root = tmp.path();
+    let shim = ShimBin::tripwire_cargo();
+
+    // A complete default cache exists to make any accidental fallback
+    // observable when the selected input later loses one tier.
+    let default_cache = root.join("target/anvil/impact");
+    for (file, spec) in [
+        ("include_modified.txt", "--package default-modified@0.1.0"),
+        ("include_affected.txt", "--workspace"),
+        ("include_required.txt", "--workspace"),
+    ] {
+        write(&default_cache.join(file), spec);
+    }
+
+    let injected_relative = "injected [cache]";
+    let injected = root.join(injected_relative);
+    for (file, spec) in [
+        ("include_modified.txt", "--package injected-modified@0.1.0"),
+        ("include_affected.txt", "--package injected-affected@0.1.0"),
+        ("include_required.txt", "--package injected-required@0.1.0"),
+    ] {
+        write(&injected.join(file), spec);
+    }
+    let command = |args: &[&str]| {
+        just_cmd(root, args)
+            .env("ANVIL_IMPACT", "consume")
+            .env("ANVIL_IMPACT_INPUT_DIR", injected_relative)
+            .env("PATH", &shim.path)
+            .env("ANVIL_TEST_LOG", &shim.log)
+            .output()
+            .unwrap()
+    };
+
+    let complete = command(&["anvil-impact"]);
+    assert!(
+        complete.status.success(),
+        "consume with a complete injected cache must succeed:\n{}\n{}",
+        String::from_utf8_lossy(&complete.stdout),
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    for (tier, expected) in [
+        ("modified", "--package injected-modified@0.1.0"),
+        ("affected", "--package injected-affected@0.1.0"),
+        ("required", "--package injected-required@0.1.0"),
+    ] {
+        let include = command(&["_anvil-impact-include", tier]);
+        assert!(
+            include.status.success(),
+            "reading the injected {tier} tier failed:\n{}\n{}",
+            String::from_utf8_lossy(&include.stdout),
+            String::from_utf8_lossy(&include.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&include.stdout).trim(),
+            expected,
+            "the {tier} tier must come from the injected cache"
+        );
+    }
+
+    fs::remove_file(injected.join("include_affected.txt")).unwrap();
+    for args in [&["anvil-impact"][..], &["_anvil-impact-include", "affected"][..]] {
+        let out = command(args);
+        let combined = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(
+            !out.status.success(),
+            "an injected cache missing one tier must fail instead of falling back:\n{combined}"
+        );
+        assert!(
+            combined.contains("affected"),
+            "the diagnostic must name the missing injected tier:\n{combined}"
+        );
+    }
+
+    let invocations = shim.log_lines();
+    assert!(
+        invocations.is_empty(),
+        "consume must not invoke cargo-delta while reading an injected cache, but did: {invocations:?}"
     );
 }
 

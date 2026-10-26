@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use camino::Utf8PathBuf;
 use cargo_gamma_process::MemoryRequest;
 
-use super::census;
 use super::test_binary::TestBinary;
+use super::test_listing;
 use super::verdict::Only;
 use super::workspace::Workspace;
 use crate::error::error;
@@ -85,7 +85,7 @@ pub(crate) fn validate_name(name: &str) -> core::result::Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct BinaryResources {
     binary: Vec<Arc<str>>,
     all: Vec<Arc<str>>,
@@ -93,11 +93,13 @@ struct BinaryResources {
 }
 
 /// Shared-resource admission for every test process in a campaign.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Resources {
     capacities: HashMap<Arc<str>, usize>,
     binaries: HashMap<Utf8PathBuf, BinaryResources>,
+    #[serde(skip)]
     active: Mutex<HashMap<Arc<str>, usize>>,
+    #[serde(skip)]
     changed: Condvar,
 }
 
@@ -147,6 +149,20 @@ impl Resources {
     }
 
     pub(super) fn discover(work: &Workspace, binaries: &[TestBinary], limits: &[ResourceLimit], request: MemoryRequest) -> Result<Self> {
+        Self::discover_with(
+            binaries,
+            limits,
+            |binary| test_listing::list_resource_markers(work, binary, request),
+            |binary| test_listing::list_selected_allow_empty(work, binary, request),
+        )
+    }
+
+    fn discover_with(
+        binaries: &[TestBinary],
+        limits: &[ResourceLimit],
+        mut markers: impl FnMut(&TestBinary) -> Option<Vec<Box<str>>>,
+        mut selected_tests: impl FnMut(&TestBinary) -> Option<Vec<Box<str>>>,
+    ) -> Result<Self> {
         let mut seen = BTreeSet::new();
         let mut assignments = HashMap::default();
 
@@ -157,7 +173,7 @@ impl Resources {
             if binary.libtest == Some(false) {
                 continue;
             }
-            let Some(names) = census::list_resource_markers(work, binary, request) else {
+            let Some(names) = markers(binary) else {
                 return Err(error!(
                     "could not list tests in `{}` while discovering its `#[gamma::resource(...)]` declarations.\n\
                      Run that test binary with `--list --format terse` to diagnose why its harness cannot be enumerated.",
@@ -184,7 +200,7 @@ impl Resources {
             }
 
             if !test_markers.is_empty() {
-                let selected: BTreeSet<Box<str>> = census::list_selected_allow_empty(work, binary, request)
+                let selected: BTreeSet<Box<str>> = selected_tests(binary)
                     .ok_or_else(|| {
                         error!(
                             "could not list the selected tests in `{}` while applying its `#[gamma::resource(...)]` declarations.\n\
@@ -248,21 +264,26 @@ impl Resources {
         let names = self.required(binary, only);
 
         let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        // #[gamma::skip(cond.negate, iter.any_to_all, tag = "timeout", reason = "the capacity wait predicate must unblock when all requested resources become available")]
         while names
             .iter()
+            // #[gamma::skip(relational.ge_to_le, literal.int_increment, tag = "timeout", reason = "the campaign capacity comparison prevented a waiter from acquiring released resources")]
             .any(|name| active.get(name).copied().unwrap_or(0) >= self.capacities.get(name).copied().unwrap_or(1))
         {
             waiting();
+            // #[gamma::skip(stmt.delete_assign, tag = "timeout", reason = "waiting must release and reacquire the mutex so permit holders can return resources")]
             active = self.changed.wait(active).unwrap_or_else(PoisonError::into_inner);
         }
         for name in &names {
             let count = active.entry(Arc::clone(name)).or_default();
+            // #[gamma::skip(literal.int_increment, tag = "timeout", reason = "counting each permit twice leaks active capacity after it is dropped")]
             *count = count.saturating_add(1);
         }
 
         ResourcePermit { resources: self, names }
     }
 
+    // #[gamma::skip(fn_value.one_element, tag = "timeout", reason = "fabricated resource names in the campaign made resource-limited scheduling wait indefinitely")]
     pub(super) fn required(&self, binary: &TestBinary, only: Only<'_>) -> Vec<Arc<str>> {
         let Some(binary) = self.binaries.get(&binary.path) else {
             return Vec::new();
@@ -270,17 +291,6 @@ impl Resources {
         let mut names = match only {
             Only::All => binary.all.clone(),
             Only::One(test) => binary.by_test.get(test).cloned().unwrap_or_default(),
-            Only::These(tests) => {
-                let mut names: Vec<Arc<str>> = tests
-                    .iter()
-                    .filter_map(|test| binary.by_test.get(*test))
-                    .flatten()
-                    .cloned()
-                    .collect();
-                names.sort_unstable();
-                names.dedup();
-                names
-            }
         };
         if !matches!(only, Only::All) {
             names.extend(binary.binary.iter().cloned());
@@ -312,10 +322,12 @@ pub(super) struct ResourcePermit<'resources> {
 }
 
 impl Drop for ResourcePermit<'_> {
+    // #[gamma::skip(fn_value.unit, tag = "timeout", reason = "not returning a permit leaves subsequent resource waiters blocked")]
     fn drop(&mut self) {
         let mut active = self.resources.active.lock().unwrap_or_else(PoisonError::into_inner);
         for name in &self.names {
             if let Some(count) = active.get_mut(name) {
+                // #[gamma::skip(stmt.delete_assign, literal.int_decrement, tag = "timeout", reason = "each dropped permit must decrement its active resource count")]
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     active.remove(name);
@@ -323,6 +335,7 @@ impl Drop for ResourcePermit<'_> {
             }
         }
         core::mem::drop(active);
+        // #[gamma::skip(stmt.delete_call, tag = "timeout", reason = "resource waiters must be notified after capacity is returned")]
         self.resources.changed.notify_all();
     }
 }
@@ -381,6 +394,268 @@ mod tests {
 
     use super::*;
     use crate::testing::test_binary;
+
+    #[test]
+    fn an_unconfigured_required_resource_has_one_slot_and_returns_it_without_waiting() {
+        let binary = test_binary("default-capacity");
+        let mut resources = Resources::fake_tests(&binary, &[("selected", "io")]);
+        resources.capacities.clear();
+        let permit = resources.acquire_observed(&binary, Only::One("selected"), || {
+            panic!("an idle default-capacity resource must not wait")
+        });
+        let active = resources.active.lock().unwrap().get("io").copied();
+        assert_eq!(active, Some(1));
+        drop(permit);
+        assert!(resources.active.lock().unwrap().is_empty());
+        let permit = resources.acquire_observed(&binary, Only::All, || {
+            panic!("dropping the first permit must return the default slot")
+        });
+        let active = resources.active.lock().unwrap().get("io").copied();
+        assert_eq!(active, Some(1));
+        drop(permit);
+        assert!(resources.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resource_discovery_forwards_the_prebaseline_memory_request_to_marker_enumeration() {
+        let root = camino::Utf8Path::new(if cfg!(windows) { "C:/resource-policy" } else { "/resource-policy" });
+        let work = Workspace::adopt(root.to_owned(), root.join("target"));
+        let binary = test_binary("resource-listing");
+        let resources = test_listing::with_listing_runner(
+            |command, budget, request| {
+                assert_eq!(command.get_program(), "resource-listing");
+                assert!(request.meter);
+                assert_eq!(request.limit, Some(37));
+                assert!(budget > Duration::ZERO);
+                assert_eq!(
+                    command.get_args().collect::<Vec<_>>(),
+                    ["--list", "--format=terse", "--ignored"].map(std::ffi::OsStr::new),
+                );
+                Some(vec!["__cargo_gamma_resource_696f_binary".into()])
+            },
+            || {
+                Resources::discover(
+                    &work,
+                    core::slice::from_ref(&binary),
+                    &[],
+                    MemoryRequest {
+                        meter: true,
+                        limit: Some(37),
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(resources.capacities().get("io"), Some(&1));
+        assert_eq!(resources.binaries.len(), 1);
+        assert_eq!(
+            resources
+                .required(&binary, Only::All)
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["io"]
+        );
+    }
+
+    #[test]
+    fn resource_hex_decode_rejects_a_bad_low_nibble_without_panicking() {
+        for invalid in ["0g", "fg", "ag", "0G", "0é", "ff", "c328"] {
+            assert_eq!(decode(invalid), None, "{invalid}");
+        }
+        assert_eq!(decode("616263"), Some("abc".into()));
+    }
+
+    #[test]
+    fn all_selection_and_partial_selection_have_identical_unique_resource_unions() {
+        let binary = test_binary("resource-union");
+        let resources = Resources::discover_with(
+            core::slice::from_ref(&binary),
+            &[],
+            |_| {
+                Some(vec![
+                    "__cargo_gamma_resource_6462_binary".into(),
+                    "__cargo_gamma_resource_6462_test_6f6e65".into(),
+                    "__cargo_gamma_resource_696f_test_6f6e65".into(),
+                ])
+            },
+            |_| Some(vec!["one".into()]),
+        )
+        .unwrap();
+        let expected = vec![Arc::<str>::from("db"), Arc::<str>::from("io")];
+        assert_eq!(resources.required(&binary, Only::All), expected);
+        assert_eq!(resources.required(&binary, Only::One("one")), expected);
+        assert_eq!(resources.required(&binary, Only::One("unknown")), [Arc::<str>::from("db")]);
+        let only_test_resources = Resources::discover_with(
+            core::slice::from_ref(&binary),
+            &[],
+            |_| Some(vec!["__cargo_gamma_resource_696f_test_6f6e65".into()]),
+            |_| Some(vec!["one".into()]),
+        )
+        .unwrap();
+        assert_eq!(only_test_resources.required(&binary, Only::All), [Arc::<str>::from("io")]);
+        assert!(only_test_resources.required(&binary, Only::One("unknown")).is_empty());
+    }
+
+    #[test]
+    fn discovery_matrix_authenticates_markers_filters_tests_and_retains_exact_sorted_resources() {
+        use core::fmt::Write as _;
+        let encode = |text: &str| {
+            text.bytes().fold(String::new(), |mut output, byte| {
+                write!(output, "{byte:02x}").expect("writing formatted bytes to a String cannot fail");
+                output
+            })
+        };
+        let marker_binary = |resource: &str| format!("{MARKER_PREFIX}{}{BINARY_SUFFIX}", encode(resource)).into_boxed_str();
+        let marker_test = |resource: &str, test: &str| {
+            format!("suite::{MARKER_PREFIX}{}{TEST_SEPARATOR}{}", encode(resource), encode(test)).into_boxed_str()
+        };
+        let mut custom = test_binary("custom");
+        custom.libtest = Some(false);
+        let empty = test_binary("empty");
+        let binary_only = test_binary("binary-only");
+        let mixed = test_binary("mixed");
+        let mut marker_calls = Vec::new();
+        let mut selected_calls = Vec::new();
+        let resources = Resources::discover_with(
+            &[custom, empty.clone(), binary_only.clone(), mixed.clone()],
+            &[ResourceLimit::new("alpha", 3).expect("valid alpha capacity")],
+            |binary| {
+                marker_calls.push(binary.path.clone());
+                Some(match binary.path.as_str() {
+                    "empty" => vec!["ordinary".into()],
+                    "binary-only" => vec![marker_binary("zeta"), marker_binary("alpha"), marker_binary("zeta")],
+                    "mixed" => vec![
+                        "ordinary".into(),
+                        marker_test("zeta", "selected"),
+                        marker_test("alpha", "selected"),
+                        marker_test("zeta", "selected"),
+                        marker_test("excluded", "ignored"),
+                        marker_binary("gamma"),
+                    ],
+                    _ => panic!("custom harness must not be enumerated"),
+                })
+            },
+            |binary| {
+                selected_calls.push(binary.path.clone());
+                Some(vec!["suite::selected".into()])
+            },
+        )
+        .expect("well-formed marker discovery");
+        assert_eq!(marker_calls, ["empty", "binary-only", "mixed"].map(Utf8PathBuf::from));
+        assert_eq!(selected_calls, ["mixed"].map(Utf8PathBuf::from));
+        assert!(!resources.binaries.contains_key(&empty.path));
+        assert_eq!(resources.binaries.len(), 2);
+        assert_eq!(
+            resources.capacities(),
+            [
+                (Arc::<str>::from("alpha"), 3),
+                (Arc::<str>::from("gamma"), 1),
+                (Arc::<str>::from("zeta"), 1)
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            resources.binaries[&binary_only.path]
+                .binary
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(
+            resources.binaries[&mixed.path].by_test["suite::selected"]
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["alpha", "zeta"]
+        );
+        assert!(!resources.binaries[&mixed.path].by_test.contains_key("suite::ignored"));
+        for (only, expected) in [
+            (Only::All, vec!["alpha", "gamma", "zeta"]),
+            (Only::One("suite::selected"), vec!["alpha", "gamma", "zeta"]),
+            (Only::One("suite::ignored"), vec!["gamma"]),
+            (Only::One("missing"), vec!["gamma"]),
+        ] {
+            assert_eq!(
+                resources.required(&mixed, only).iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_error_matrix_propagates_marker_and_selected_listing_failures_without_panics() {
+        let binary = test_binary("broken-harness");
+        let failed = Resources::discover_with(
+            core::slice::from_ref(&binary),
+            &[],
+            |_binary| None,
+            |_binary| panic!("marker listing already failed"),
+        )
+        .expect_err("failed marker enumeration");
+        assert_eq!(
+            failed.to_string(),
+            "could not list tests in `broken-harness` while discovering its `#[gamma::resource(...)]` declarations.\nRun that test binary with `--list --format terse` to diagnose why its harness cannot be enumerated."
+        );
+        let failed = Resources::discover_with(
+            core::slice::from_ref(&binary),
+            &[],
+            |_binary| Some(vec!["__cargo_gamma_resource_61_test_62".into()]),
+            |_binary| None,
+        )
+        .expect_err("failed selected enumeration");
+        assert_eq!(
+            failed.to_string(),
+            "could not list the selected tests in `broken-harness` while applying its `#[gamma::resource(...)]` declarations.\nRun that test binary with cargo-gamma's test arguments plus `--list --format terse` to diagnose the selection."
+        );
+        let empty = Resources::discover_with(
+            &[binary],
+            &[],
+            |_binary| Some(vec!["__cargo_gamma_resource_61_test_62".into()]),
+            |_binary| Some(Vec::new()),
+        )
+        .expect("empty selected population is authoritative");
+        assert!(empty.binaries.is_empty());
+        assert!(empty.capacities.is_empty());
+    }
+
+    #[test]
+    fn permit_count_matrix_releases_exactly_one_and_removes_only_exhausted_entries() {
+        let binary = test_binary("permit-count");
+        let mut resources = Resources::fake_binary(&binary);
+        *resources.capacities.get_mut("test-resource").expect("fake capacity exists") = 3;
+        let first = resources.acquire(&binary, Only::All);
+        let second = resources.acquire(&binary, Only::All);
+        assert_eq!(resources.active.lock().expect("healthy lock").get("test-resource"), Some(&2));
+        drop(first);
+        assert_eq!(resources.active.lock().expect("healthy lock").get("test-resource"), Some(&1));
+        drop(second);
+        assert!(resources.active.lock().expect("healthy lock").is_empty());
+    }
+
+    #[test]
+    fn resource_errors_and_marker_decoding_have_exact_validation_outcomes() {
+        for (input, error) in [
+            ("cargo", "expected `NAME=N`, for example `cargo-subprocess=2`"),
+            ("cargo=0", "resource concurrency must be at least 1"),
+            ("cargo=bad", "resource concurrency `bad` is not a positive integer"),
+        ] {
+            assert_eq!(input.parse::<ResourceLimit>().expect_err("invalid resource capacity"), error);
+        }
+        assert!(is_marker("__cargo_gamma_resource_61_binary"));
+        for marker_name in [
+            "__cargo_gamma_resource_ff_test_61",
+            "__cargo_gamma_resource_61_test_ff",
+            "__cargo_gamma_resource_gg_test_61",
+            "__cargo_gamma_resource_61_test_gg",
+        ] {
+            assert_eq!(marker(marker_name), None);
+        }
+        assert_eq!(decode(""), Some(String::new()));
+        assert_eq!(decode("616263"), Some("abc".to_owned()));
+    }
 
     #[test]
     fn resource_limit_requires_a_positive_capacity() {
@@ -482,14 +757,14 @@ mod tests {
         let (_directory, work) = crate::testing::helper_workspace("resource-custom-harness", &[]);
         let mut binary = test_binary("missing-custom-harness");
         binary.libtest = Some(false);
-        census::reset_resource_listing_calls();
+        test_listing::reset_resource_listing_calls();
 
         let resources =
             Resources::discover(&work, &[binary], &[], MemoryRequest::default()).expect("custom harness has no libtest markers");
 
         assert!(resources.capacities.is_empty());
         assert!(resources.binaries.is_empty());
-        assert_eq!(census::resource_listing_calls(), 0);
+        assert_eq!(test_listing::resource_listing_calls(), 0);
     }
 
     #[test]
@@ -630,7 +905,7 @@ mod tests {
             assert_eq!(permit.names, vec![Arc::clone(&cargo), Arc::clone(&network)]);
         }
         {
-            let permit = resources.acquire(&binary, Only::These(&["first", "second"]));
+            let permit = resources.acquire(&binary, Only::One("second"));
             assert_eq!(permit.names, vec![Arc::clone(&cargo), Arc::clone(&network)]);
         }
         let unknown = test_binary("unknown");

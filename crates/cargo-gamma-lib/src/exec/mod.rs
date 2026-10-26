@@ -15,7 +15,6 @@
 mod baseline;
 mod build;
 mod cargo_options;
-mod census;
 mod config;
 mod copy;
 mod events;
@@ -46,9 +45,14 @@ mod sweep;
 mod sync;
 mod test_binary;
 mod test_environment;
+mod test_listing;
+mod testing_state;
 mod verdict;
 mod workspace;
 
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub use build::native_test_util as build_test_util;
 #[doc(inline)]
 pub use build::{OrderingHints, PackageWithdrawal, Round, Withdrawal};
 #[doc(inline)]
@@ -69,7 +73,7 @@ pub use loader::UNDER_GAMMA_VAR;
 pub(crate) use manifest::RUNTIME_CRATE;
 #[doc(inline)]
 pub use measure::{Built, Measured, Oracle, measure, run};
-pub(crate) use measure::{FailedMeasurement, run_with_locks};
+pub(crate) use measure::{FailedMeasurement, resume_testing, run_with_locks};
 #[doc(inline)]
 pub use memory::{DEFAULT_HEADROOM, DEFAULT_MULTIPLIER, Demand, MemoryControl, MemoryPolicy};
 // Named for its subject at this level, where `support` alone would say nothing about what is
@@ -80,19 +84,35 @@ pub use resources::ResourceLimit;
 #[doc(hidden)]
 pub use rustc_wrapper::run_if_requested as run_rustc_wrapper_if_requested;
 #[doc(inline)]
-pub use session::{CensusCost, CensusStatus, PackageSweepCost, Phases, Session, SweepCost};
+pub use session::{AttemptCost, InitialHints, PackageSweepCost, Phases, Session, SweepAccounting, SweepCost};
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub use sweep::run_scheduler_native_smoke;
 #[doc(inline)]
 pub use test_binary::TestBinary;
+pub(crate) use testing_state::{RecordPreparation, TestingState, finish_testing_record, invalidate_testing, partial_testing_record};
 #[doc(inline)]
 pub use verdict::READERS;
 #[cfg(loom)]
 pub(crate) use verdict::run_loom_models;
-#[cfg(test)]
-pub(crate) use workspace::mark_cache_owned_for_test;
 #[cfg(any(test, feature = "internals"))]
 pub(crate) use workspace::production_campaign_base;
+pub(crate) use workspace::{
+    TestingResumeIo, campaign_base_from_state, claim_cache, claim_campaign_state, claim_testing_state, claim_workspace,
+    remember_campaign_base, same_existing_path,
+};
 #[doc(inline)]
 pub use workspace::{Workspace, campaign_base, clean_cache, footprint, gamma_base, scratch_tree};
 #[cfg(any(test, feature = "internals"))]
 pub(crate) use workspace::{absolute as absolute_test_path, cache_lock_identity};
-pub(crate) use workspace::{campaign_base_from_state, claim_cache, claim_campaign_state, claim_workspace, remember_campaign_base};
+#[cfg(test)]
+pub(crate) use workspace::{create_private_dir_all_for_test, mark_cache_owned_for_test};
+
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod native_storage_test_util;
+
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub use sync::native_test_util as sync_test_util;

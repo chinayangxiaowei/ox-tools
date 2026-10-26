@@ -60,6 +60,12 @@ impl<H: Host> crate::exec::Events for ConsoleEvents<'_, H> {
     }
 
     fn begin(&mut self, active: &str, completed: &str, detail: &str) {
+        let detail = if active == "Excluding" {
+            self.progress.reset_unviable();
+            "unviable mutants (0 found)"
+        } else {
+            detail
+        };
         if self.dashboard.is_active() {
             self.dashboard.status(self.host, active, detail);
             return;
@@ -110,12 +116,19 @@ impl<H: Host> crate::exec::Events for ConsoleEvents<'_, H> {
     }
 
     fn convergence_progress(&mut self, unviable: usize) {
+        let unviable = self.progress.confirmed_unviable(unviable);
         let detail = format!("unviable mutants ({unviable} found)");
         if self.dashboard.is_active() {
             self.dashboard.status(self.host, "Excluding", &detail);
             return;
         }
         self.progress.update_phase(self.host, &detail);
+    }
+
+    fn convergence_activity(&mut self, _round: u32, unviable: usize, _proof: usize) {
+        // Both displays report monotonic confirmed exclusions, never check rounds, proof subset
+        // sizes, or interaction-only exclusions that do not establish individual unviability.
+        self.convergence_progress(unviable);
     }
 
     fn build_output(&mut self, line: &str) {
@@ -209,16 +222,24 @@ impl<H: Host> crate::exec::Events for ConsoleEvents<'_, H> {
         if !self.dashboard.enabled() {
             self.progress.complete(self.host, &crate::report::quantity(work.len(), "mutant"));
         }
-        self.progress.set_total(work.len());
+        self.progress.set_remaining_total(work.len());
         if self.dashboard.enabled() {
             self.progress.finish(self.host);
             self.progress.resize(self.host.terminal_width());
             self.dashboard.start_testing(self.host, jobs, self.progress.render());
+        } else {
+            self.progress.draw_now(self.host);
         }
     }
 
     fn mutant_started(&mut self) {
         self.dashboard.mutant_started();
+        self.sync_testing_status();
+        self.dashboard.tick(self.host);
+    }
+
+    fn mutant_activity(&mut self, active: bool) {
+        self.dashboard.mutant_activity(active);
         self.sync_testing_status();
         self.dashboard.tick(self.host);
     }
@@ -262,9 +283,10 @@ impl<H: Host> crate::exec::Events for ConsoleEvents<'_, H> {
 
     fn measured(&mut self, plan: &crate::discover::Plan, session: &crate::exec::Session) {
         self.dashboard.measured(plan, session);
+        self.progress.restore_outcomes(plan.mutants.iter().map(|mutant| mutant.outcome));
         for mutant in &plan.mutants {
             if mutant.outcome != Outcome::Pending {
-                self.verdict_log.record(mutant);
+                self.verdict_log.record_prepared(mutant);
             }
         }
     }
@@ -289,7 +311,6 @@ pub(super) fn mutant_detail(mutant: &crate::model::Mutant) -> String {
 }
 
 #[cfg(test)]
-#[cfg(not(miri))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use camino::Utf8PathBuf;
@@ -354,9 +375,9 @@ mod tests {
         let rendered = String::from_utf8_lossy(&events.host.err);
         assert!(rendered.contains("    Planning 0/1 mutants planned"), "{rendered}");
 
-        events.begin("Census", "Censused", "selecting useful tests");
+        events.begin("Testing", "Tested", "executing mutants");
         events.phase_progress(2, 10, "tests");
-        events.end(", selected 4 tests");
+        events.end(", 4 killed");
         events.complete("reachability index ready");
 
         assert_eq!(
@@ -446,6 +467,44 @@ mod tests {
         assert!(err.contains("SURVIVED"), "{err}");
         assert!(err.contains("peaked at 2.1 GiB"), "{err}");
         assert!(!err.contains("after"), "{err}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "restores a 45,153-mutant campaign and allocates 40,008 work items; native population-scale regression"
+    )]
+    fn testing_status_is_painted_before_execution_with_the_announced_retained_count() {
+        let mut host = Sink::default().terminal(200);
+        let mut events = ConsoleEvents {
+            host: &mut host,
+            progress: Progress::new(true, Styler::new(false), Some(200)),
+            dashboard: Dashboard::new(false, Some(200), Styler::new(false)),
+            styler: Styler::new(false),
+            show_build: false,
+            verdict_log: VerdictLog::default(),
+        };
+        let outcomes = core::iter::repeat_n(Outcome::Killed, 1381)
+            .chain([Outcome::Survived, Outcome::Timeout, Outcome::OutOfMemory])
+            .chain(core::iter::repeat_n(Outcome::CompileError, 1000))
+            .chain(core::iter::repeat_n(Outcome::Ignored, 2000))
+            .chain(core::iter::repeat_n(Outcome::NotBuilt, 761))
+            .chain(core::iter::repeat_n(Outcome::Pending, 40008));
+        let retained = events.progress.restore_outcomes(outcomes);
+        assert_eq!(retained, 1384);
+        events.sweep_planning(&empty_plan(), 1, 1);
+        let work = (0..40008)
+            .map(|_| crate::estimate::MutationWork::new(crate::estimate::WorkKind::Whole, core::time::Duration::from_secs(1)))
+            .collect::<Vec<_>>();
+        events.sweep_planned(&work, 1);
+        assert!(
+            events.host.err().contains(&format!("{retained}/41392 mutants evaluated")),
+            "{}",
+            events.host.err()
+        );
+        events.mutant(&mutant(Outcome::Killed, None));
+        assert!(events.progress.render().contains("1385/41392 mutants evaluated"));
+        assert!(!events.progress.render().contains("45153"));
     }
 
     #[test]
@@ -622,6 +681,7 @@ mod tests {
         };
 
         events.begin("Excluding", "Excluded", "unviable mutants");
+        assert!(events.host.err().contains("Excluding unviable mutants (0 found)"));
         events.convergence_progress(10);
         events.complete("10 unviable mutants, leaving 20 viable mutants");
 
@@ -640,6 +700,151 @@ mod tests {
         assert!(!rendered.contains("schema checks"), "{rendered}");
         assert!(!rendered.contains("round"), "{rendered}");
         assert!(!rendered.contains("Cargo reused"), "{rendered}");
+    }
+
+    #[test]
+    fn excluding_retains_confirmed_counts_through_proofs_in_both_displays() {
+        for dashboard in [false, true] {
+            let mut host = Sink::default().terminal(160);
+            let mut events = ConsoleEvents {
+                host: &mut host,
+                progress: Progress::new(true, Styler::new(false), Some(160)),
+                dashboard: Dashboard::new(dashboard, Some(160), Styler::new(false)),
+                styler: Styler::new(false),
+                show_build: false,
+                verdict_log: VerdictLog::default(),
+            };
+            if dashboard {
+                events.sweep_planning(&empty_plan(), 1, 1);
+            }
+            events.begin("Excluding", "Excluded", "unviable mutants");
+            if dashboard {
+                assert_eq!(events.dashboard.testing_status_for_test(), "Excluding unviable mutants (0 found)");
+            }
+            for (reported, retained) in [(3, 3), (1, 3), (10, 10), (0, 10)] {
+                events.convergence_progress(reported);
+                events.isolation_evidence(123, 456, &[], 1, 2, &[]);
+                events.build_progress("checking 99 active mutants");
+                events.build_finished();
+                let expected = format!("Excluding unviable mutants ({retained} found)");
+                if dashboard {
+                    assert_eq!(events.dashboard.testing_status_for_test(), expected);
+                } else {
+                    assert!(events.host.err().ends_with(&expected), "{}", events.host.err());
+                }
+            }
+            assert!(!events.host.err().contains("123 found"));
+            assert!(!events.host.err().contains("456 found"));
+            events.begin("Excluding", "Excluded", "unviable mutants");
+            if dashboard {
+                assert_eq!(events.dashboard.testing_status_for_test(), "Excluding unviable mutants (0 found)");
+            } else {
+                assert!(events.host.err().ends_with("Excluding unviable mutants (0 found)"));
+            }
+        }
+    }
+
+    #[test]
+    fn excluding_shows_only_confirmed_counts_during_check_activity_in_both_displays() {
+        for dashboard in [false, true] {
+            let mut host = Sink::default().terminal(160);
+            let mut events = ConsoleEvents {
+                host: &mut host,
+                progress: Progress::new(true, Styler::new(false), Some(160)),
+                dashboard: Dashboard::new(dashboard, Some(160), Styler::new(false)),
+                styler: Styler::new(false),
+                show_build: false,
+                verdict_log: VerdictLog::default(),
+            };
+            if dashboard {
+                events.sweep_planning(&empty_plan(), 1, 1);
+            }
+            events.begin("Excluding", "Excluded", "unviable mutants");
+            for (confirmed, retained, round, proof) in [(0, 0, 2, 7), (3, 3, 3, 0), (10, 10, 4, 2), (0, 10, 5, 0)] {
+                if confirmed > 0 {
+                    events.convergence_progress(confirmed);
+                }
+                events.convergence_activity(round, confirmed, proof);
+                events.build_finished();
+                let expected = format!("Excluding unviable mutants ({retained} found)");
+                if dashboard {
+                    assert_eq!(events.dashboard.testing_status_for_test(), expected);
+                } else {
+                    assert!(events.host.err().ends_with(&expected), "{}", events.host.err());
+                }
+            }
+            assert!(!events.host.err().contains("105 found"));
+            assert!(!events.host.err().contains("13 found"));
+            for hidden in ["provisional", "confirmed", "; check", "proof"] {
+                assert!(!events.host.err().contains(hidden), "{}", events.host.err());
+            }
+        }
+    }
+
+    #[test]
+    fn file_only_sweep_telemetry_never_changes_either_console_display() {
+        use core::time::Duration;
+
+        let mut session = crate::exec::Session {
+            baseline: Duration::ZERO,
+            baseline_wall: Duration::ZERO,
+            tests: None,
+            quiet: Duration::ZERO,
+            stall: None,
+            build: Duration::ZERO,
+            peak: None,
+            metered: false,
+            unbounded: None,
+            withdrawn: 0,
+            census: Vec::new(),
+            rounds: 0,
+            rounds_taken: Vec::new(),
+            binaries: Vec::new(),
+            scratch: Utf8PathBuf::from("unused"),
+            filtered: 0,
+            widened: false,
+            ordering: crate::exec::OrderingHints::default(),
+            phases: crate::exec::Phases::default(),
+        };
+        let render = |dashboard, session: &crate::exec::Session| {
+            let mut host = Sink::default().terminal(160);
+            let mut events = ConsoleEvents {
+                host: &mut host,
+                progress: Progress::new(true, Styler::new(false), Some(160)),
+                dashboard: Dashboard::new(dashboard, Some(160), Styler::new(false)),
+                styler: Styler::new(false),
+                show_build: false,
+                verdict_log: VerdictLog::default(),
+            };
+            let plan = empty_plan();
+            events.sweep_planning(&plan, 1, 1);
+            events.measured(&plan, session);
+            events.sweep_planned(&[], 1);
+            let status = events.dashboard.testing_status_for_test().to_owned();
+            let progress = events.progress.render();
+            (host.err(), host.out, status, progress)
+        };
+        for dashboard in [false, true] {
+            session.phases.sweep = None;
+            let before = render(dashboard, &session);
+            session.phases.sweep = Some(crate::exec::SweepCost {
+                accounting: Some(crate::exec::SweepAccounting {
+                    complete: true,
+                    initial_population: Some(43_164),
+                    initial_exact_hints: Some(34_603),
+                    initial_killer_confirmed: Some(245),
+                    exact: crate::exec::AttemptCost {
+                        launches: 999,
+                        execution_ms: 123_456,
+                        ..crate::exec::AttemptCost::default()
+                    },
+                    duplicate_launches_avoided: 777,
+                    ..crate::exec::SweepAccounting::default()
+                }),
+                ..crate::exec::SweepCost::default()
+            });
+            assert_eq!(render(dashboard, &session), before);
+        }
     }
 
     /// A warning about what a run is about to cost is worth nothing if it is only shown when
@@ -690,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "writes and reads the filesystem-backed testing progress log")]
     fn the_testing_progress_log_is_truncated_and_flushed_after_every_verdict() {
         let directory = crate::testing::workdir("testing-progress-log-");
         let scratch = Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).expect("the test path is UTF-8");
@@ -746,5 +952,63 @@ mod tests {
             assert!(text.contains(label), "{label} was absent from:\n{text}");
         }
         assert!(!text.contains("\u{1b}["), "the durable log contains terminal styling: {text:?}");
+    }
+    #[test]
+    fn survivor_testing_status_resizes_progress_and_only_updates_an_active_dashboard() {
+        for dashboard in [false, true] {
+            let mut host = Sink::default().terminal(160);
+            let styler = Styler::new(false);
+            let mut events = ConsoleEvents {
+                host: &mut host,
+                progress: Progress::new(true, styler, Some(160)),
+                dashboard: Dashboard::new(dashboard, Some(160), styler),
+                styler,
+                show_build: false,
+                verdict_log: VerdictLog::default(),
+            };
+            events.progress.set_total(4);
+            events.progress.record(Outcome::Killed);
+            if dashboard {
+                events.dashboard.start_testing(events.host, 2, "old status".into());
+            }
+            let previous = events.dashboard.testing_status_for_test().to_owned();
+            events.host.resize_terminal(80);
+            events.sync_testing_status();
+            let rendered = events.progress.render();
+            assert!(rendered.contains("1/4 mutants evaluated"), "{rendered}");
+            if dashboard {
+                assert_ne!(rendered, previous);
+                assert_eq!(events.dashboard.testing_status_for_test(), rendered);
+            } else {
+                assert_eq!(events.dashboard.testing_status_for_test(), previous);
+            }
+            events.host.resize_terminal(20);
+            events.sync_testing_status();
+            assert!(crate::report::unstyled_width(&events.progress.render()) <= 20);
+        }
+    }
+
+    #[test]
+    fn survivor_abandon_clears_the_dashboard_and_closes_the_pending_progress_row() {
+        let mut host = Sink::default().terminal(160);
+        let styler = Styler::new(false);
+        let mut events = ConsoleEvents {
+            host: &mut host,
+            progress: Progress::new(true, styler, Some(160)),
+            dashboard: Dashboard::new(true, Some(160), styler),
+            styler,
+            show_build: false,
+            verdict_log: VerdictLog::default(),
+        };
+        events.progress.begin(events.host, "Building", "Built", "subject");
+        events.progress.borrowed(events.host, "compiler progress");
+        events.dashboard.start_testing(events.host, 2, "testing".into());
+        assert!(events.dashboard.is_active());
+        events.abandon();
+        assert!(!events.dashboard.is_active());
+        assert!(events.host.err().ends_with("subject\n"), "{}", events.host.err());
+        let length = events.host.err.len();
+        events.abandon();
+        assert_eq!(events.host.err.len(), length);
     }
 }

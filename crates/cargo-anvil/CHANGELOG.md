@@ -2,11 +2,390 @@
 
 ## [Unreleased]
 
-## [0.13.0] - 2026-09-24
+## [0.20.0] - 2026-10-26
 
 - ✨ Features
 
-  - select platform-specific mutants configs
+  - cargo-anvil: adopt cargo-each 0.6 package selection
+  - cargo-anvil: manage JSON array entries ([#283](https://github.com/microsoft/ox-tools/pull/283))
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: reuse the validated MSRV for package discovery
+  - cargo-anvil: skip package discovery when no MSRV is declared
+  - cargo-anvil: run examples from the canonical workspace root
+  - cargo-anvil: build example specs from manifest paths and fix test shims
+  - cargo-anvil: select examples and Miri opt-outs by exact identity
+  - cargo-anvil: avoid ambiguous package specs in remaining recipes
+
+- 📚 Documentation
+
+  - cargo-anvil: note coverage still passes name@version specs
+  - cargo-anvil: explain shared license allow list
+
+- ✔️ Tasks
+
+  - cargo-anvil: release v0.20.0 after rebasing package selection
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: drop old-Cargo workarounds and document Cargo 1.93 minimum
+  - cargo-anvil: remove obsolete package-name handling
+
+## [0.19.0] - 2026-10-24
+
+- ✨ Features
+
+  - cargo-anvil: manage JSON array entries
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: stabilize GitHub mutation gate
+  - cargo-anvil: repair body-local JSON corruption
+  - cargo-anvil: validate projected JSON placement
+  - cargo-anvil: sort manifest sections
+  - cargo-anvil: preserve changelog history
+  - cargo-anvil: address final review feedback
+  - cargo-anvil: preserve legacy retirement scanning
+  - cargo-anvil: verify generated JSON regions
+  - cargo-anvil: validate scanner-only splices
+  - cargo-anvil: require active JSON regions
+  - cargo-anvil: preserve structural provenance edges
+  - cargo-anvil: refuse unmatched XML closes
+  - cargo-anvil: refuse incomplete JSON scans
+  - cargo-anvil: guard retained JSON syntax
+  - cargo-anvil: retain scanner on edited retirement
+  - cargo-anvil: harden JSON scanner lifecycle
+  - cargo-anvil: persist JSON scanner hosts
+  - cargo-anvil: preserve renamed JSON tracking
+  - cargo-anvil: scan bare CR line endings
+  - cargo-anvil: retain scanner provenance on refusal
+  - cargo-anvil: retain JSON scanner provenance
+  - cargo-anvil: scan mixed JSON retirement safely
+  - cargo-anvil: scan mixed JSON hosts safely
+  - cargo-anvil: reject moved JSON regions
+  - cargo-anvil: isolate structural JSON scanning
+  - cargo-anvil: preserve JSON region provenance
+  - cargo-anvil: sequence JSON requirement checks
+  - cargo-anvil: validate required JSON entries
+  - cargo-anvil: validate composed JSON hosts
+  - cargo-anvil: harden JSON array splicing
+
+- 📚 Documentation
+
+  - cargo-anvil: record JSONC parser policy
+  - cargo-anvil: clarify JSON retirement provenance
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: key JSON specs by region
+  - cargo-anvil: clarify JSON array invariants
+
+- 🧩 Miscellaneous
+
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge remote-tracking branch 'origin/main' into makolnek-microsoft-json-array-regions
+
+## [0.18.0] - 2026-10-24
+
+- ✨ Features
+
+  - cargo-anvil: manage JSON array entries
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: repair body-local JSON corruption
+  - cargo-anvil: validate projected JSON placement
+  - cargo-anvil: sort manifest sections
+  - cargo-anvil: preserve changelog history
+  - cargo-anvil: address final review feedback
+  - cargo-anvil: preserve legacy retirement scanning
+  - cargo-anvil: verify generated JSON regions
+  - cargo-anvil: validate scanner-only splices
+  - cargo-anvil: require active JSON regions
+  - cargo-anvil: preserve structural provenance edges
+  - cargo-anvil: refuse unmatched XML closes
+  - cargo-anvil: refuse incomplete JSON scans
+  - cargo-anvil: guard retained JSON syntax
+  - cargo-anvil: retain scanner on edited retirement
+  - cargo-anvil: harden JSON scanner lifecycle
+  - cargo-anvil: persist JSON scanner hosts
+  - cargo-anvil: preserve renamed JSON tracking
+  - cargo-anvil: scan bare CR line endings
+  - cargo-anvil: retain scanner provenance on refusal
+  - cargo-anvil: retain JSON scanner provenance
+  - cargo-anvil: scan mixed JSON retirement safely
+  - cargo-anvil: scan mixed JSON hosts safely
+  - cargo-anvil: reject moved JSON regions
+  - cargo-anvil: isolate structural JSON scanning
+  - cargo-anvil: preserve JSON region provenance
+  - cargo-anvil: sequence JSON requirement checks
+  - cargo-anvil: validate required JSON entries
+  - cargo-anvil: validate composed JSON hosts
+  - cargo-anvil: harden JSON array splicing
+
+- 📚 Documentation
+
+  - cargo-anvil: record JSONC parser policy
+  - cargo-anvil: clarify JSON retirement provenance
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: key JSON specs by region
+  - cargo-anvil: clarify JSON array invariants
+
+- 🧩 Miscellaneous
+
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge remote-tracking branch 'origin/main' into makolnek-microsoft-json-array-regions
+
+## [0.17.0] - 2026-10-23
+
+- ✨ Features
+
+  - cargo-anvil: manage JSON array entries
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: validate projected JSON placement
+  - cargo-anvil: sort manifest sections
+  - cargo-anvil: preserve changelog history
+  - cargo-anvil: address final review feedback
+  - cargo-anvil: preserve legacy retirement scanning
+  - cargo-anvil: verify generated JSON regions
+  - cargo-anvil: validate scanner-only splices
+  - cargo-anvil: require active JSON regions
+  - cargo-anvil: preserve structural provenance edges
+  - cargo-anvil: refuse unmatched XML closes
+  - cargo-anvil: refuse incomplete JSON scans
+  - cargo-anvil: guard retained JSON syntax
+  - cargo-anvil: retain scanner on edited retirement
+  - cargo-anvil: harden JSON scanner lifecycle
+  - cargo-anvil: persist JSON scanner hosts
+  - cargo-anvil: preserve renamed JSON tracking
+  - cargo-anvil: scan bare CR line endings
+  - cargo-anvil: retain scanner provenance on refusal
+  - cargo-anvil: retain JSON scanner provenance
+  - cargo-anvil: scan mixed JSON retirement safely
+  - cargo-anvil: scan mixed JSON hosts safely
+  - cargo-anvil: reject moved JSON regions
+  - cargo-anvil: isolate structural JSON scanning
+  - cargo-anvil: preserve JSON region provenance
+  - cargo-anvil: sequence JSON requirement checks
+  - cargo-anvil: validate required JSON entries
+  - cargo-anvil: validate composed JSON hosts
+  - cargo-anvil: harden JSON array splicing
+
+- 📚 Documentation
+
+  - cargo-anvil: clarify JSON retirement provenance
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: key JSON specs by region
+  - cargo-anvil: clarify JSON array invariants
+
+- 🧩 Miscellaneous
+
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge remote-tracking branch 'origin/main' into makolnek-microsoft-json-array-regions
+
+## [0.16.0] - 2026-10-23
+
+- ✨ Features
+
+  - cargo-anvil: execute examples during verification ([#286](https://github.com/microsoft/ox-tools/pull/286))
+
+## [0.15.2] - 2026-10-23
+
+- ✨ Features
+
+  - cargo-anvil: roll out filtered coverage reports
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: clarify coverage adoption boundaries
+
+- 📚 Documentation
+
+  - cargo-anvil: explain Windows ARM coverage fallback
+  - align coverage topology and helper names
+
+- ✔️ Tasks
+
+  - cargo-anvil: prepare 0.15.2 release
+  - cargo-anvil: pin coverage gate 0.7.1
+
+- 🧩 Miscellaneous
+
+  - Merge cargo-anvil 0.15.1 from main
+  - Merge cargo-deny cleanup from main
+  - Merge current main into coverage rollout
+  - Merge main into coverage rollout
+  - Merge origin/main into anvil coverage rollout
+
+## [0.15.1] - 2026-10-22
+
+- ✨ Features
+
+  - cargo-gamma: improve campaign reliability and mutation detection ([#282](https://github.com/microsoft/ox-tools/pull/282))
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: hide internal recipes from just listings ([#272](https://github.com/microsoft/ox-tools/pull/272))
+  - cargo-anvil: preserve immutable action tags
+  - cargo-anvil: synchronize advisory and coverage action pins
+  - pass release and container inputs explicitly ([#265](https://github.com/microsoft/ox-tools/pull/265))
+  - cargo-anvil: use just_executable for nested invocations ([#266](https://github.com/microsoft/ox-tools/pull/266))
+
+- ⚡ Performance
+
+  - cargo-anvil: keep Miri under 30 minutes ([#279](https://github.com/microsoft/ox-tools/pull/279))
+
+- ✔️ Tasks
+
+  - clean up cargo-deny warnings without narrowing license policy ([#287](https://github.com/microsoft/ox-tools/pull/287))
+  - cargo-anvil: prepare 0.15.1 release
+
+- 🧩 Miscellaneous
+
+  - Merge main after #287 and regenerate Anvil
+  - Merge main into pin alignment
+
+## [0.15.0] - 2026-10-13
+
+- ✨ Features
+
+  - resume interrupted campaigns and streamline mutant testing ([#248](https://github.com/microsoft/ox-tools/pull/248))
+  - support managed TOML array entries ([#235](https://github.com/microsoft/ox-tools/pull/235))
+  - support XML managed regions
+
+- ✔️ Tasks
+
+  - release v0.14.0 ([#252](https://github.com/microsoft/ox-tools/pull/252))
+
+- 🧩 Miscellaneous
+
+  - Merge main and harden XML managed regions
+
+## [0.14.1] - 2026-10-15
+
+- 🐛 Bug Fixes
+
+  - restore eager libclang setup ([#262](https://github.com/microsoft/ox-tools/pull/262))
+
+## [0.14.0] - 2026-10-12
+
+- ✨ Features
+
+  - support managed TOML array entries ([#235](https://github.com/microsoft/ox-tools/pull/235))
+  - Add `TomlArrayRegionSpec` and `CatalogBuilder::with_toml_array_region`
+    so custom catalogs can manage required string entries without owning
+    the enclosing TOML array or table. `Catalog::toml_array_path` exposes
+    the selector for a region.
+  - Preserve repository-owned entries, comments, table headers, and
+    surrounding formatting during adoption, updates, and retirement.
+    Adoption moves one matching unmanaged string per required entry into
+    the managed region; extra copies remain repository-owned.
+  - Validate array-host composition before producing an applicable plan.
+    Invalid TOML, overlapping ownership, and structural dependencies
+    refuse without applying unrelated pending writes.
+
+- Bug Fixes
+
+  - Use unique temporary baseline worktree paths in the generated impact
+    recipe to avoid collisions when process IDs are reused. Clean up
+    partial baseline checkouts and surface cleanup failures
+    ([#248](https://github.com/microsoft/ox-tools/pull/248)).
+
+- Upgrade notes
+
+  - Array regions are opt-in for custom catalogs. Hosts must have a
+    `.toml` suffix and use hash comments. Selectors contain literal key
+    components through normal TOML tables.
+  - Templates must contain at least one string entry and end with a
+    comma. Generated compound values, inline-table scaffolding, and
+    automatic migration from whole-table regions are not supported.
+  - The `.anvil.lock` schema remains version 1. Array selectors contribute
+    to custom catalog checksums. The generated impact recipe update also
+    changes the built-in catalog checksum; updating generated
+    infrastructure follows the existing managed-file ownership rules.
+
+- Dependencies
+
+  - Add `toml_parser` 1.1.3 as a direct dependency for TOML-aware
+    managed-region scanning.
+
+## [0.13.0] - 2026-10-08
+
+- ✨ Features
+
+  - Select `.cargo/mutants.<os>.toml` for both mutation recipes when
+    present. Platform files replace the default configuration rather
+    than overlay it; otherwise normal cargo-mutants discovery applies
+    ([#203](https://github.com/microsoft/ox-tools/pull/203)).
+  - Extend the generated Copilot code-review skill with
+    `.github/skills/code-review/test-review.md`. The guide covers
+    deterministic inputs, mocked collaborators, state isolation, exact
+    assertions, doctests, tests in examples, runtime limits, Miri, and
+    root-cause fixes for flaky tests. Review applies to changed tests,
+    not unrelated existing tests
+    ([#228](https://github.com/microsoft/ox-tools/pull/228)).
+  - Add `anvil-check-all-targets` to the fast PR tier. Check each affected
+    package independently with default features and with defaults
+    disabled, preventing workspace feature unification from hiding
+    missing test or example dependencies
+    ([#224](https://github.com/microsoft/ox-tools/pull/224)).
+
+- 🐛 Bug Fixes
+
+  - Filter doctest runs by Cargo's `doctest` capability instead of
+    selecting bin-only packages. An empty eligible set is a successful
+    no-op. Cache the capability list with impact metadata and fall back
+    to locked discovery for older caches or full-workspace paths
+    ([#218](https://github.com/microsoft/ox-tools/pull/218),
+    [#221](https://github.com/microsoft/ox-tools/pull/221)).
+  - Fetch the current GitHub PR title through the REST API so workflow
+    reruns validate renamed titles rather than the original event
+    payload. Title retrieval failures remain errors
+    ([#234](https://github.com/microsoft/ox-tools/pull/234)).
+  - Prefer exact path spelling and reject ambiguous case-insensitive
+    matches. Report directory-enumeration and permission errors instead
+    of treating them as missing files
+    ([#221](https://github.com/microsoft/ox-tools/pull/221)).
+  - Return dry-run status through the application entry point instead
+    of terminating inside the engine. Dirty dry runs still exit with
+    failure; clean runs exit successfully
+    ([#221](https://github.com/microsoft/ox-tools/pull/221)).
+  - Distinguish invalid generated TOML bodies from invalid existing
+    hosts and table-ownership conflicts in refusal guidance
+    ([#221](https://github.com/microsoft/ox-tools/pull/221)).
+
+- Documentation
+
+  - Clarify generated configuration comments, including empty impact
+    reports, coverage opt-outs, and the pinned nightly formatting policy
+    ([#223](https://github.com/microsoft/ox-tools/pull/223)).
+
+- Build and maintenance
+
+  - Raise the generated `cargo-each` pin from 0.1.0 to 0.3.0 for the
+    package-isolated checks
+    ([#224](https://github.com/microsoft/ox-tools/pull/224)).
+  - Exclude test-only modules from production coverage
+    ([#229](https://github.com/microsoft/ox-tools/pull/229)).
+  - Record the crate's coverage floor as 99.86445 percent
+    ([#221](https://github.com/microsoft/ox-tools/pull/221)).
+  - Expand engine regression and mutation coverage, and refactor
+    catalog, manifest, region, and workspace helpers without changing
+    the managed-file ownership contract
+    ([#208](https://github.com/microsoft/ox-tools/pull/208),
+    [#221](https://github.com/microsoft/ox-tools/pull/221)).
 
 ## [0.12.0] - 2026-09-18
 

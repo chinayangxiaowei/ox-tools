@@ -23,6 +23,7 @@ use std::io::ErrorKind;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 use crate::commands::{RunArgs, SelectArgs};
 use crate::error::{Error, error};
@@ -93,9 +94,6 @@ pub struct Config {
 
     /// Let tests from every workspace package judge mutants they can reach.
     pub test_workspace: Option<bool>,
-
-    /// Run the experimental case-level reachability census.
-    pub optimize_test_execution: Option<bool>,
 
     /// Run every selected test in each reachable test binary instead of selecting cases by reachability.
     pub whole_test_binaries: Option<bool>,
@@ -200,17 +198,20 @@ impl Config {
     /// was misspelled is the failure this guards against, whereas a missing conventional file is
     /// the ordinary case.
     pub fn resolve(select: &SelectArgs) -> Result<Self> {
+        Self::resolve_with(select, Self::parse)
+    }
+
+    pub(crate) fn resolve_reporting_gates(select: &SelectArgs) -> Result<Self> {
+        Self::resolve_with(select, Self::parse_reporting_gates)
+    }
+
+    fn resolve_with(select: &SelectArgs, parse: fn(&str) -> Result<Self, String>) -> Result<Self> {
         if select.config.no_config {
             return Ok(Self::default());
         }
 
-        let Some(path) = select.config.path.as_ref() else {
-            return Self::load(&select.dir);
-        };
-
-        let text = fs::read_to_string(path).map_err(|cause| error!("could not read `{path}`").caused_by(cause))?;
-
-        Self::parse(&text).map_err(|cause| error!("{path}: {cause}").usage())
+        let path = select.config.path.clone().unwrap_or_else(|| select.dir.join(RELATIVE_PATH));
+        Self::read(&path, select.config.path.is_none(), parse)
     }
 
     /// Loads the configuration for a directory, if there is one.
@@ -218,17 +219,72 @@ impl Config {
     /// Returns the default configuration when the file is absent, which is the overwhelmingly
     /// common case and is not worth distinguishing from an empty file.
     pub fn load(dir: &Utf8Path) -> Result<Self> {
-        let path = dir.join(RELATIVE_PATH);
+        Self::read(&dir.join(RELATIVE_PATH), true, Self::parse)
+    }
 
-        let text = match fs::read_to_string(&path) {
+    fn read(path: &Utf8Path, optional: bool, parse: fn(&str) -> Result<Self, String>) -> Result<Self> {
+        let text = match fs::read_to_string(path) {
             Ok(text) => text,
 
-            Err(cause) if cause.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(cause) if optional && cause.kind() == ErrorKind::NotFound => return Ok(Self::default()),
 
             Err(cause) => return Err(error!("could not read `{path}`").caused_by(cause)),
         };
 
-        Self::parse(&text).map_err(|cause| error!("{path}: {cause}").usage())
+        parse(&text).map_err(|cause| error!("{path}: {cause}").usage())
+    }
+
+    fn parse_reporting_gates(text: &str) -> Result<Self, String> {
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+        struct ReportingGates {
+            min_score: Option<f64>,
+            max_flaky: Option<usize>,
+            mutators: Option<IgnoredAny>,
+            files: Option<IgnoredAny>,
+            exclude_files: Option<IgnoredAny>,
+            exclude_trait_impls: Option<IgnoredAny>,
+            jobs: Option<IgnoredAny>,
+            resources: Option<IgnoredAny>,
+            test_timeout_multiplier: Option<IgnoredAny>,
+            incremental: Option<IgnoredAny>,
+            no_baseline: Option<IgnoredAny>,
+            no_confirm: Option<IgnoredAny>,
+            packages: Option<IgnoredAny>,
+            test_packages: Option<IgnoredAny>,
+            test_lib: Option<IgnoredAny>,
+            test_workspace: Option<IgnoredAny>,
+            whole_test_binaries: Option<IgnoredAny>,
+            include_tests: Option<IgnoredAny>,
+            exclude_tests: Option<IgnoredAny>,
+            features: Option<IgnoredAny>,
+            all_features: Option<IgnoredAny>,
+            no_default_features: Option<IgnoredAny>,
+            profile: Option<IgnoredAny>,
+            cargo_args: Option<IgnoredAny>,
+            cargo_test_args: Option<IgnoredAny>,
+            errors: Option<IgnoredAny>,
+            minimum_test_timeout: Option<IgnoredAny>,
+            nextest: Option<IgnoredAny>,
+            memory: Option<IgnoredAny>,
+            memory_multiplier: Option<IgnoredAny>,
+            memory_headroom: Option<IgnoredAny>,
+            memory_limit: Option<IgnoredAny>,
+            baseline_memory_limit: Option<IgnoredAny>,
+            build_timeout: Option<IgnoredAny>,
+            build_timeout_multiplier: Option<IgnoredAny>,
+            artifact_dir: Option<IgnoredAny>,
+            shard: Option<IgnoredAny>,
+        }
+
+        let gates: ReportingGates = toml::from_str(text).map_err(|cause| cause.message().to_owned())?;
+        let config = Self {
+            min_score: gates.min_score,
+            max_flaky: gates.max_flaky,
+            ..Self::default()
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Parses configuration text.
@@ -305,6 +361,11 @@ impl Config {
         dir.join(FOREIGN_PATH).is_file() && !dir.join(RELATIVE_PATH).is_file()
     }
 
+    pub(crate) fn apply_reporting_gates(&self, args: &mut RunArgs) {
+        args.min_score = args.min_score.or(self.min_score);
+        args.max_flaky = args.max_flaky.or(self.max_flaky);
+    }
+
     /// Applies the configuration underneath the command line.
     ///
     /// Scalars set on the command line win outright: a flag typed for this one run is the most
@@ -320,8 +381,7 @@ impl Config {
 
         let implied_by_cli = crate::exec::implied_memory_control(args.measure.memory_limit, args.measure.baseline_memory_limit);
 
-        args.min_score = args.min_score.or(self.min_score);
-        args.max_flaky = args.max_flaky.or(self.max_flaky);
+        self.apply_reporting_gates(args);
         args.measure.jobs = args.measure.jobs.or(self.jobs);
         let mut command_line_resources = BTreeSet::new();
         for limit in &args.measure.resource_concurrency {
@@ -360,7 +420,6 @@ impl Config {
         args.measure.test_packages.extend(self.test_packages.iter().cloned());
         args.measure.test_lib = args.measure.test_lib || self.test_lib.unwrap_or(false);
         args.measure.test_workspace = args.measure.test_workspace || self.test_workspace.unwrap_or(false);
-        args.measure.optimize_test_execution = args.measure.optimize_test_execution || self.optimize_test_execution.unwrap_or(false);
         args.measure.whole_test_binaries = args.measure.whole_test_binaries || self.whole_test_binaries.unwrap_or(false);
         args.measure.include_tests.extend(self.include_tests.iter().cloned());
         args.measure.exclude_tests.extend(self.exclude_tests.iter().cloned());
@@ -378,15 +437,6 @@ impl Config {
                 self.test_workspace == Some(true),
             ));
         }
-        if args.measure.optimize_test_execution && args.measure.whole_test_binaries {
-            return Err(contradiction(
-                "optimize-test-execution",
-                self.optimize_test_execution == Some(true),
-                "whole-test-binaries",
-                self.whole_test_binaries == Some(true),
-            ));
-        }
-
         if args.measure.test_lib
             && let Some(argument) = args.measure.cargo_args.iter().find(|argument| {
                 matches!(
@@ -502,6 +552,221 @@ mod miri_tests {
     use super::*;
 
     #[test]
+    fn validation_reports_exact_keys_and_preserves_first_error_precedence() {
+        for key in [
+            "test-timeout-multiplier",
+            "minimum-test-timeout",
+            "build-timeout",
+            "build-timeout-multiplier",
+            "memory-multiplier",
+        ] {
+            assert_eq!(
+                Config::parse(&format!("{key} = 0")).expect_err("zero is not a positive factor or timeout"),
+                format!("{key}: `0` must be a number greater than zero")
+            );
+        }
+        assert_eq!(
+            Config::parse("min-score = 101").expect_err("scores cannot exceed one hundred"),
+            "min-score: `101` is not a percentage between 0 and 100"
+        );
+        for key in ["memory-headroom", "memory-limit", "baseline-memory-limit"] {
+            assert_eq!(
+                Config::parse(&format!("{key} = \"oops\"")).expect_err("oops is not a supported size unit"),
+                format!("{key}: `oops` does not end in a size unit such as `KiB`, `MiB` or `GiB`")
+            );
+        }
+        assert_eq!(
+            Config::parse("test-timeout-multiplier = 0\nmemory-multiplier = 0").expect_err("both factors are invalid"),
+            "test-timeout-multiplier: `0` must be a number greater than zero"
+        );
+        assert!(
+            Config::parse("memory-headroom = \"oops\"\nbaseline-memory-limit = \"oops\"")
+                .expect_err("both sizes are invalid")
+                .starts_with("memory-headroom:")
+        );
+    }
+
+    #[test]
+    fn absent_or_false_configuration_never_clears_command_line_flags() {
+        for configured in [None, Some(false)] {
+            let config = Config {
+                nextest: configured,
+                test_lib: configured,
+                no_baseline: configured,
+                no_confirm: configured,
+                all_features: configured,
+                no_default_features: configured,
+                ..Config::default()
+            };
+            let mut args = RunArgs {
+                no_baseline: true,
+                no_confirm: true,
+                ..RunArgs::default()
+            };
+            args.measure.nextest = true;
+            args.measure.test_lib = true;
+            args.select.features.all_features = true;
+            args.select.features.no_default_features = true;
+            config.apply(&mut args).expect("these independent CLI settings do not contradict");
+            assert!(args.measure.nextest);
+            assert!(args.measure.test_lib);
+            assert!(args.no_baseline);
+            assert!(args.no_confirm);
+            assert!(args.select.features.all_features);
+            assert!(args.select.features.no_default_features);
+        }
+    }
+
+    #[test]
+    fn package_workspace_conflicts_require_both_halves_and_name_their_origins() {
+        for configured_packages in [false, true] {
+            for cli_packages in [false, true] {
+                for configured_workspace in [None, Some(false), Some(true)] {
+                    for cli_workspace in [false, true] {
+                        let packages: Vec<String> = if configured_packages {
+                            vec!["configured".to_owned()]
+                        } else {
+                            Vec::new()
+                        };
+                        let config = Config {
+                            test_packages: packages,
+                            test_workspace: configured_workspace,
+                            ..Config::default()
+                        };
+                        let mut args = RunArgs::default();
+                        if cli_packages {
+                            args.measure.test_packages.push("cli".to_owned());
+                        }
+                        args.measure.test_workspace = cli_workspace;
+                        let result = config.apply(&mut args);
+                        if (configured_packages || cli_packages) && (cli_workspace || configured_workspace == Some(true)) {
+                            let cause = result.expect_err("package and workspace oracle selections both apply");
+                            let package_source = if configured_packages { "gamma.toml" } else { "the command line" };
+                            let workspace_source = if configured_workspace == Some(true) {
+                                "gamma.toml"
+                            } else {
+                                "the command line"
+                            };
+                            assert!(
+                                cause.to_string().starts_with(&format!(
+                                    "`test-packages` from {package_source} and `test-workspace` from {workspace_source} cannot both apply."
+                                )),
+                                "{cause}"
+                            );
+                        } else {
+                            result.expect("only one oracle selection applies");
+                        }
+                    }
+                }
+                for workspace in [false, true] {
+                    let config = Config {
+                        packages: if configured_packages {
+                            vec!["configured".to_owned()]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Config::default()
+                    };
+                    let mut selection = SelectArgs {
+                        workspace,
+                        packages: if cli_packages { vec!["cli".to_owned()] } else { Vec::new() },
+                        ..SelectArgs::default()
+                    };
+                    let result = config.apply_selection(&mut selection);
+                    if workspace && (configured_packages || cli_packages) {
+                        let source = if configured_packages { "gamma.toml" } else { "the command line" };
+                        assert!(
+                            result
+                                .expect_err("package and workspace mutation selections both apply")
+                                .to_string()
+                                .starts_with(&format!(
+                                    "`packages` from {source} and `workspace` from the command line cannot both apply."
+                                ))
+                        );
+                    } else {
+                        result.expect("only one mutation selection applies");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn library_oracle_rejects_every_target_selector_but_not_similar_unrelated_arguments() {
+        for argument in [
+            "--tests",
+            "--all-targets",
+            "--bins",
+            "--bin",
+            "--examples",
+            "--example",
+            "--benches",
+            "--bench",
+            "--test",
+            "--doc",
+            "--bin=tool",
+            "--example=tool",
+            "--bench=tool",
+            "--test=tool",
+        ] {
+            let config = Config {
+                test_lib: Some(true),
+                cargo_args: vec![argument.to_owned()],
+                ..Config::default()
+            };
+            let cause = config
+                .apply(&mut RunArgs::default())
+                .expect_err("target selectors can widen the library oracle");
+            assert_eq!(
+                cause.to_string(),
+                format!(
+                    "`test-lib` cannot be combined with Cargo target selector `{argument}`, which would widen or replace the library-only oracle"
+                )
+            );
+        }
+        for argument in [
+            "--locked",
+            "prefix--bin=",
+            "prefix--example=",
+            "prefix--bench=",
+            "prefix--test=",
+            "xyzzy",
+            "--binary=tool",
+        ] {
+            Config {
+                test_lib: Some(true),
+                cargo_args: vec![argument.to_owned()],
+                ..Config::default()
+            }
+            .apply(&mut RunArgs::default())
+            .expect("this is not a Cargo target selector");
+        }
+    }
+
+    #[test]
+    fn invalid_and_duplicate_effective_resource_capacities_return_usage_errors() {
+        let mut args = RunArgs::default();
+        args.measure.resource_concurrency = vec![
+            crate::exec::ResourceLimit::new("db", 1).expect("db is a valid resource"),
+            crate::exec::ResourceLimit::new("db", 2).expect("db is a valid resource"),
+        ];
+        let cause = Config::default()
+            .apply(&mut args)
+            .expect_err("a CLI capacity may be specified only once");
+        assert!(cause.is_usage());
+        assert!(cause.to_string().contains("`--resource-concurrency` specifies `db` more than once"));
+        let config = Config {
+            resources: BTreeMap::from([("db".to_owned(), 0)]),
+            ..Config::default()
+        };
+        let cause = config
+            .apply(&mut RunArgs::default())
+            .expect_err("the directly constructed resource has zero capacity");
+        assert!(cause.is_usage());
+        assert!(cause.to_string().starts_with("resources.db:"), "{cause}");
+    }
+
+    #[test]
     fn a_flaky_gate_requires_confirmation_after_configuration_is_merged() {
         let config = Config::parse("max-flaky = 0\nno-confirm = true\n").expect("configuration parses");
         let mut args = RunArgs::default();
@@ -596,6 +861,27 @@ mod tests {
         assert!(!args.measure.nextest);
         assert!(!args.no_baseline);
         assert!(!args.no_confirm);
+    }
+
+    #[test]
+    fn survivor_absent_library_test_selection_is_not_an_implicit_opt_in() {
+        for (configured, cli, expected) in [
+            (None, false, false),
+            (None, true, true),
+            (Some(false), false, false),
+            (Some(false), true, true),
+            (Some(true), false, true),
+            (Some(true), true, true),
+        ] {
+            let config = Config {
+                test_lib: configured,
+                ..Config::default()
+            };
+            let mut args = RunArgs::default();
+            args.measure.test_lib = cli;
+            config.apply(&mut args).expect("the typed configuration is valid");
+            assert_eq!(args.measure.test_lib, expected, "configured={configured:?}, cli={cli}");
+        }
     }
 
     /// `packages` in the file and `--workspace` on the command line both reach `selected_packages`,
@@ -868,30 +1154,6 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_optimization_in_the_file_selects_the_same_mode_as_the_flag() {
-        let config = Config::parse("optimize-test-execution = true\n").expect("the documented equivalence must hold");
-        let mut args = RunArgs::default();
-
-        config.apply(&mut args).expect("the settings are compatible");
-
-        assert!(args.measure.optimize_test_execution);
-    }
-
-    #[test]
-    fn whole_binaries_and_test_execution_optimization_are_contradictory() {
-        let config = Config::parse("whole-test-binaries = true\n").expect("parses");
-        let mut args = RunArgs::default();
-        args.measure.optimize_test_execution = true;
-
-        let error = config
-            .apply(&mut args)
-            .expect_err("one mode selects cases and the other forbids doing so");
-
-        assert!(error.to_string().contains("optimize-test-execution"), "{error}");
-        assert!(error.to_string().contains("whole-test-binaries"), "{error}");
-    }
-
-    #[test]
     fn a_memory_size_that_is_not_a_size_is_reported_rather_than_ignored() {
         // A ceiling read as a handful of bytes would report every mutant as caught by tests that
         // could never have started, which is a far more expensive failure than a rejected file.
@@ -915,6 +1177,14 @@ mod tests {
         let cause = Config::parse("exclude-file = [\"src/main.rs\"]\n").expect_err("must be rejected");
 
         assert!(cause.contains("unknown field"), "{cause}");
+    }
+
+    #[test]
+    fn removed_test_execution_key_is_rejected_by_full_and_reporting_parsers() {
+        let text = "optimize-test-execution = true";
+        for cause in [Config::parse(text).unwrap_err(), Config::parse_reporting_gates(text).unwrap_err()] {
+            assert!(cause.contains("unknown field `optimize-test-execution`"), "{cause}");
+        }
     }
 
     #[test]
@@ -974,6 +1244,74 @@ mod tests {
             .expect("the merged settings do not contradict one another");
 
         assert_eq!(select.mutators.as_deref(), Some("@arithmetic,!bitwise"));
+    }
+
+    #[test]
+    fn reporting_gate_parsing_ignores_invalid_frozen_execution_settings() {
+        for execution in [
+            "minimum-test-timeout = -1",
+            "jobs = \"not a count\"",
+            "memory-limit = \"not a size\"",
+            "mutators = 12",
+            "[resources]\nshared = -1",
+        ] {
+            let config = Config::parse_reporting_gates(&format!("min-score = 80.0\nmax-flaky = 2\n{execution}\n")).unwrap();
+            assert_eq!(config.min_score, Some(80.0));
+            assert_eq!(config.max_flaky, Some(2));
+            assert_eq!(config.jobs, None);
+            assert!(config.resources.is_empty());
+        }
+    }
+
+    #[test]
+    fn reporting_gate_schema_recognizes_exactly_the_full_configs_top_level_keys() {
+        let full_error = Config::parse("unknown = 0").unwrap_err();
+        let reporting_error = Config::parse_reporting_gates("unknown = 0").unwrap_err();
+        let full_keys: BTreeSet<_> = full_error.split('`').skip(3).step_by(2).collect();
+        let reporting_keys: BTreeSet<_> = reporting_error.split('`').skip(3).step_by(2).collect();
+        assert!(full_keys.contains("min-score"), "{full_error}");
+        assert_eq!(reporting_keys, full_keys);
+        for key in full_keys {
+            if matches!(key, "min-score" | "max-flaky") {
+                continue;
+            }
+            let config = Config::parse_reporting_gates(&format!("min-score = 80.0\n{key} = {{ ignored = [1, 2] }}")).unwrap();
+            assert_eq!(config.min_score, Some(80.0), "{key}");
+        }
+    }
+
+    #[test]
+    fn reporting_gate_parsing_rejects_unknown_keys_and_invalid_syntax() {
+        for key in ["minscore", "max-flakey", "unexpected"] {
+            let error = Config::parse_reporting_gates(&format!("{key} = 80")).unwrap_err();
+            assert!(error.contains(&format!("unknown field `{key}`")), "{error}");
+        }
+        Config::parse_reporting_gates("jobs = [").unwrap_err();
+    }
+
+    #[test]
+    fn reporting_gate_parsing_preserves_full_schema_gate_errors() {
+        for text in ["min-score = -1", "min-score = 101", "max-flaky = -1", "max-flaky = \"not a count\""] {
+            assert_eq!(Config::parse_reporting_gates(text).unwrap_err(), Config::parse(text).unwrap_err());
+        }
+    }
+
+    #[test]
+    fn resumed_reporting_gates_preserve_cli_overrides_and_leave_execution_frozen() {
+        let config = Config::parse("min-score = 80.0\nmax-flaky = 2\njobs = 12\nno-confirm = true\n").unwrap();
+        for (minimum, flaky) in [(None, None), (Some(90.0), Some(0))] {
+            let mut args = RunArgs {
+                resume_testing: true,
+                min_score: minimum,
+                max_flaky: flaky,
+                ..RunArgs::default()
+            };
+            config.apply_reporting_gates(&mut args);
+            assert_eq!(args.min_score, Some(minimum.unwrap_or(80.0)));
+            assert_eq!(args.max_flaky, Some(flaky.unwrap_or(2)));
+            assert_eq!(args.measure.jobs, None);
+            assert!(!args.no_confirm);
+        }
     }
 
     #[test]
@@ -1265,7 +1603,6 @@ mod tests {
             test_packages: vec!["test-package-from-the-file".to_owned()],
             test_lib: Some(true),
             test_workspace: Some(false),
-            optimize_test_execution: Some(false),
             whole_test_binaries: Some(true),
             include_tests: vec!["included-test-from-the-file".to_owned()],
             exclude_tests: vec!["excluded-test-from-the-file".to_owned()],
@@ -1344,7 +1681,6 @@ mod tests {
         assert_eq!(args.measure.test_packages, ["test-package-from-the-file"]);
         assert!(args.measure.test_lib);
         assert!(!args.measure.test_workspace, "the file said false, so nothing may turn it on");
-        assert!(!args.measure.optimize_test_execution);
         assert!(args.measure.whole_test_binaries);
         assert_eq!(args.measure.include_tests, ["included-test-from-the-file"]);
         assert_eq!(args.measure.exclude_tests, ["excluded-test-from-the-file"]);

@@ -66,7 +66,7 @@ flowchart LR
     impact_act[".github/actions/<br/>anvil-impact"]:::action
     setup_act[".github/actions/<br/>anvil-setup"]:::action
     run_group_act[".github/actions/<br/>anvil-run-group"]:::action
-    codecov_act["codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f<br/>v7.0.0"]:::external
+    codecov_act["codecov/codecov-action@v7.1.1"]:::external
     impact_just["just anvil-impact"]:::recipe
     fast_just["just anvil-pr-fast"]:::recipe
     test_just["just anvil-pr-test"]:::recipe
@@ -132,7 +132,7 @@ flowchart LR
     publish_job["publish-failure<br/>upsert incident issue"]:::job
     setup_act[".github/actions/<br/>anvil-setup"]:::action
     run_group_act[".github/actions/<br/>anvil-run-group"]:::action
-    codecov_act["codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f<br/>v7.0.0"]:::external
+    codecov_act["codecov/codecov-action@v7.1.1"]:::external
     github_issues["GitHub Issues"]:::external
     stest_just["just anvil-scheduled-test"]:::recipe
     sadv_just["just anvil-scheduled-advisories"]:::recipe
@@ -416,7 +416,7 @@ jobs:
   pr-test:
     name: "Check Group: Tests and Coverage (${{ matrix.os }})"
     # Tests + coverage: llvm-cov, doc-test, examples. Coverage upload
-    # is gated to the canonical x86_64 Linux leg (omitted here for brevity).
+    # runs on every leg except Windows ARM (omitted here for brevity).
     needs: [impact-linux, impact-windows]
     strategy:
       fail-fast: false
@@ -829,6 +829,18 @@ prerequisites provision the selected compiler and tools. Its
   lowercase letters, digits, and hyphens. `anvil-run-group` passes its group
   input here, so a `pr-fast` matrix leg never installs cargo-mutants.
 
+Linux setup jobs whose selected group includes spellcheck install
+`libclang-dev` before catalog tool installation. This is intentionally eager:
+cargo-spellcheck may need a source build when its release binary is unavailable,
+and the GitHub-hosted runner adapter has an unambiguous non-interactive `apt`
+contract. Other groups do not pay the package installation cost, and portable
+Just recipes retain diagnostic-only system-dependency checks for local and
+self-hosted environments.
+
+Both cargo-binstall call sites receive the workflow's built-in `GITHUB_TOKEN`,
+so GitHub Release discovery uses the authenticated API quota rather than the
+low unauthenticated limit.
+
 Before invoking Just, the action registers the generated
 `just-problem-matcher.json`. Just already prints the exact failed dependency
 recipe (for example, ``error: recipe `anvil-license-headers` failed with exit
@@ -1033,7 +1045,7 @@ than inconsistent.
 
 Actions whose publisher has enabled GitHub [immutable releases][immutable] are pinned
 by tag. In the generated workflows that is, at the time of writing,
-`codecov/codecov-action@v7.0.0`, `marocchino/sticky-pull-request-comment@v3.0.5` and
+`codecov/codecov-action@v7.1.1`, `marocchino/sticky-pull-request-comment@v3.0.5` and
 `cargo-bins/cargo-binstall@v1.21.0`; a repository's own hand-maintained workflows apply
 the same rule to the actions they use, so the list a reader sees there may be longer.
 An immutable release locks its Git tag to one commit: the tag cannot be moved, and
@@ -1054,21 +1066,26 @@ the publisher. When bumping a tag-pinned action, confirm the new release still r
 it:
 
 ```console
-$ gh api repos/codecov/codecov-action/releases/tags/v7.0.0 --jq .immutable
+$ gh api repos/codecov/codecov-action/releases/tags/v7.1.1 --jq .immutable
 true
 ```
 
 If that returns `false`, or the release is missing, pin the commit SHA instead.
+
+Pin changes belong in the source templates. Regenerate the workflows and `.anvil.lock`
+with that updated catalog; editing only generated workflows leaves their recorded
+checksums stale and takes them off the automatic update path.
 
 [immutable]: https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases
 
 ## 10. Coverage upload
 
 After `pr-test` (and `scheduled-test`) runs the `anvil-llvm-cov` recipe, the reusable
-workflow uploads the resulting coverage files to Codecov from every leg of the matrix
-except `windows-11-arm`. The upload condition uses `always()` plus a file-existence
-guard: completed coverage reports are retained even when the coverage gate or a later
-group recipe fails, while failures before both the all-features
+workflow uploads the released-surface-filtered coverage files to Codecov from every leg
+of the matrix except `windows-11-arm`. These are the same files evaluated by the local
+gate; Codecov applies no second source-exclusion policy. The upload condition uses
+`always()` plus a file-existence guard: completed coverage reports are retained even
+when the coverage gate or a later group recipe fails, while failures before both the all-features
 (`lcov-all-features.info`) and no-default-features (`lcov-no-default.info`)
 configurations complete do not trigger an empty or partial upload. The windows-arm leg is excluded because its
 LLVM-coverage instrumentation produces `malformed instrumentation profile data: symbol
@@ -1084,7 +1101,7 @@ The upload step:
 ```yaml
 - name: Upload coverage to Codecov
   if: always() && matrix.os != 'windows-arm' && hashFiles('target/coverage/lcov-all-features.info') != '' && hashFiles('target/coverage/lcov-no-default.info') != ''
-  uses: codecov/codecov-action@v7.0.0 # pinned by tag: this release is an immutable release (GitHub locks the tag to a commit)
+  uses: codecov/codecov-action@v7.1.1 # pinned by tag: this release is an immutable release (GitHub locks the tag to a commit)
   with:
     files: target/coverage/lcov-all-features.info,target/coverage/lcov-no-default.info
     flags: ${{ matrix.os }}
@@ -1104,9 +1121,9 @@ additionally combines the OS flag with a `scheduled` marker
 (`flags: scheduled,${{ matrix.os }}`) so PR vs scheduled streams stay distinguishable
 in the Codecov UI while still being queryable per-OS.
 
-anvil does not gate the PR on coverage. The lcov upload is informational; Codecov's
-own status check is the gating layer when the adopter wants one (configured in Codecov,
-visible as a separate required check in branch protection).
+The generated recipe gates the PR locally before the upload step. Codecov is an
+informational view of the same filtered LCOV files; adopters may expose Codecov's own
+status check, but it is not the source of Anvil's coverage verdict.
 
 ## 11. Scheduled failure issues
 
@@ -1185,7 +1202,7 @@ recipes emit comments today). Two steps run after the composite that executes th
   if: always() && github.event_name == 'pull_request' && matrix.os == 'linux'
       && github.event.pull_request.head.repo.full_name == github.repository
       && hashFiles('target/anvil/comments/semver.md') != ''
-  uses: marocchino/sticky-pull-request-comment
+  uses: marocchino/sticky-pull-request-comment@v3.0.5 # pinned by tag: this release is an immutable release (GitHub locks the tag to a commit)
   with:
     header: anvil-semver
     path: target/anvil/comments/semver.md
@@ -1193,7 +1210,7 @@ recipes emit comments today). Two steps run after the composite that executes th
   if: always() && github.event_name == 'pull_request' && matrix.os == 'linux'
       && github.event.pull_request.head.repo.full_name == github.repository
       && hashFiles('target/anvil/comments/semver.md') == ''
-  uses: marocchino/sticky-pull-request-comment
+  uses: marocchino/sticky-pull-request-comment@v3.0.5 # pinned by tag: this release is an immutable release (GitHub locks the tag to a commit)
   with:
     header: anvil-semver
     delete: true

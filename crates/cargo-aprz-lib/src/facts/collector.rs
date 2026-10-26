@@ -95,8 +95,12 @@ impl Collector {
             )
             .await?,
 
-            advisories_provider: super::advisories::Provider::new(&advisories_cache, Arc::clone(&progress), endpoints.advisory_url())
-                .await?,
+            advisories_provider: super::advisories::Provider::new(
+                &advisories_cache,
+                Arc::clone(&progress),
+                endpoints.advisory_archive_url(),
+            )
+            .await?,
 
             hosting_provider: super::hosting::Provider::new(github_token, codeberg_token, hosting_cache, bug_labels, endpoints)?,
             codebase_provider: super::codebase::Provider::new(codebase_cache),
@@ -142,33 +146,11 @@ impl Collector {
     }
 
     async fn query_providers(&self, crates_data: Vec<(CrateSpec, ProviderResult<CratesData>)>) -> Vec<CrateFacts> {
+        query_providers_with(crates_data, |facts, specs| self.query_found(facts, specs)).await
+    }
+
+    async fn query_found(&self, mut facts_map: HashMap<CrateSpec, CrateFacts>, all_queryable_specs: Arc<[CrateSpec]>) -> Vec<CrateFacts> {
         let request_tracker = RequestTracker::new(&self.progress);
-
-        let mut facts_map: HashMap<CrateSpec, CrateFacts> = crates_data
-            .into_iter()
-            .map(|(crate_spec, crates_result)| {
-                let facts = CrateFacts {
-                    crate_spec: crate_spec.clone(),
-                    crates_data: crates_result,
-                    hosting_data: ProviderResult::Unavailable("not queried".into()),
-                    advisory_data: ProviderResult::Unavailable("not queried".into()),
-                    codebase_data: ProviderResult::Unavailable("not queried".into()),
-                    coverage_data: ProviderResult::Unavailable("not queried".into()),
-                    docs_data: ProviderResult::Unavailable("not queried".into()),
-                };
-                (crate_spec, facts)
-            })
-            .collect();
-
-        let all_queryable_specs: Arc<[CrateSpec]> = facts_map
-            .iter()
-            .filter(|(_, facts)| facts.crates_data.is_found())
-            .map(|(crate_spec, _)| crate_spec.clone())
-            .collect();
-
-        if all_queryable_specs.is_empty() {
-            return facts_map.into_values().collect();
-        }
 
         // Phase 1: Run advisory, hosting, codebase, and coverage providers in parallel.
         let (advisory_iter, hosting_iter, codebase_iter, coverage_iter) = tokio::join!(
@@ -205,6 +187,37 @@ impl Collector {
     }
 }
 
+async fn query_providers_with<F: core::future::Future<Output = Vec<CrateFacts>>>(
+    crates_data: Vec<(CrateSpec, ProviderResult<CratesData>)>,
+    query: impl FnOnce(HashMap<CrateSpec, CrateFacts>, Arc<[CrateSpec]>) -> F,
+) -> Vec<CrateFacts> {
+    let facts_map: HashMap<CrateSpec, CrateFacts> = crates_data
+        .into_iter()
+        .map(|(crate_spec, crates_result)| {
+            let facts = CrateFacts {
+                crate_spec: crate_spec.clone(),
+                crates_data: crates_result,
+                hosting_data: ProviderResult::Unavailable("not queried".into()),
+                advisory_data: ProviderResult::Unavailable("not queried".into()),
+                codebase_data: ProviderResult::Unavailable("not queried".into()),
+                coverage_data: ProviderResult::Unavailable("not queried".into()),
+                docs_data: ProviderResult::Unavailable("not queried".into()),
+            };
+            (crate_spec, facts)
+        })
+        .collect();
+    let specs: Arc<[CrateSpec]> = facts_map
+        .iter()
+        .filter(|(_, facts)| facts.crates_data.is_found())
+        .map(|(spec, _)| spec.clone())
+        .collect();
+    if specs.is_empty() {
+        facts_map.into_values().collect()
+    } else {
+        query(facts_map, specs).await
+    }
+}
+
 fn deduplicate_crate_refs(crate_refs: &[CrateRef]) -> Vec<CrateRef> {
     let mut seen = HashSet::default();
     crate_refs.iter().filter(|crate_ref| seen.insert(*crate_ref)).cloned().collect()
@@ -212,18 +225,41 @@ fn deduplicate_crate_refs(crate_refs: &[CrateRef]) -> Vec<CrateRef> {
 
 /// Create a cache directory by joining a base path with a name
 fn create_cache_dir(base_path: impl AsRef<Path>, name: impl AsRef<str>) -> Result<PathBuf> {
-    let name_str = name.as_ref();
-    let cache_path = base_path.as_ref().join(name_str);
+    create_cache_dir_with(
+        base_path.as_ref(),
+        name.as_ref(),
+        |path| {
+            #[cfg(windows)]
+            {
+                path.exists()
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = path;
+                false
+            }
+        },
+        |path| fs::create_dir_all(path),
+        |path, name, needs_creation| {
+            #[cfg(windows)]
+            configure_windows_cache_directory(path, name, needs_creation);
+            #[cfg(not(windows))]
+            let _ = (path, name, needs_creation);
+        },
+    )
+}
 
-    #[cfg(windows)]
-    // #[gamma::skip(bool_expr.negate, reason = "whether NTFS compression is attempted is an opportunistic Windows filesystem optimization whose outcome depends on the host volume and privileges")]
-    let needs_creation = !cache_path.exists();
-
-    fs::create_dir_all(&cache_path).into_app_err_with(|| format!("creating `{name_str}` cache directory"))?;
-
-    #[cfg(windows)]
-    // #[gamma::skip(bool_expr.negate, stmt.delete_call, reason = "NTFS compression is an opportunistic Windows filesystem optimization whose success depends on the host volume and privileges")]
-    configure_windows_cache_directory(&cache_path, name_str, needs_creation);
+fn create_cache_dir_with(
+    base_path: &Path,
+    name: &str,
+    exists: impl FnOnce(&Path) -> bool,
+    create: impl FnOnce(&Path) -> std::io::Result<()>,
+    configure: impl FnOnce(&Path, &str, bool),
+) -> Result<PathBuf> {
+    let cache_path = base_path.join(name);
+    let needs_creation = !exists(&cache_path);
+    create(&cache_path).into_app_err_with(|| format!("creating `{name}` cache directory"))?;
+    configure(&cache_path, name, needs_creation);
 
     Ok(cache_path)
 }
@@ -233,12 +269,17 @@ fn create_cache_dir(base_path: impl AsRef<Path>, name: impl AsRef<str>) -> Resul
 #[mutants::skip] // Windows-only optimization; Linux mutation runners cannot compile or observe this code.
 // #[gamma::skip(all, reason = "NTFS compression is an opportunistic Windows filesystem optimization whose success depends on the host volume and privileges")]
 fn configure_windows_cache_directory(cache_path: &Path, name: &str, needs_creation: bool) {
+    configure_cache_compression(cache_path, name, needs_creation, |path| disable_directory_compression(path));
+}
+
+#[cfg(any(windows, test))]
+fn configure_cache_compression(cache_path: &Path, name: &str, needs_creation: bool, disable: impl FnOnce(&Path) -> bool) {
     if should_disable_cache_compression(name, needs_creation) {
-        let _ = disable_directory_compression(cache_path);
+        let _ = disable(cache_path);
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn should_disable_cache_compression(name: &str, needs_creation: bool) -> bool {
     needs_creation && name == "crates"
 }
@@ -432,8 +473,74 @@ mod tests {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod pure_tests {
-    use super::deduplicate_crate_refs;
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use super::{configure_cache_compression, create_cache_dir_with, deduplicate_crate_refs};
     use crate::facts::CrateRef;
+
+    #[test]
+    fn cache_creation_disables_compression_only_for_a_new_crates_directory() {
+        for (name, exists, disabled) in [
+            ("crates", false, true),
+            ("crates", true, false),
+            ("hosting", false, false),
+            ("hosting", true, false),
+        ] {
+            for compression_succeeds in [false, true] {
+                let calls = RefCell::new(Vec::new());
+                let expected_path = Path::new("cache").join(name);
+                let path = create_cache_dir_with(
+                    Path::new("cache"),
+                    name,
+                    |path| {
+                        assert_eq!(path, expected_path);
+                        calls.borrow_mut().push("exists");
+                        exists
+                    },
+                    |path| {
+                        assert_eq!(path, expected_path);
+                        calls.borrow_mut().push("create");
+                        Ok(())
+                    },
+                    |path, name, needs_creation| {
+                        configure_cache_compression(path, name, needs_creation, |path| {
+                            assert_eq!(path, expected_path);
+                            calls.borrow_mut().push("disable");
+                            compression_succeeds
+                        });
+                    },
+                )
+                .unwrap();
+                assert_eq!(path, expected_path);
+                assert_eq!(
+                    *calls.borrow(),
+                    if disabled {
+                        vec!["exists", "create", "disable"]
+                    } else {
+                        vec!["exists", "create"]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_cache_creation_does_not_attempt_compression() {
+        let error = create_cache_dir_with(
+            Path::new("cache"),
+            "crates",
+            |_| false,
+            |_| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "creation denied")),
+            |_, _, _| panic!("compression must not run after failed creation"),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "creation denied");
+        assert_eq!(
+            error.find_source::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn crate_references_are_deduplicated_in_insertion_order() {
@@ -462,7 +569,7 @@ mod portable_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{Collector, CrateSpec, create_cache_dir};
+    use super::{Collector, CrateSpec, create_cache_dir, query_providers_with};
     use crate::facts::cache::Cache;
     use crate::facts::crates::{CrateOverallData, CrateVersionData};
     use crate::facts::progress::Progress;
@@ -687,10 +794,14 @@ mod portable_tests {
     }
 
     fn mark_advisory_cache_fresh(cache_dir: &std::path::Path) {
+        mark_advisory_cache_fresh_for(cache_dir, "https://example.invalid/advisories.tar.gz");
+    }
+
+    fn mark_advisory_cache_fresh_for(cache_dir: &std::path::Path, archive_url: &str) {
         let advisories_dir = cache_dir.join("advisories");
         write_advisory(&advisories_dir.join("repo"), "fixture-crate", "RUSTSEC-2020-0001");
         Cache::new(&advisories_dir, core::time::Duration::from_hours(1), false)
-            .save("last_synced.bin", &())
+            .save("last_synced.bin", &(blake3::hash(archive_url.as_bytes()).to_hex().as_str(), "repo"))
             .expect("writing advisory sync marker");
     }
 
@@ -710,7 +821,7 @@ mod portable_tests {
             .with_coverage_url(&server_uri)
             .with_github_url(&server_uri)
             .with_codeberg_url(&server_uri)
-            .with_advisory_url("https://example.invalid/advisories.git")
+            .with_advisory_archive_url("https://example.invalid/advisories.tar.gz")
     }
 
     async fn new_fixture_collector(cache_dir: &std::path::Path, progress: impl Progress + 'static, server: &MockServer) -> Collector {
@@ -814,6 +925,58 @@ mod portable_tests {
     }
 
     #[tokio::test]
+    async fn collector_new_propagates_cache_lock_errors_before_contacting_providers() {
+        let cache_dir = tempfile::tempdir_in(".").unwrap();
+        std::fs::create_dir(cache_dir.path().join("cache.lock")).unwrap();
+        let result = Collector::new(
+            None,
+            None,
+            cache_dir.path(),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            false,
+            Arc::new(BugLabelMatcher::default()),
+            NoOpProgress,
+            &Endpoints::default(),
+        )
+        .await;
+        let error = result.expect_err("a directory cannot be opened as a writable cache-lock file");
+        assert!(format!("{error:#}").contains("opening cache lock file"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn collector_initialization_retains_distinct_coverage_and_documentation_endpoints() {
+        let cache_dir = tempfile::tempdir_in(".").unwrap();
+        let server = MockServer::start().await;
+        mount_minimal_dump(&server).await;
+        mark_advisory_cache_fresh(cache_dir.path());
+        let coverage = "http://coverage.example.invalid/custom";
+        let docs = "http://docs.example.invalid/custom";
+        let endpoints = local_endpoints(&server).with_coverage_url(coverage).with_docs_url(docs);
+        let collector = Collector::new(
+            None,
+            None,
+            cache_dir.path(),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            core::time::Duration::from_hours(1),
+            false,
+            Arc::new(BugLabelMatcher::default()),
+            NoOpProgress,
+            &endpoints,
+        )
+        .await
+        .unwrap();
+        assert!(format!("{:?}", collector.coverage_provider).contains(&format!("base_url: {coverage:?}")));
+        assert!(format!("{:?}", collector.docs_provider).contains(&format!("base_url: {docs:?}")));
+    }
+
+    #[tokio::test]
     #[cfg_attr(miri, ignore = "Miri cannot run a Tokio reactor")]
     async fn collector_new_propagates_crates_provider_errors() {
         let cache_dir = tempfile::tempdir().expect("creating collector cache directory");
@@ -844,7 +1007,7 @@ mod portable_tests {
         let server = MockServer::start().await;
         mount_minimal_dump(&server).await;
         let cache_dir = tempfile::tempdir().expect("creating collector cache directory");
-        let endpoints = local_endpoints(&server).with_advisory_url("not a valid repository URL");
+        let endpoints = local_endpoints(&server).with_advisory_archive_url("not a valid archive URL");
 
         let result = Collector::new(
             None,
@@ -900,26 +1063,32 @@ mod portable_tests {
         let server = MockServer::start().await;
         mount_minimal_dump(&server).await;
         let cache_dir = tempfile::tempdir().expect("creating collector cache directory");
-        mark_advisory_cache_fresh(cache_dir.path());
-        let endpoints = local_endpoints(&server).with_advisory_url("not a valid repository URL");
+        let endpoints = local_endpoints(&server).with_advisory_archive_url("not a valid archive URL");
+        mark_advisory_cache_fresh_for(cache_dir.path(), endpoints.advisory_archive_url());
 
-        let result = Collector::new(
-            None,
-            None,
-            cache_dir.path(),
-            core::time::Duration::from_hours(1),
-            core::time::Duration::from_hours(1),
-            core::time::Duration::from_hours(1),
-            core::time::Duration::from_hours(1),
-            core::time::Duration::from_hours(1),
-            true,
-            Arc::new(BugLabelMatcher::default()),
-            NoOpProgress,
-            &endpoints,
-        )
-        .await;
+        for ignore_cached in [false, true] {
+            let result = Collector::new(
+                None,
+                None,
+                cache_dir.path(),
+                core::time::Duration::from_hours(1),
+                core::time::Duration::from_hours(1),
+                core::time::Duration::from_hours(1),
+                core::time::Duration::from_hours(1),
+                core::time::Duration::from_hours(1),
+                ignore_cached,
+                Arc::new(BugLabelMatcher::default()),
+                NoOpProgress,
+                &endpoints,
+            )
+            .await;
 
-        assert!(result.is_err(), "ignoring the fresh advisory marker must force a fetch");
+            assert_eq!(
+                result.is_err(),
+                ignore_cached,
+                "only cache bypass must force a fetch of the configured invalid endpoint"
+            );
+        }
     }
 
     #[tokio::test]
@@ -977,24 +1146,24 @@ mod portable_tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(miri, ignore = "Miri cannot run a Tokio reactor")]
     async fn query_providers_leaves_unavailable_crates_unqueried() {
-        let server = MockServer::start().await;
-        let cache_dir = tempfile::tempdir().expect("creating collector cache directory");
-        let collector = new_fixture_collector(cache_dir.path(), NoOpProgress, &server).await;
         let spec = CrateSpec::from_arcs(Arc::from("unavailable-crate"), Arc::new(Version::new(1, 0, 0)));
 
-        let facts = collector
-            .query_providers(vec![(spec, ProviderResult::Unavailable("crate was unavailable".into()))])
-            .await
-            .pop()
-            .expect("one fact is returned for the one input crate");
+        let facts = query_providers_with(
+            vec![(spec.clone(), ProviderResult::Unavailable("crate was unavailable".into()))],
+            |_, _| async { panic!("unavailable crates must not query any provider") },
+        )
+        .await
+        .pop()
+        .expect("one fact is returned for the one input crate");
 
         assert!(is_not_queried(&facts.hosting_data));
         assert!(is_not_queried(&facts.advisory_data));
         assert!(is_not_queried(&facts.codebase_data));
         assert!(is_not_queried(&facts.coverage_data));
         assert!(is_not_queried(&facts.docs_data));
+        assert_eq!(facts.crate_spec, spec);
+        assert!(matches!(facts.crates_data, ProviderResult::Unavailable(ref reason) if reason == "crate was unavailable"));
     }
 
     #[tokio::test]
@@ -1011,7 +1180,10 @@ mod portable_tests {
         let advisories_dir = cache_dir.path().join("advisories");
         write_advisory(&advisories_dir.join("repo"), "queried-crate", "RUSTSEC-2020-0200");
         Cache::new(&advisories_dir, core::time::Duration::from_hours(1), false)
-            .save("last_synced.bin", &())
+            .save(
+                "last_synced.bin",
+                &(blake3::hash(b"https://example.invalid/advisories.tar.gz").to_hex().as_str(), "repo"),
+            )
             .expect("writing advisory sync marker");
 
         let server_uri = server.uri();
@@ -1022,13 +1194,13 @@ mod portable_tests {
             .with_coverage_url(&server_uri)
             .with_github_url(&server_uri)
             .with_codeberg_url(&server_uri)
-            .with_advisory_url("https://example.invalid/advisories.git");
+            .with_advisory_archive_url("https://example.invalid/advisories.tar.gz");
         assert_eq!(endpoints.dump_url(), dump_url);
         assert_eq!(endpoints.docs_url(), server_uri);
         assert_eq!(endpoints.coverage_url(), server_uri);
         assert_eq!(endpoints.host_url("github.com"), Some(server_uri.as_str()));
         assert_eq!(endpoints.host_url("codeberg.org"), Some(server_uri.as_str()));
-        assert_eq!(endpoints.advisory_url(), "https://example.invalid/advisories.git");
+        assert_eq!(endpoints.advisory_archive_url(), "https://example.invalid/advisories.tar.gz");
         let collector = Collector::new(
             None,
             None,

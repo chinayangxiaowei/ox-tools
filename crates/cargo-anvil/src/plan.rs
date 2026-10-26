@@ -17,6 +17,7 @@
 //! See [`updates.md §7`](../../docs/design/updates.md) for the proposed-file
 //! protocol.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -77,6 +78,11 @@ pub struct PlanItem {
     /// whenever it is present, so a decision that leaves it `None` leaves
     /// the previously recorded checksum untouched.
     pub rendered_checksum: Option<String>,
+    /// Structural JSON array selector whose provenance must be retained in
+    /// the manifest. `None` for every other plan item.
+    pub(crate) json_array_path: Option<Vec<String>>,
+    /// Whether this region must retain JSONC-aware marker scanning.
+    pub(crate) json_scanner: bool,
 }
 
 impl PlanItem {
@@ -92,6 +98,8 @@ impl PlanItem {
             rendered: None,
             spliced_host: Some(spliced_host),
             rendered_checksum: None,
+            json_array_path: None,
+            json_scanner: false,
         }
     }
     /// Construct a plan item for an in-sync, skipped, or leave-alone
@@ -105,6 +113,8 @@ impl PlanItem {
             rendered: None,
             spliced_host: None,
             rendered_checksum: None,
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -125,6 +135,8 @@ impl PlanItem {
             rendered: None,
             spliced_host: None,
             rendered_checksum: Some(template_checksum),
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -137,6 +149,8 @@ impl PlanItem {
             rendered: Some(rendered),
             spliced_host: None,
             rendered_checksum: Some(checksum),
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -156,6 +170,8 @@ impl PlanItem {
             rendered: Some(rendered),
             spliced_host: None,
             rendered_checksum: Some(template_checksum),
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -171,6 +187,8 @@ impl PlanItem {
             rendered: Some(body),
             spliced_host: Some(spliced_host),
             rendered_checksum: Some(body_checksum),
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -185,6 +203,8 @@ impl PlanItem {
             rendered: None,
             spliced_host: None,
             rendered_checksum: None,
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -202,6 +222,8 @@ impl PlanItem {
             rendered: None,
             spliced_host: Some(spliced_host),
             rendered_checksum: None,
+            json_array_path: None,
+            json_scanner: false,
         }
     }
 
@@ -217,7 +239,22 @@ impl PlanItem {
             rendered: None,
             spliced_host: None,
             rendered_checksum: None,
+            json_array_path: None,
+            json_scanner: false,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_json_array_path(mut self, path: Vec<String>) -> Self {
+        self.json_array_path = Some(path);
+        self.json_scanner = true;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_json_scanner(mut self) -> Self {
+        self.json_scanner = true;
+        self
     }
 }
 
@@ -225,6 +262,9 @@ impl PlanItem {
 #[derive(Debug, Default)]
 pub struct Plan {
     items: Vec<PlanItem>,
+    json_array_paths: BTreeMap<RegionKey, Vec<String>>,
+    json_scanner_hosts: BTreeSet<String>,
+    json_scanner_hosts_authoritative: bool,
     notes: Vec<String>,
     refusals: Vec<String>,
     manifest_update_required: bool,
@@ -265,6 +305,41 @@ impl Plan {
     #[must_use]
     pub fn items(&self) -> &[PlanItem] {
         &self.items
+    }
+
+    pub(crate) fn set_json_scanner_hosts(&mut self, hosts: BTreeSet<String>) {
+        self.json_scanner_hosts = hosts;
+        self.json_scanner_hosts_authoritative = true;
+    }
+
+    pub(crate) fn retain_json_array_path(&mut self, host: String, id: String, path: Vec<String>) {
+        self.json_array_paths.insert(RegionKey { host, id }, path);
+    }
+
+    pub(crate) fn region_has_checksum_update(&self, host: &str, id: &str) -> bool {
+        self.items.iter().any(|item| {
+            item.rendered_checksum.is_some()
+                && matches!(
+                    &item.target,
+                    Target::Region {
+                        host: item_host,
+                        id: item_id
+                    } if item_host == host && item_id == id
+                )
+        })
+    }
+
+    pub(crate) fn region_tracking_removed(&self, host: &str, id: &str) -> bool {
+        self.items.iter().any(|item| {
+            matches!(item.decision, Decision::Remove | Decision::OrphanedKept)
+                && matches!(
+                    &item.target,
+                    Target::Region {
+                        host: item_host,
+                        id: item_id
+                    } if item_host == host && item_id == id
+                )
+        })
     }
 
     /// Record whether applying this plan would change `.anvil.lock`.
@@ -397,30 +472,49 @@ impl Plan {
     ///
     /// Manifest projection is deliberately separate so dry-run and real
     /// application calculate the same next `.anvil.lock`.
+    pub(crate) fn apply_files(&self, repo_root: &Path) -> Result<(), AppError> {
+        self.apply_files_with(
+            repo_root,
+            (resolve_existing_case_insensitive, contained_path, write_file, |path| {
+                std::fs::remove_file(path)
+            }),
+        )
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "the expects encode invariants enforced by the PlanItem constructors"
     )]
-    pub(crate) fn apply_files(&self, repo_root: &Path) -> Result<(), AppError> {
+    fn apply_files_with(
+        &self,
+        repo_root: &Path,
+        operations: (
+            impl FnMut(&Path, &str) -> Result<String, AppError>,
+            impl FnMut(&Path, &str) -> Result<PathBuf, AppError>,
+            impl FnMut(&Path, &str) -> Result<(), AppError>,
+            impl FnMut(&Path) -> std::io::Result<()>,
+        ),
+    ) -> Result<(), AppError> {
+        let (mut resolve, mut contained, mut write, mut remove) = operations;
         for item in &self.items {
             match (&item.target, item.decision) {
                 (Target::File { path }, Decision::Write) => {
                     let content = item.rendered.as_ref().expect("Write decision must carry rendered content");
-                    write_file(&contained_path(repo_root, path)?, content)?;
+                    write(&contained(repo_root, path)?, content)?;
                 }
                 (Target::File { path }, Decision::Propose) => {
                     let content = item.rendered.as_ref().expect("Propose decision must carry rendered content");
-                    write_file(&contained_path(repo_root, &format!("{path}.anvil-proposed"))?, content)?;
+                    write(&contained(repo_root, &format!("{path}.anvil-proposed"))?, content)?;
                 }
                 (Target::Region { host, .. }, Decision::Write) => {
                     let spliced = item.spliced_host.as_ref().expect("region Write must carry spliced host");
-                    write_file(&contained_path(repo_root, host)?, spliced)?;
+                    write(&contained(repo_root, host)?, spliced)?;
                 }
                 (Target::Region { .. }, Decision::Propose) => unreachable!("only owned files can propose"),
                 (Target::File { path }, Decision::Remove) => {
-                    let actual_path = resolve_existing_case_insensitive(repo_root, path)?;
-                    let abs = contained_path(repo_root, &actual_path)?;
-                    if let Err(e) = std::fs::remove_file(&abs)
+                    let actual_path = resolve(repo_root, path)?;
+                    let abs = contained(repo_root, &actual_path)?;
+                    if let Err(e) = remove(&abs)
                         && e.kind() != std::io::ErrorKind::NotFound
                     {
                         return Err::<(), _>(e).into_app_err_with(|| format!("failed to remove {}", abs.display()));
@@ -428,8 +522,8 @@ impl Plan {
                 }
                 (Target::Region { host, .. }, Decision::Remove) => {
                     let spliced = item.spliced_host.as_ref().expect("region Remove must carry spliced host");
-                    let actual_host = resolve_existing_case_insensitive(repo_root, host)?;
-                    write_file(&contained_path(repo_root, &actual_host)?, spliced)?;
+                    let actual_host = resolve(repo_root, host)?;
+                    write(&contained(repo_root, &actual_host)?, spliced)?;
                 }
                 (_, Decision::InSync | Decision::LeaveAlone | Decision::OrphanedKept) => {}
             }
@@ -446,9 +540,22 @@ impl Plan {
             catalog_checksum: previous_manifest.catalog_checksum.clone(),
             files: previous_manifest.files.clone(),
             regions: previous_manifest.regions.clone(),
+            json_array_paths: previous_manifest.json_array_paths.clone(),
+            json_scanner_hosts: if self.json_scanner_hosts_authoritative {
+                self.json_scanner_hosts.clone()
+            } else {
+                previous_manifest.json_scanner_hosts.clone()
+            },
         };
+        next.json_array_paths
+            .extend(self.json_array_paths.iter().map(|(key, path)| (key.clone(), path.clone())));
 
         for item in &self.items {
+            if item.json_scanner
+                && let Target::Region { host, .. } = &item.target
+            {
+                next.json_scanner_hosts.insert(host.clone());
+            }
             match item.decision {
                 Decision::Write | Decision::Propose | Decision::InSync => {
                     if let Some(checksum) = &item.rendered_checksum {
@@ -457,13 +564,14 @@ impl Plan {
                                 next.files.insert(path.clone(), checksum.clone());
                             }
                             Target::Region { host, id } => {
-                                next.regions.insert(
-                                    RegionKey {
-                                        host: host.clone(),
-                                        id: id.clone(),
-                                    },
-                                    checksum.clone(),
-                                );
+                                let key = RegionKey {
+                                    host: host.clone(),
+                                    id: id.clone(),
+                                };
+                                next.regions.insert(key.clone(), checksum.clone());
+                                if let Some(path) = &item.json_array_path {
+                                    next.json_array_paths.insert(key, path.clone());
+                                }
                             }
                         }
                     }
@@ -473,10 +581,12 @@ impl Plan {
                         next.files.remove(path);
                     }
                     Target::Region { host, id } => {
-                        next.regions.remove(&RegionKey {
+                        let key = RegionKey {
                             host: host.clone(),
                             id: id.clone(),
-                        });
+                        };
+                        next.regions.remove(&key);
+                        next.json_array_paths.remove(&key);
                     }
                 },
                 Decision::LeaveAlone => {}
@@ -554,6 +664,10 @@ fn contained_path(repo_root: &Path, relpath: &str) -> Result<PathBuf, AppError> 
 }
 
 fn write_file(path: &Path, content: &str) -> Result<(), AppError> {
+    write_file_with(path, content, write_temporary_file)
+}
+
+fn write_file_with(path: &Path, content: &str, write_temporary: impl FnOnce(&Path, &str) -> Result<(), AppError>) -> Result<(), AppError> {
     let parent = path
         .parent()
         .expect("write_file targets are always repo-root-joined paths, which always have a parent");
@@ -572,7 +686,7 @@ fn write_file(path: &Path, content: &str) -> Result<(), AppError> {
             return Err(e).into_app_err_with(|| format!("failed to clear the temporary file {}", tmp.display()));
         }
     }
-    write_temporary_file(&tmp, content)?;
+    write_temporary(&tmp, content)?;
     std::fs::rename(&tmp, path).into_app_err_with(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
@@ -596,6 +710,22 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn checksum_update_requires_a_matching_region_with_a_rendered_checksum() {
+        let mut plan = Plan::default();
+        plan.push(PlanItem::repair_region("config.json", "settings", "{}".to_owned()));
+        plan.push(PlanItem::insync(
+            Target::Region {
+                host: "config.json".to_owned(),
+                id: "other".to_owned(),
+            },
+            "checksum".to_owned(),
+        ));
+
+        assert!(!plan.region_has_checksum_update("config.json", "settings"));
+        assert!(plan.region_has_checksum_update("config.json", "other"));
+    }
+
     /// Only owned files propose: a managed region's proposal would be a sidecar
     /// nobody can apply, because moving it over the host would replace the
     /// repository's own content around the region as well. The arm that says so
@@ -616,6 +746,8 @@ mod tests {
             rendered: Some("[advisories]\n".to_owned()),
             spliced_host: None,
             rendered_checksum: None,
+            json_array_path: None,
+            json_scanner: false,
         });
 
         drop(plan.apply_files(tmp.path()));
@@ -1391,5 +1523,89 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = write_temporary_file(tmp.path(), "data").unwrap_err();
         assert!(err.to_string().contains("failed to write"), "{err}");
+    }
+
+    #[test]
+    fn region_and_removal_plans_preserve_resolution_and_containment_failures() {
+        let root = Path::new("scripted-repository");
+        for resolution_failure in [false, true] {
+            for (item, path, resolves) in [
+                (
+                    PlanItem::write_region("host", "id", "body".into(), "spliced".into(), "checksum".into()),
+                    "host",
+                    false,
+                ),
+                (PlanItem::remove_region("host", "id", "spliced".into()), "host", true),
+                (PlanItem::remove_file("file"), "file", true),
+            ] {
+                if resolution_failure && !resolves {
+                    continue;
+                }
+                let expected = if resolution_failure {
+                    "scripted case-resolution failure"
+                } else {
+                    "scripted containment failure"
+                };
+                let kind = if resolution_failure {
+                    std::io::ErrorKind::NotFound
+                } else {
+                    std::io::ErrorKind::PermissionDenied
+                };
+                let mut calls = Vec::new();
+                let mut plan = Plan::default();
+                plan.push(item);
+                let error = plan
+                    .apply_files_with(
+                        root,
+                        (
+                            |actual_root, actual_path| {
+                                assert!(resolves, "region writes must not resolve existing paths");
+                                assert_eq!(actual_root, root);
+                                assert_eq!(actual_path, path);
+                                calls.push("resolve");
+                                if resolution_failure {
+                                    Err(AppError::new(std::io::Error::new(kind, expected)))
+                                } else {
+                                    Ok(format!("resolved-{path}"))
+                                }
+                            },
+                            |actual_root, actual_path| {
+                                assert!(!resolution_failure, "a resolution failure must stop containment checks");
+                                assert_eq!(actual_root, root);
+                                assert_eq!(actual_path, if resolves { format!("resolved-{path}") } else { path.to_owned() });
+                                Err(AppError::new(std::io::Error::new(kind, expected)))
+                            },
+                            |_, _| panic!("resolution or containment failure must stop writes"),
+                            |_| panic!("resolution or containment failure must stop removals"),
+                        ),
+                    )
+                    .expect_err("invalid repository roots return errors instead of panicking");
+                assert_eq!(error.message(), expected);
+                assert_eq!(
+                    error
+                        .find_source::<std::io::Error>()
+                        .expect("the injected cause is retained")
+                        .kind(),
+                    kind
+                );
+                assert_eq!(calls, if resolves { vec!["resolve"] } else { Vec::new() });
+            }
+        }
+    }
+
+    #[cfg_attr(miri, ignore = "uses filesystem; miri isolation forbids it")]
+    #[test]
+    fn temporary_write_error_stops_atomic_replacement_and_preserves_destination() {
+        let tmp = TempDir::new().expect("repository fixture exists");
+        let destination = tmp.path().join("owned.txt");
+        fs::write(&destination, "original").expect("owned destination exists");
+        let error = write_file_with(&destination, "replacement", |path, contents| {
+            assert_eq!(path, make_temp_path(&destination));
+            assert_eq!(contents, "replacement");
+            Err(ohno::app_err!("injected temporary write failure"))
+        })
+        .expect_err("temporary write errors return instead of panicking");
+        assert!(error.to_string().contains("injected temporary write failure"), "{error}");
+        assert_eq!(fs::read_to_string(&destination).expect("destination remains readable"), "original");
     }
 }
