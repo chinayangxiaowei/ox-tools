@@ -29,16 +29,16 @@ use crate::{HashMap, HashSet};
 
 /// One `mod name;` declaration that pulls in another file.
 #[derive(Debug, Clone)]
-pub(super) struct Declaration {
+pub struct Declaration {
     /// The file it resolves to, absolute.
-    pub(super) target: Utf8PathBuf,
+    pub target: Utf8PathBuf,
 
     /// Whether the selected configuration, or an enclosing module, excludes this declaration.
     ///
     /// This includes test scaffolding and a `cfg` condition that does not hold. Both kinds of file
     /// are walked to carry the exclusion to their children, but neither can contribute mutants
     /// unless another live declaration reaches it.
-    pub(super) excluded: bool,
+    pub excluded: bool,
 }
 
 /// Finds the file declarations a parsed file makes.
@@ -46,13 +46,19 @@ pub(super) struct Declaration {
 /// `path` is the file the declarations were written in, absolute, since a `mod` resolves relative
 /// to where it appears.
 #[must_use]
-pub(super) fn declarations(path: &Utf8Path, ast: &syn::File, cfg: &CfgSet) -> Vec<Declaration> {
+pub fn declarations(path: &Utf8Path, ast: &syn::File, cfg: &CfgSet) -> Vec<Declaration> {
+    declarations_with(path, ast, cfg, |target| target.as_std_path().is_file())
+}
+
+fn declarations_with(path: &Utf8Path, ast: &syn::File, cfg: &CfgSet, is_file: impl FnMut(&Utf8Path) -> bool) -> Vec<Declaration> {
+    let mut is_file = is_file;
     let mut found = Vec::new();
     let (Some(directory), Some(beside)) = (owned_directory(path), path.parent()) else {
+        // #[gamma::skip(return_value.default, reason = "found is still the newly created empty vector on this early return, identical to inferred Vec Default")]
         return found;
     };
 
-    walk(&ast.items, &directory, beside, cfg, false, &mut found);
+    walk(&ast.items, &directory, beside, cfg, false, &mut found, &mut is_file);
 
     found
 }
@@ -62,7 +68,7 @@ pub(super) fn declarations(path: &Utf8Path, ast: &syn::File, cfg: &CfgSet) -> Ve
 /// `lib.rs`, `main.rs` and `mod.rs` own the directory they sit in; any other file owns a
 /// subdirectory named after it. This is the rule the compiler applies, and getting it wrong would
 /// silently resolve a declaration to nothing.
-fn owned_directory(path: &Utf8Path) -> Option<Utf8PathBuf> {
+pub(super) fn owned_directory(path: &Utf8Path) -> Option<Utf8PathBuf> {
     let parent = path.parent()?;
     let stem = path.file_stem()?;
 
@@ -80,7 +86,15 @@ fn owned_directory(path: &Utf8Path) -> Option<Utf8PathBuf> {
 /// relative to the directory that file sits in, while `mod name;` looks in the directory that file
 /// owns. For `de/reader_impl_tests.rs` those are `de/` and `de/reader_impl_tests/` respectively,
 /// so reading `#[path = "reader_tests.rs"]` against the wrong one finds nothing at all.
-fn walk(items: &[Item], directory: &Utf8Path, base: &Utf8Path, cfg: &CfgSet, inherited_exclusion: bool, found: &mut Vec<Declaration>) {
+fn walk(
+    items: &[Item],
+    directory: &Utf8Path,
+    base: &Utf8Path,
+    cfg: &CfgSet,
+    inherited_exclusion: bool,
+    found: &mut Vec<Declaration>,
+    is_file: &mut impl FnMut(&Utf8Path) -> bool,
+) {
     for item in items {
         let Item::Mod(module) = item else { continue };
         let excluded = inherited_exclusion || test_gated_for(cfg, &module.attrs) || !cfg.holds_for(&module.attrs);
@@ -93,7 +107,7 @@ fn walk(items: &[Item], directory: &Utf8Path, base: &Utf8Path, cfg: &CfgSet, inh
 
             // Inside an inline module both rules point at the same place, so from here down a
             // `#[path]` and a plain declaration resolve against the module's own directory.
-            walk(items, &nested, &nested, cfg, excluded, found);
+            walk(items, &nested, &nested, cfg, excluded, found, is_file);
             continue;
         }
 
@@ -104,7 +118,7 @@ fn walk(items: &[Item], directory: &Utf8Path, base: &Utf8Path, cfg: &CfgSet, inh
         );
 
         for target in candidates {
-            if target.as_std_path().is_file() {
+            if is_file(&target) {
                 found.push(Declaration { target, excluded });
                 break;
             }
@@ -113,7 +127,7 @@ fn walk(items: &[Item], directory: &Utf8Path, base: &Utf8Path, cfg: &CfgSet, inh
 }
 
 /// Reads the path a `#[path = "…"]` attribute points at.
-fn path_attribute(attrs: &[Attribute]) -> Option<String> {
+pub(super) fn path_attribute(attrs: &[Attribute]) -> Option<String> {
     attrs.iter().find_map(|attr| {
         let Meta::NameValue(pair) = &attr.meta else { return None };
 
@@ -139,18 +153,30 @@ fn path_attribute(attrs: &[Attribute]) -> Option<String> {
 /// `include!`, or by a `mod` behind a `cfg` this cannot evaluate, and dropping mutants on a guess
 /// would quietly shrink the population.
 #[must_use]
-pub(super) fn excluded_files(roots: &[Utf8PathBuf], declared: &[(Utf8PathBuf, Vec<Declaration>)]) -> HashSet<Utf8PathBuf> {
-    let edges: HashMap<&Utf8Path, &[Declaration]> = declared.iter().map(|(from, list)| (from.as_path(), list.as_slice())).collect();
+pub fn excluded_files(roots: &[Utf8PathBuf], declared: &[(Utf8PathBuf, Vec<Declaration>)]) -> HashSet<Utf8PathBuf> {
+    let mut edges: HashMap<Utf8PathBuf, Vec<Declaration>> = HashMap::default();
+    for (from, list) in declared {
+        edges
+            .entry(identity(from))
+            .or_default()
+            .extend(list.iter().map(|declaration| Declaration {
+                target: identity(&declaration.target),
+                excluded: declaration.excluded,
+            }));
+    }
 
     let mut live: HashSet<Utf8PathBuf> = HashSet::default();
+    let roots: Vec<_> = roots.iter().map(|root| identity(root)).collect();
     let mut queue: Vec<&Utf8Path> = roots.iter().map(Utf8PathBuf::as_path).collect();
 
     while let Some(file) = queue.pop() {
+        // #[gamma::skip(cond.always_false, tag = "timeout", reason = "without the visited-file guard cyclic live module edges are enqueued indefinitely")]
         if !live.insert(file.to_owned()) {
+            // #[gamma::skip(loop.delete_continue, tag = "timeout", reason = "already visited live module edges must not be enqueued again in a cycle")]
             continue;
         }
 
-        for declaration in edges.get(file).copied().unwrap_or(&[]) {
+        for declaration in edges.get(file).map_or(&[][..], Vec::as_slice) {
             if !declaration.excluded {
                 queue.push(declaration.target.as_path());
             }
@@ -160,24 +186,32 @@ pub(super) fn excluded_files(roots: &[Utf8PathBuf], declared: &[(Utf8PathBuf, Ve
     // Everything below an excluded module is absent too, so the exclusion follows every edge from
     // there rather than stopping at the file the declaration named.
     let mut excluded: HashSet<Utf8PathBuf> = HashSet::default();
-    let mut queue: Vec<&Utf8Path> = declared
-        .iter()
-        .flat_map(|(_from, list)| list)
+    let mut queue: Vec<&Utf8Path> = edges
+        .values()
+        .flatten()
         .filter(|declaration| declaration.excluded)
         .map(|declaration| declaration.target.as_path())
         .collect();
 
     while let Some(file) = queue.pop() {
+        // #[gamma::skip(cond.always_false, logical.or_remove_right, tag = "timeout", reason = "without the visited-file guard cyclic module edges are enqueued indefinitely")]
         if live.contains(file) || !excluded.insert(file.to_owned()) {
+            // #[gamma::skip(loop.delete_continue, tag = "timeout", reason = "already visited module edges must not be enqueued again in a cycle")]
             continue;
         }
 
-        for declaration in edges.get(file).copied().unwrap_or(&[]) {
+        for declaration in edges.get(file).map_or(&[][..], Vec::as_slice) {
             queue.push(declaration.target.as_path());
         }
     }
 
     excluded
+}
+
+/// Existing files share an OS identity; unresolved declarations cannot prove an alias.
+#[must_use]
+pub fn identity(path: &Utf8Path) -> Utf8PathBuf {
+    path.canonicalize_utf8().unwrap_or_else(|_cause| path.to_owned())
 }
 
 #[cfg(test)]
@@ -186,12 +220,121 @@ pub(super) fn excluded_files(roots: &[Utf8PathBuf], declared: &[(Utf8PathBuf, Ve
 mod tests {
     use super::*;
 
+    #[test]
+    fn survivor_a_self_referential_module_declaration_does_not_revisit_its_live_root_forever() {
+        let source = Utf8PathBuf::from("workspace/lib.rs");
+        let ast = syn::parse_file("#[path = \"lib.rs\"] mod recursive;\n").expect("a cyclic module path is still valid Rust syntax");
+        let edges = declarations_with(&source, &ast, &CfgSet::unconditional(), |path| {
+            assert_eq!(path, source);
+            true
+        });
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, source);
+        let excluded = crate::testing::within(crate::testing::WATCHDOG, "cyclic module reachability", move || {
+            let declarations = [(source.clone(), edges)];
+            excluded_files(std::slice::from_ref(&source), &declarations)
+        });
+        assert!(
+            excluded.is_empty(),
+            "a live root remains live even when its module declarations cycle"
+        );
+    }
+
     fn parse(text: &str) -> syn::File {
         syn::parse_file(text).unwrap()
     }
 
     fn test_gated(attrs: &[Attribute]) -> bool {
         test_gated_for(&CfgSet::default(), attrs)
+    }
+
+    #[test]
+    fn declaration_fixture_preserves_inherited_exclusion_and_first_existing_module_candidate() {
+        let root = Utf8Path::new("workspace");
+        let source = root.join("lib.rs");
+        let ast = parse("mod missing; mod dual; mod directory_only; #[cfg(test)] mod hidden { mod nested; }");
+        let mut inspected = Vec::new();
+        let found = declarations_with(&source, &ast, &CfgSet::unconditional(), |path| {
+            inspected.push(path.to_owned());
+            if [
+                root.join("missing.rs"),
+                root.join("missing").join("mod.rs"),
+                root.join("directory_only.rs"),
+            ]
+            .contains(&path.to_owned())
+            {
+                false
+            } else if [
+                root.join("dual.rs"),
+                root.join("directory_only").join("mod.rs"),
+                root.join("hidden").join("nested.rs"),
+            ]
+            .contains(&path.to_owned())
+            {
+                true
+            } else {
+                panic!("unexpected module candidate {path}")
+            }
+        });
+        assert_eq!(
+            inspected,
+            [
+                root.join("missing.rs"),
+                root.join("missing/mod.rs"),
+                root.join("dual.rs"),
+                root.join("directory_only.rs"),
+                root.join("directory_only/mod.rs"),
+                root.join("hidden/nested.rs"),
+            ]
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|declaration| (declaration.target.clone(), declaration.excluded))
+                .collect::<Vec<_>>(),
+            [
+                (root.join("dual.rs"), false),
+                (root.join("directory_only/mod.rs"), false),
+                (root.join("hidden/nested.rs"), true),
+            ]
+        );
+        assert_eq!(owned_directory(Utf8Path::new(".")), None);
+        assert_eq!(owned_directory(Utf8Path::new("")), None);
+    }
+
+    #[test]
+    fn exclusion_graph_continues_after_duplicate_live_nodes_and_excluded_nodes() {
+        let path = |name: &str| Utf8PathBuf::from(name);
+        let edge = |name: &str, excluded| Declaration {
+            target: path(name),
+            excluded,
+        };
+        let declared = vec![
+            (
+                path("root"),
+                vec![
+                    edge("later", false),
+                    edge("duplicate", false),
+                    edge("duplicate", false),
+                    edge("excluded", true),
+                    edge("later", true),
+                ],
+            ),
+            (path("later"), vec![edge("leaf", false)]),
+            (path("excluded"), vec![edge("child", false), edge("child", false)]),
+            (path("child"), vec![edge("grandchild", false)]),
+            (path("unreferenced"), vec![edge("orphan", false)]),
+        ];
+        assert_eq!(
+            excluded_files(&[path("root")], &declared),
+            [path("excluded"), path("child"), path("grandchild")].into_iter().collect()
+        );
+        let mut declared = declared;
+        declared[0].1.push(edge("grandchild", false));
+        assert_eq!(
+            excluded_files(&[path("root")], &declared),
+            [path("excluded"), path("child")].into_iter().collect()
+        );
     }
 
     #[test]
@@ -355,7 +498,7 @@ mod tests {
         assert!(active[0].excluded);
         assert_eq!(inactive.len(), 1, "{inactive:?}");
         assert!(!inactive[0].excluded);
-        assert!(excluded_files(&[declaring], &declared).contains(&target));
+        assert!(excluded_files(&[declaring], &declared).contains(&identity(&target)));
     }
 
     #[test]

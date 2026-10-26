@@ -265,22 +265,22 @@ _anvil-impact-snapshot:
         # host: RUNNER_TEMP on GitHub Actions, AGENT_TEMPDIRECTORY on Azure
         # Pipelines -- both are job-owned and cleaned up by the runner, so the
         # throwaway worktree never leaks into the workspace or survives the job.
-        # Local runs have neither, so fall back to the system temp dir. The
-        # worktree name includes $PID so concurrent impact runs (e.g. several
-        # local checks, or matrix legs sharing a temp root) each get a distinct
-        # path and never remove or overwrite another run's baseline checkout.
+        # Local runs fall back to the system temp dir. A fresh nonce prevents
+        # collisions with abandoned directories when the OS reuses a PID.
         $tmpRoot = $env:RUNNER_TEMP
         if (-not $tmpRoot) { $tmpRoot = $env:AGENT_TEMPDIRECTORY }
         if (-not $tmpRoot) { $tmpRoot = [System.IO.Path]::GetTempPath() }
-        $wt = Join-Path $tmpRoot "anvil-baseline-$PID"
-        if (Test-Path $wt) { git worktree remove --force $wt 2>$null | Out-Null }
+        $wt = Join-Path $tmpRoot "anvil-baseline-$PID-$([System.Guid]::NewGuid().ToString('N'))"
         # GIT_LFS_SKIP_SMUDGE=1: the worktree inherits the repo config but not
         # the credential helper, so LFS smudge would fail. cargo-delta only
         # needs file content hashes; LFS pointer files hash consistently.
         $env:GIT_LFS_SKIP_SMUDGE = '1'
-        git worktree add --detach $wt $baseSha 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Error "anvil-impact: failed to create baseline worktree at $wt"; exit 1 }
+        $baselineFailed = $false
         try {
+            $worktreeOutput = @(git worktree add --detach $wt $baseSha 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "anvil-impact: failed to create baseline worktree at ${wt}: $($worktreeOutput -join [Environment]::NewLine)"
+            }
             if (-not (Test-Path (Join-Path $wt 'Cargo.toml'))) {
                 # First-time anvil adoption: the base predates the cargo
                 # workspace (no root Cargo.toml), so there is nothing for
@@ -310,8 +310,39 @@ _anvil-impact-snapshot:
                 Set-Content -LiteralPath $baselineJson -Value $baseSnap -Encoding UTF8
                 Set-Content -LiteralPath $baselineKeyFile -Value $baselineKey -Encoding UTF8 -NoNewline
             }
+        } catch {
+            $baselineFailed = $true
+            throw
         } finally {
-            git worktree remove --force $wt 2>$null | Out-Null
+            $cleanupFailures = [System.Collections.Generic.List[string]]::new()
+            $worktreeOutput = @(git worktree list --porcelain -z)
+            $listFailed = $LASTEXITCODE -ne 0
+            if ($listFailed) {
+                $cleanupFailures.Add("failed to list worktrees: $($worktreeOutput -join [Environment]::NewLine)")
+            }
+            $worktrees = if ($listFailed) { @() } else { ($worktreeOutput -join "`n").Split([char] 0) }
+            $registeredPath = 'worktree ' + $wt.Replace([System.IO.Path]::DirectorySeparatorChar, [char] '/')
+            if ($listFailed -or $worktrees -contains $registeredPath) {
+                $cleanupOutput = @(git worktree remove --force --force $wt 2>&1)
+                if ($LASTEXITCODE -ne 0) {
+                    $cleanupFailures.Add("failed to remove baseline worktree at ${wt}: $($cleanupOutput -join [Environment]::NewLine)")
+                }
+            }
+            try {
+                if (Test-Path -LiteralPath $wt) {
+                    Remove-Item -LiteralPath $wt -Recurse -Force -ErrorAction Stop
+                }
+            } catch {
+                $cleanupFailures.Add("failed to remove baseline directory at ${wt}: $($_.Exception.Message)")
+            }
+            if ($cleanupFailures.Count -gt 0) {
+                $cleanupMessage = "anvil-impact: baseline cleanup failed: $($cleanupFailures -join '; ')"
+                if ($baselineFailed) {
+                    Write-Warning -Message $cleanupMessage -WarningAction Continue
+                } else {
+                    throw $cleanupMessage
+                }
+            }
         }
     }
 
@@ -708,3 +739,63 @@ _anvil-impact-include tier:
     } else {
         Write-Output $default
     }
+
+# Private. Same contract as _anvil-impact-include, but a member list is
+# returned as aggregate Cargo selection: "--workspace --exclude <name> ...".
+# Cargo resolves --exclude against workspace members only, so this stays
+# unambiguous when a registry dependency shares a member's name and version
+# (where `--package name@version` fails). "--skip", "--workspace" and the
+# empty modified default pass through unchanged, so callers keep their
+# explicit skip: excluding every member is a Cargo error, not a no-op.
+
+# Resolve a tier's scope as workspace-exclude Cargo selection.
+[script("pwsh", "-NoProfile")]
+_anvil-impact-exclude tier:
+    Set-StrictMode -Version 3.0
+    $ErrorActionPreference = 'Stop'
+    $include = (& "{{ just_executable() }}" _anvil-impact-include '{{ tier }}')
+    $impactExit = $LASTEXITCODE
+    if ($impactExit -ne 0) { exit $impactExit }
+    if ($include -notmatch '(^|\s)--package\s') { Write-Output $include; exit 0 }
+    $specs = @(-split $include | Where-Object { $_ -ne '--package' })
+    & "{{ just_executable() }}" _anvil-workspace-exclude @specs
+    exit $LASTEXITCODE
+
+# Private. Prints "--workspace --exclude <name> ..." selecting exactly the
+# given workspace-member name@version specs. Fails when a spec is not a
+# workspace member, so a stale selection never widens silently.
+
+# Convert workspace-member specs to workspace-exclude Cargo selection.
+[script("pwsh", "-NoProfile")]
+_anvil-workspace-exclude +specs:
+    Set-StrictMode -Version 3.0
+    $ErrorActionPreference = 'Stop'
+    $selected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($spec in -split '{{ specs }}') { [void]$selected.Add($spec) }
+    $metadataJson = & cargo {{_anvil_stable_toolchain_args}} metadata --locked --no-deps --format-version 1
+    $metadataExit = $LASTEXITCODE
+    if ($metadataExit -ne 0) {
+        [Console]::Error.WriteLine('anvil: cargo metadata failed')
+        exit $metadataExit
+    }
+    $meta = $metadataJson | ConvertFrom-Json
+    $workspaceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($id in $meta.workspace_members) { [void]$workspaceIds.Add("$id") }
+    $selection = [System.Collections.Generic.List[string]]::new()
+    $selection.Add('--workspace')
+    $found = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($p in @($meta.packages | Where-Object { $workspaceIds.Contains("$($_.id)") })) {
+        $spec = "$($p.name)@$($p.version)"
+        if ($selected.Contains($spec)) {
+            [void]$found.Add($spec)
+        } else {
+            $selection.Add('--exclude')
+            $selection.Add($p.name)
+        }
+    }
+    $missing = @($selected | Where-Object { -not $found.Contains($_) })
+    if ($missing.Count -gt 0) {
+        [Console]::Error.WriteLine("anvil: not workspace members: $($missing -join ', ')")
+        exit 1
+    }
+    Write-Output ($selection -join ' ')

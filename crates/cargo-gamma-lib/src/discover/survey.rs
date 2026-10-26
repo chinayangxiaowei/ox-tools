@@ -22,7 +22,7 @@ use super::compile_fail::{CompileFailTarget, compile_fail_targets};
 use super::glob::{Glob, normalize_separators};
 use super::killers::Killers;
 use super::shard::shard_of;
-use super::{Diff, Plan, TargetFile, modules};
+use super::{Diff, Plan, TargetFile, module_identities, modules};
 use crate::cfg::{CfgSet, Cfgs, features};
 use crate::commands::{FeatureArgs, SelectArgs};
 use crate::error::{Error, error};
@@ -32,6 +32,11 @@ use crate::ops::collect;
 use crate::ops::registry::Selection;
 use crate::parse::SourceFile;
 use crate::{HashMap, HashSet, Result, suppress};
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "survey/resource_evidence_tests.rs"]
+mod resource_evidence_tests;
 
 /// Builds the plan for a run.
 ///
@@ -109,8 +114,8 @@ pub struct Survey {
     /// Every mutable source file walked for each selected package, including files excluded from
     /// mutation by `--file` or `--in-diff`.
     ///
-    /// Module declarations in an excluded parent can still prove that an included child exists
-    /// only under `#[cfg(test)]`, so the declaration graph must be wider than the population.
+    /// Excluded files still supply module declarations and `Default` implementations, so the
+    /// evidence graph must be wider than the mutation population.
     declaration_files: HashMap<String, Vec<Utf8PathBuf>>,
 
     /// For each workspace package, the workspace packages its test binaries can reach.
@@ -191,6 +196,7 @@ pub struct Survey {
     /// They are not mutation candidates, but their bytes can change what a workspace package
     /// compiles or what its tests observe. The record snapshot captures them separately.
     external_inputs: Vec<Utf8PathBuf>,
+    resource_dependencies: Vec<super::resource_dependencies::Dependency>,
 
     /// Whether a build script may have read an external path Cargo does not report.
     untracked_build_script_inputs: bool,
@@ -200,7 +206,6 @@ pub struct Survey {
     only_mutants: Option<HashSet<MutantId>>,
     settled: HashMap<MutantId, super::Settled>,
     exclude_trait_impls: Vec<String>,
-    complete_defaults: bool,
 }
 
 /// What scanning some part of the workspace yielded.
@@ -290,7 +295,6 @@ impl Survey {
         Self::for_build_with_cache_inputs(args, shard, cargo, false)
     }
 
-    #[expect(clippy::too_many_lines, reason = "workspace selection is one ordered metadata pass")]
     // #[gamma::skip(all, reason = "survey construction integrates Cargo metadata, filesystem discovery, and process toolchain state; deterministic component tests cover normalization while isolated mutations are platform-dependent")]
     pub(crate) fn for_build_with_cache_inputs(
         args: &SelectArgs,
@@ -301,15 +305,76 @@ impl Survey {
         cargo.validate()?;
 
         let features = features::from_extra(&args.features, &cargo.extra);
-        let metadata = load_metadata(&args.dir, &features)?;
+        let metadata = load_survey_metadata_using(&args.dir, &features, cache_inputs, MetadataCommand::exec)?;
         let root = Utf8PathBuf::from(metadata.workspace_root.as_str());
-        let target = Utf8PathBuf::from(metadata.target_directory.as_str());
         let external_inputs = if cache_inputs {
             external_path_inputs(&args.dir, &features, &root)?
         } else {
             ExternalPathInputs::default()
         };
-        let enabled = features::enabled(&metadata, &features);
+        Self::for_build_with_metadata(
+            args,
+            shard,
+            cargo,
+            &features,
+            &metadata,
+            external_inputs,
+            cache_inputs,
+            configuration,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_build_using(
+        args: &SelectArgs,
+        shard: Option<(u32, u32)>,
+        cargo: &CargoOptions,
+        read_metadata: impl FnOnce(&MetadataCommand) -> std::result::Result<Metadata, cargo_metadata::Error>,
+    ) -> Result<Self> {
+        cargo.validate()?;
+
+        let features = features::from_extra(&args.features, &cargo.extra);
+        let metadata = load_survey_metadata_using(&args.dir, &features, false, read_metadata)?;
+        Self::for_build_with_metadata(
+            args,
+            shard,
+            cargo,
+            &features,
+            &metadata,
+            ExternalPathInputs::default(),
+            false,
+            configuration,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "workspace selection is one ordered metadata pass with explicit test seams"
+    )]
+    fn for_build_with_metadata(
+        args: &SelectArgs,
+        shard: Option<(u32, u32)>,
+        cargo: &CargoOptions,
+        features: &FeatureArgs,
+        metadata: &Metadata,
+        external_inputs: ExternalPathInputs,
+        cache_inputs: bool,
+        configuration: impl FnOnce(&Utf8Path, &CargoOptions, &HashMap<String, Vec<String>>) -> Cfgs,
+    ) -> Result<Self> {
+        let root = Utf8PathBuf::from(metadata.workspace_root.as_str());
+        let target = Utf8PathBuf::from(metadata.target_directory.as_str());
+        let ExternalPathInputs {
+            roots: external_roots,
+            has_build_scripts,
+            resource_dependencies: cached_resource_dependencies,
+        } = external_inputs;
+        let resource_dependencies = if cache_inputs {
+            cached_resource_dependencies
+        } else {
+            super::resource_dependencies::of(metadata)
+        };
+        let enabled = features::enabled(metadata, features);
         let mut files: Vec<TargetFile> = Vec::new();
         let mut seen: HashSet<Utf8PathBuf> = HashSet::default();
         let mut exclusion_files: Vec<TargetFile> = Vec::new();
@@ -331,14 +396,25 @@ impl Survey {
         let collecting_walked = checking_patterns || diff.is_some();
         let mut walked: Vec<Utf8PathBuf> = Vec::new();
 
-        if let Some(named) = unknown_packages(&metadata, args) {
+        if let Some(named) = unknown_packages(metadata, args) {
             return Err(error!("no package named `{named}` in this workspace").usage());
         }
 
-        let selected = selected_packages(&metadata, args);
+        let selected = selected_packages(metadata, args);
+        let mut resource_roots = metadata
+            .workspace_packages()
+            .into_iter()
+            .filter(|package| selected.contains(package.name.as_str()))
+            .flat_map(|package| package.targets.iter().map(|target| target.src_path.to_string()))
+            .collect::<HashSet<_>>();
+        super::resource_dependencies::extend_roots(&mut resource_roots, &resource_dependencies);
 
         for package in metadata.workspace_packages() {
             let mutating = selected.contains(package.name.as_str());
+            let resource_only = package
+                .targets
+                .iter()
+                .any(|target| resource_roots.contains(target.src_path.as_str()));
 
             if let Some(directory) = Utf8Path::new(package.manifest_path.as_str()).parent() {
                 let relative = directory
@@ -353,14 +429,16 @@ impl Survey {
             // whereas `--package` narrows a single run; validating them against the narrowed set
             // would reject a correct config on every run that happened to select another package.
             // #[gamma::skip(cond.always_false, reason = "removing this fast path only walks unselected targets whose files are still rejected by the mutating guard below")]
-            if !mutating && !checking_patterns && !checking_exclusions {
+            if !mutating && !checking_patterns && !checking_exclusions && !resource_only {
                 continue;
             }
 
             for target in &package.targets {
                 // Before the mutability filter, so that the tests which judge this workspace are
                 // indexed whether or not their own target is one this run would mutate.
-                if let Some(directory) = Utf8Path::new(target.src_path.as_str()).parent() {
+                if (mutating || checking_patterns || checking_exclusions)
+                    && let Some(directory) = Utf8Path::new(target.src_path.as_str()).parent()
+                {
                     let _added = source_dirs.insert(directory.to_owned());
                 }
 
@@ -373,7 +451,7 @@ impl Survey {
                 // The module tree is walked from here to find the files that exist only for tests,
                 // so a root is recorded whether or not it survives the filters below: a crate root
                 // excluded from mutation still says what the rest of the crate is.
-                if mutating {
+                if mutating || resource_only {
                     roots.entry(package.name.to_string()).or_default().push(source_root.to_owned());
                 }
 
@@ -395,20 +473,20 @@ impl Survey {
                     }
 
                     // #[gamma::skip(cond.always_true, reason = "collecting paths when neither patterns nor a diff consume them changes only discovery allocation")]
-                    if collecting_walked {
+                    if collecting_walked && (mutating || checking_patterns || checking_exclusions) {
                         walked.push(relative.clone());
                     }
 
-                    if !mutating {
-                        continue;
-                    }
-
                     // #[gamma::skip(cond.always_true, reason = "duplicate declaration parses contribute the same idempotent module edges and only add discovery work")]
-                    if declaration_seen.insert(absolute.clone()) {
+                    if (mutating || resource_only) && declaration_seen.insert(absolute.clone()) {
                         declaration_files
                             .entry(package.name.to_string())
                             .or_default()
                             .push(absolute.clone());
+                    }
+
+                    if !mutating {
+                        continue;
                     }
 
                     if !patterns.includes(&relative) {
@@ -435,7 +513,7 @@ impl Survey {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         normalize_file_lists(&mut declaration_files, &mut exclusion_files);
 
-        let cfgs = configuration(&root, cargo, &enabled);
+        let cfgs = configuration(&root, cargo, &enabled).feature_uncertainty(&features::uncertain_packages(metadata, &selected));
         validate_trait_exclusions(&args.exclude_trait_impls, &exclusion_files, &cfgs)?;
 
         // The diff names files; only the workspace can say which files those are. Resolving it
@@ -463,19 +541,17 @@ impl Survey {
             by_package.entry(file.package.clone()).or_default().push(position);
         }
 
-        let complete_defaults = args.files.is_empty() && args.exclude_files.is_empty() && args.in_diff.is_none();
-
         Ok(Self {
             root,
             target,
             files,
             declaration_files,
             by_package,
-            reach: reachable(&metadata),
+            reach: reachable(metadata),
             selected: sorted(selected),
-            tests: test_targets(&metadata),
-            library_tests: library_tests(&metadata),
-            compile_fail: compile_fail_targets(&metadata),
+            tests: test_targets(metadata),
+            library_tests: library_tests(metadata),
+            compile_fail: compile_fail_targets(metadata),
             roots,
             specs,
             cfgs,
@@ -484,10 +560,10 @@ impl Survey {
             only_mutants: None,
             settled: HashMap::default(),
             exclude_trait_impls: args.exclude_trait_impls.clone(),
-            complete_defaults,
             source_dirs: sorted(source_dirs),
-            external_inputs: external_inputs.roots,
-            untracked_build_script_inputs: external_inputs.has_build_scripts,
+            external_inputs: external_roots,
+            resource_dependencies,
+            untracked_build_script_inputs: has_build_scripts,
         })
     }
 
@@ -606,11 +682,21 @@ impl Survey {
     /// # Errors
     ///
     /// Returns an error if a file cannot be read or parsed.
+    pub fn scan(&self, package: Option<&str>, selection: &Selection, ordinals: &mut u32) -> Result<Scanned> {
+        self.scan_excluding(package, selection, ordinals, None)
+    }
+
     #[expect(
         clippy::too_many_lines,
-        reason = "scanning keeps selection, discovery, and stable ordinal assignment in one transaction"
+        reason = "package selection, evidence provenance, and stable mutation numbering form one scan"
     )]
-    pub fn scan(&self, package: Option<&str>, selection: &Selection, ordinals: &mut u32) -> Result<Scanned> {
+    pub(crate) fn scan_excluding(
+        &self,
+        package: Option<&str>,
+        selection: &Selection,
+        ordinals: &mut u32,
+        exclusions: Option<&super::CompilerExclusions>,
+    ) -> Result<Scanned> {
         let files: Vec<&TargetFile> = package.map_or_else(
             || self.files.iter().collect(),
             |wanted| {
@@ -621,46 +707,56 @@ impl Survey {
             },
         );
 
-        let roots: Vec<Utf8PathBuf> = package.map_or_else(
-            || self.roots.values().flatten().cloned().collect(),
-            |wanted| self.roots.get(wanted).cloned().unwrap_or_default(),
-        );
-        let declaration_files: Vec<(&Utf8Path, &CfgSet)> = package.map_or_else(
-            || {
-                self.declaration_files
-                    .iter()
-                    .flat_map(|(package, paths)| {
-                        let cfg = self.cfgs.for_package(package);
-
-                        paths.iter().map(move |path| (path.as_path(), cfg))
-                    })
-                    .collect()
-            },
-            |wanted| {
-                let cfg = self.cfgs.for_package(wanted);
-
-                self.declaration_files
-                    .get(wanted)
-                    .map(|paths| paths.iter().map(|path| (path.as_path(), cfg)).collect())
-                    .unwrap_or_default()
-            },
-        );
+        let mut resource_roots: HashSet<String> = self
+            .roots
+            .iter()
+            .filter(|(name, _)| package.is_none_or(|wanted| name.as_str() == wanted))
+            .flat_map(|(_, roots)| roots.iter().map(ToString::to_string))
+            .collect();
+        super::resource_dependencies::extend_roots(&mut resource_roots, &self.resource_dependencies);
+        let participating = |name: &str| {
+            package.is_none_or(|wanted| name == wanted)
+                || self
+                    .roots
+                    .get(name)
+                    .is_some_and(|roots| roots.iter().any(|root| resource_roots.contains(root.as_str())))
+        };
+        let roots: Vec<Utf8PathBuf> = self
+            .roots
+            .iter()
+            .filter(|(name, _)| participating(name))
+            .flat_map(|(_, roots)| roots.iter().cloned())
+            .collect();
+        let declaration_files: Vec<(&Utf8Path, &CfgSet, &str)> = self
+            .declaration_files
+            .iter()
+            .filter(|(name, _)| participating(name))
+            .flat_map(|(name, paths)| {
+                let cfg = self.cfgs.for_package(name);
+                paths.iter().map(move |path| (path.as_path(), cfg, name.as_str()))
+            })
+            .collect();
         let Scan {
             mut mutants,
             suppressed,
             idle,
             skipped,
-            digests,
+            mut digests,
             sources,
-        } = scan(
+            evidence_digests,
+        } = scan_with_dependencies(
             &files,
             &declaration_files,
             &roots,
             selection,
             &self.cfgs,
             &self.exclude_trait_impls,
-            self.complete_defaults,
+            &self.resource_dependencies,
         )?;
+        for (absolute, digest) in evidence_digests {
+            let relative = placed_under(&self.root, &absolute, "resource evidence")?;
+            let _previous = digests.insert(relative, digest);
+        }
 
         // Within a file the diff still has the last word: a changed line usually sits among many
         // that were not touched, and mutating those would report on code the change never went
@@ -668,8 +764,7 @@ impl Survey {
         // one it ends on, so editing an interior line of a multi-line site still selects it.
         if let Some(diff) = self.diff.as_ref() {
             mutants.retain(|mutant| {
-                let start = u32::try_from(mutant.line).unwrap_or(u32::MAX);
-                let end = u32::try_from(mutant.end_line).unwrap_or(u32::MAX);
+                let (start, end) = diff_extent(mutant.line, mutant.end_line);
 
                 diff.touches(&mutant.file, start, end)
             });
@@ -704,6 +799,10 @@ impl Survey {
                     settled_out = settled_out.saturating_add(1);
                 }
             }
+        }
+
+        if let Some(exclusions) = exclusions {
+            settled_out += exclusions.exclude(&mut mutants);
         }
 
         // Suppressed and already-settled mutants are kept but never run, so they take no part in
@@ -1005,25 +1104,83 @@ fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
 /// The barrier's party count is fixed at spawn, so *every* worker must reach both waits on every
 /// path, including the ones this code did not plan for. Failures are recorded and fall through;
 /// panics are caught, held, and resumed once both waits are behind them.
-fn scan(
+#[cfg(any(test, feature = "internals"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn scan(
     files: &[&TargetFile],
-    declaration_files: &[(&Utf8Path, &CfgSet)],
+    declaration_files: &[(&Utf8Path, &CfgSet, &str)],
     roots: &[Utf8PathBuf],
     selection: &Selection,
     cfgs: &Cfgs,
     exclude_trait_impls: &[String],
-    complete_defaults: bool,
 ) -> Result<Scan> {
+    scan_with_dependencies(files, declaration_files, roots, selection, cfgs, exclude_trait_impls, &[])
+}
+
+fn scan_with_dependencies(
+    files: &[&TargetFile],
+    declaration_files: &[(&Utf8Path, &CfgSet, &str)],
+    roots: &[Utf8PathBuf],
+    selection: &Selection,
+    cfgs: &Cfgs,
+    exclude_trait_impls: &[String],
+    resource_dependencies: &[super::resource_dependencies::Dependency],
+) -> Result<Scan> {
+    scan_with_declarations(
+        files,
+        declaration_files,
+        roots,
+        selection,
+        cfgs,
+        exclude_trait_impls,
+        resource_dependencies,
+        parse_declarations_parallel,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the declaration barrier shares complete mutation and resource evidence context"
+)]
+fn scan_with_declarations(
+    files: &[&TargetFile],
+    declaration_files: &[(&Utf8Path, &CfgSet, &str)],
+    roots: &[Utf8PathBuf],
+    selection: &Selection,
+    cfgs: &Cfgs,
+    exclude_trait_impls: &[String],
+    resource_dependencies: &[super::resource_dependencies::Dependency],
+    declarations: impl FnOnce(&[(&Utf8Path, &CfgSet, &str)]) -> Result<Declarations>,
+) -> Result<Scan> {
+    let selected: HashSet<&Utf8Path> = files.iter().map(|file| file.absolute.as_path()).collect();
+    let mut extra_decl_files: Vec<(&Utf8Path, &CfgSet, &str)> = declaration_files
+        .iter()
+        .copied()
+        .filter(|(path, _cfg, _package)| !selected.contains(path))
+        .collect();
+    extra_decl_files.sort_by(|left, right| left.0.cmp(right.0));
+    let Declarations {
+        declared: extra_declared,
+        skipped: declaration_skips,
+        defaults: extra_defaults,
+        incomplete_packages,
+        named: extra_named,
+        digests: evidence_digests,
+    } = declarations(&extra_decl_files)?;
+
     // #[gamma::skip(all, reason = "the worker count is a positive resource bound; changing it either preserves results while changing scheduling or violates that bound")]
     let workers = thread::available_parallelism().map_or(1, NonZero::get).min(files.len().max(1));
     let shared = Shared {
         next: AtomicUsize::new(0),
-        partials: Mutex::new(Vec::new()),
+        partials: Mutex::new(vec![extra_defaults]),
         skipped: Mutex::new(Vec::new()),
-        // #[gamma::skip(all, reason = "the barrier party count must exactly equal the number of spawned workers or discovery deadlocks")]
         barrier: Barrier::new(workers),
         defaults: OnceLock::new(),
-        complete_defaults,
+        incomplete_packages: &incomplete_packages,
+        named: Mutex::new(extra_named),
+        roots,
+        resource_dependencies,
     };
 
     let mut collected: Vec<(usize, Parsed)> = thread::scope(|scope| {
@@ -1050,9 +1207,7 @@ fn scan(
                 // first is a race. The earliest in file order is reported so the message does not
                 // change between runs.
                 Err((at, error)) => {
-                    if failure.as_ref().is_none_or(|(seen, _)| at < *seen) {
-                        failure = Some((at, error));
-                    }
+                    retain_first_failure(&mut failure, at, error);
                 }
             }
         }
@@ -1069,36 +1224,32 @@ fn scan(
     // production population, whatever it looks like from the inside, and its mutants are dropped
     // rather than reported. A mutated assertion is a broken test, not a gap in one, and inactive
     // code is not built for any test to catch.
-    let mut declared: Vec<(Utf8PathBuf, Vec<modules::Declaration>)> = collected
+    let declared: Vec<(Utf8PathBuf, Vec<modules::Declaration>)> = collected
         .iter()
         .map(|(index, parsed)| {
             let path = files.get(*index).map_or_else(Utf8PathBuf::new, |file| file.absolute.clone());
 
             (path, parsed.declared.clone())
         })
+        .chain(extra_declared)
         .collect();
-    let selected: HashSet<&Utf8Path> = files.iter().map(|file| file.absolute.as_path()).collect();
 
-    let extra_decl_files: Vec<(&Utf8Path, &CfgSet)> = declaration_files
+    // Dependency roots supply proof evidence, not population membership. Only mutation
+    // packages may make reachable source live during module-exclusion analysis.
+    let mutation_packages: HashSet<&str> = files.iter().map(|file| file.package.as_str()).collect();
+    let population_roots = roots
         .iter()
-        .filter(|&&(path, _cfg)| !selected.contains(path))
-        .map(|&(path, cfg)| (path, cfg))
-        .collect();
-
-    // #[gamma::skip(cond.always_false, reason = "parsing an empty declaration slice returns the same two empty vectors and only adds call overhead")]
-    let declaration_skips: Vec<(Utf8PathBuf, String)> = if extra_decl_files.is_empty() {
-        Vec::new()
-    } else {
-        let Declarations {
-            declared: extra_declared,
-            skipped: extra_skipped,
-        } = parse_declarations_parallel(&extra_decl_files)?;
-
-        declared.extend(extra_declared);
-        extra_skipped
-    };
-
-    let excluded = modules::excluded_files(roots, &declared);
+        .filter(|root| {
+            files
+                .iter()
+                .any(|file| modules::identity(&file.absolute) == modules::identity(root))
+                || declaration_files
+                    .iter()
+                    .any(|(path, _cfg, package)| modules::identity(path) == modules::identity(root) && mutation_packages.contains(package))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let excluded = modules::excluded_files(&population_roots, &declared);
     let total = collected.iter().map(|(_index, parsed)| parsed.mutants.len()).sum();
     let mut mutants = Vec::with_capacity(total);
     let mut digests: HashMap<Utf8PathBuf, String> = HashMap::default();
@@ -1107,7 +1258,10 @@ fn scan(
     let mut idle = Vec::new();
 
     for (index, parsed) in collected {
-        if files.get(index).is_some_and(|file| excluded.contains(&file.absolute)) {
+        if files
+            .get(index)
+            .is_some_and(|file| excluded.contains(&modules::identity(&file.absolute)))
+        {
             continue;
         }
 
@@ -1146,29 +1300,58 @@ fn scan(
         skipped: unanalyzable.into_iter().map(|(_path, message)| message).collect(),
         digests,
         sources,
+        evidence_digests,
     })
+}
+
+fn retain_first_failure(failure: &mut Option<(usize, Error)>, at: usize, error: Error) {
+    if failure.as_ref().is_none_or(|(seen, _)| at < *seen) {
+        *failure = Some((at, error));
+    }
+}
+
+fn diff_extent(line: usize, end_line: usize) -> (u32, u32) {
+    let start = u32::try_from(line).unwrap_or(u32::MAX);
+    let end = u32::try_from(end_line).unwrap_or(u32::MAX);
+    (start, end)
+}
+
+const fn next_discovery_index(index: u32) -> u32 {
+    index + 1
 }
 
 type DeclarationParse = (usize, Result<DeclarationOutcome>);
 
 /// What parsing one declaration-only file yielded: its declarations, or the reason it was skipped.
-enum DeclarationOutcome {
+#[derive(Debug)]
+pub enum DeclarationOutcome {
     /// The file parsed, and declares these modules.
-    Declared(Utf8PathBuf, Vec<modules::Declaration>),
+    Declared(
+        Utf8PathBuf,
+        Vec<modules::Declaration>,
+        Box<collect::Defaults>,
+        Vec<module_identities::Edge>,
+        String,
+    ),
 
     /// The file could not be analyzed, and this diagnostic names it and says why.
     Skipped(Utf8PathBuf, String),
 }
 
 /// Declarations gathered from files outside the selection, with the ones that could not be read.
-struct Declarations {
+#[derive(Debug)]
+pub struct Declarations {
+    pub digests: HashMap<Utf8PathBuf, String>,
+    named: Vec<(Utf8PathBuf, Vec<module_identities::Edge>)>,
     declared: Vec<(Utf8PathBuf, Vec<modules::Declaration>)>,
     skipped: Vec<(Utf8PathBuf, String)>,
+    defaults: HashMap<String, collect::Defaults>,
+    incomplete_packages: HashSet<String>,
 }
 
 /// Parses declaration-only files with bounded parallelism.
 ///
-/// Each file is read and parsed solely to extract module declarations — no mutation is performed.
+/// Each file supplies module declarations and package `Default` evidence, but no mutants.
 /// The parallelism is bounded by `available_parallelism` to avoid exceeding system thread limits.
 /// Results are returned in filesystem-path order.
 ///
@@ -1183,21 +1366,40 @@ struct Declarations {
 /// # Errors
 ///
 /// Returns the first non-skippable file-read or parse error encountered, in path order.
-fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declarations> {
+fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet, &str)]) -> Result<Declarations> {
+    parse_declarations_with_parallelism(files, thread::available_parallelism)
+}
+
+fn parse_declarations_with_parallelism(
+    files: &[(&Utf8Path, &CfgSet, &str)],
+    parallelism: impl FnOnce() -> std::io::Result<NonZero<usize>>,
+) -> Result<Declarations> {
+    parse_declarations_with_parser(files, parallelism, parse_declarations_of)
+}
+
+pub fn parse_declarations_with_parser(
+    files: &[(&Utf8Path, &CfgSet, &str)],
+    parallelism: impl FnOnce() -> std::io::Result<NonZero<usize>>,
+    parse: impl Fn(&Utf8Path, &CfgSet) -> Result<DeclarationOutcome> + Sync,
+) -> Result<Declarations> {
     if files.is_empty() {
         return Ok(Declarations {
+            digests: HashMap::default(),
+            named: Vec::new(),
             declared: Vec::new(),
             skipped: Vec::new(),
+            defaults: HashMap::default(),
+            incomplete_packages: HashSet::default(),
         });
     }
 
-    let workers = thread::available_parallelism().map_or(1, NonZero::get).min(files.len());
+    let workers = parallelism().map_or(1, NonZero::get).min(files.len());
 
     let mut results: Vec<DeclarationParse> = if workers <= 1 {
         let mut results = Vec::with_capacity(files.len());
 
-        for (index, &(path, cfg)) in files.iter().enumerate() {
-            results.push((index, parse_declarations_of(path, cfg)));
+        for (index, &(path, cfg, _package)) in files.iter().enumerate() {
+            results.push((index, parse(path, cfg)));
         }
 
         results
@@ -1208,17 +1410,20 @@ fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declara
             let handles: Vec<_> = (0..workers)
                 .map(|_worker| {
                     let next = &next;
+                    let parse = &parse;
 
                     scope.spawn(move || {
                         let mut mine = Vec::new();
 
                         loop {
+                            // #[gamma::skip(literal.int_decrement, tag = "outofmemory", reason = "a zero atomic increment repeatedly parses and accumulates the same file")]
                             let index = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(path, cfg)) = files.get(index) else {
+                            let Some(&(path, cfg, _package)) = files.get(index) else {
+                                // #[gamma::skip(loop.break_to_continue, tag = "timeout", reason = "workers must exit after exhausting the finite file list")]
                                 break;
                             };
 
-                            mine.push((index, parse_declarations_of(path, cfg)));
+                            mine.push((index, parse(path, cfg)));
                         }
 
                         mine
@@ -1240,14 +1445,27 @@ fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declara
 
     // Check for errors after restoring input order, so scheduling cannot choose the diagnostic.
     let mut gathered = Declarations {
+        digests: HashMap::default(),
+        named: Vec::new(),
         declared: Vec::with_capacity(results.len()),
         skipped: Vec::new(),
+        defaults: HashMap::default(),
+        incomplete_packages: HashSet::default(),
     };
 
-    for (_index, result) in results {
+    for (index, result) in results {
+        let (_, _, package) = files[index];
         match result? {
-            DeclarationOutcome::Declared(path, declarations) => gathered.declared.push((path, declarations)),
-            DeclarationOutcome::Skipped(path, message) => gathered.skipped.push((path, message)),
+            DeclarationOutcome::Declared(path, declarations, defaults, named, digest) => {
+                let _previous = gathered.digests.insert(path.clone(), digest);
+                gathered.named.push((path.clone(), named));
+                gathered.declared.push((path, declarations));
+                gathered.defaults.entry(package.to_owned()).or_default().absorb(*defaults);
+            }
+            DeclarationOutcome::Skipped(path, message) => {
+                gathered.skipped.push((path, message));
+                let _inserted = gathered.incomplete_packages.insert(package.to_owned());
+            }
         }
     }
 
@@ -1259,11 +1477,14 @@ fn parse_declarations_parallel(files: &[(&Utf8Path, &CfgSet)]) -> Result<Declara
 }
 
 /// Reads one declaration-only file, turning a skippable failure into a named skip.
-fn parse_declarations_of(path: &Utf8Path, cfg: &CfgSet) -> Result<DeclarationOutcome> {
+pub fn parse_declarations_of(path: &Utf8Path, cfg: &CfgSet) -> Result<DeclarationOutcome> {
     match SourceFile::read(path) {
         Ok(source) => Ok(DeclarationOutcome::Declared(
             path.to_owned(),
             modules::declarations(path, source.ast(), cfg),
+            Box::new(collect::Defaults::of_source_in(source.ast(), cfg, path.as_str())),
+            module_identities::declarations(path, source.ast(), cfg)?,
+            crate::discover::digest(retained_source(&source).as_bytes()),
         )),
 
         Err(error) if error.is_skippable() => Ok(DeclarationOutcome::Skipped(path.to_owned(), error.to_string())),
@@ -1273,18 +1494,23 @@ fn parse_declarations_of(path: &Utf8Path, cfg: &CfgSet) -> Result<DeclarationOut
 }
 
 /// What parsing and mutating a set of files produced.
-struct Scan {
-    mutants: Vec<Mutant>,
+#[derive(Debug)]
+pub struct Scan {
+    pub evidence_digests: HashMap<Utf8PathBuf, String>,
+    pub mutants: Vec<Mutant>,
     suppressed: usize,
     idle: Vec<suppress::Idle>,
-    skipped: Vec<String>,
-    digests: HashMap<Utf8PathBuf, String>,
-    sources: HashMap<Utf8PathBuf, String>,
+    pub skipped: Vec<String>,
+    pub digests: HashMap<Utf8PathBuf, String>,
+    pub sources: HashMap<Utf8PathBuf, String>,
 }
 
 /// Everything the workers of one scan share, so that adding a channel does not widen every
 /// signature between here and the loop that uses it.
-struct Shared {
+struct Shared<'a> {
+    resource_dependencies: &'a [super::resource_dependencies::Dependency],
+    named: Mutex<Vec<(Utf8PathBuf, Vec<module_identities::Edge>)>>,
+    roots: &'a [Utf8PathBuf],
     /// The next file index to claim, so work is taken one file at a time rather than in blocks.
     next: AtomicUsize,
 
@@ -1300,7 +1526,46 @@ struct Shared {
 
     /// The merged package indexes, set once by the leader and read by all of them.
     defaults: OnceLock<HashMap<String, collect::Defaults>>,
-    complete_defaults: bool,
+
+    /// Packages with an unanalyzable declaration-only file cannot supply negative evidence.
+    incomplete_packages: &'a HashSet<String>,
+}
+
+impl Shared<'_> {
+    fn merged_defaults(&self, files: &[&TargetFile]) -> HashMap<String, collect::Defaults> {
+        let mut merged: HashMap<String, collect::Defaults> = HashMap::default();
+        for partial in self.partials.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+            for (package, index) in partial {
+                merged.entry(package).or_default().absorb(index);
+            }
+        }
+        for (at, _message) in self.skipped.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            if let Some(index) = files.get(*at).and_then(|file| merged.get_mut(&file.package)) {
+                index.mark_incomplete();
+            }
+        }
+        for package in self.incomplete_packages {
+            if let Some(index) = merged.get_mut(package) {
+                index.mark_incomplete();
+            }
+        }
+        let layouts = module_identities::layouts(self.roots, &self.named.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut resources = collect::Defaults::default();
+        for index in merged.values() {
+            resources.extend_resource_evidence(index);
+        }
+        for index in merged.values_mut() {
+            index.extend_resource_evidence(&resources);
+            index.bind_sources(&layouts);
+            index.bind_resource_dependencies(self.resource_dependencies);
+        }
+        for file in files {
+            if let Some(index) = merged.get_mut(&file.package) {
+                index.alias_source(file.absolute.as_str(), file.path.as_str());
+            }
+        }
+        merged
+    }
 }
 
 /// What one file yielded when it was parsed.
@@ -1315,7 +1580,7 @@ struct Shared {
 // #[gamma::skip(all, reason = "parallel discovery aggregation is covered by deterministic single- and multi-worker plan equality; deleting an individual merge changes only resource scheduling under the mutation harness")]
 fn work(
     files: &[&TargetFile],
-    shared: &Shared,
+    shared: &Shared<'_>,
     selection: &Selection,
     cfgs: &Cfgs,
     exclude_trait_impls: &[String],
@@ -1326,7 +1591,8 @@ fn work(
         skipped,
         barrier,
         defaults,
-        complete_defaults,
+        named,
+        ..
     } = shared;
 
     let mut mine: Vec<(usize, SourceFile)> = Vec::new();
@@ -1355,11 +1621,19 @@ fn work(
                     // Report paths relative to the workspace root; that is what a user can act on
                     // and what a suppression or an expectation is keyed by.
                     source.set_path(file.path.clone());
-                    let defaults = if *complete_defaults {
-                        collect::Defaults::of_in(source.ast(), cfgs.for_package(&file.package))
-                    } else {
-                        collect::Defaults::optimistic_of_in(source.ast(), cfgs.for_package(&file.package))
+                    let cfg = cfgs.for_package(&file.package);
+                    let defaults = collect::Defaults::of_source_in(source.ast(), cfg, file.absolute.as_str());
+                    let declarations = match module_identities::declarations(&file.absolute, source.ast(), cfg) {
+                        Ok(declarations) => declarations,
+                        Err(error) => {
+                            failure = Some((at, error));
+                            break;
+                        }
                     };
+                    named
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push((file.absolute.clone(), declarations));
                     indexes.entry(file.package.clone()).or_default().absorb(defaults);
                     mine.push((at, source));
                 }
@@ -1391,21 +1665,7 @@ fn work(
     // #[gamma::skip(cond.always_true, reason = "if every released worker enters, the mutex drain still lets exactly one consume all partials and OnceLock still accepts exactly one merged value")]
     let merged = if barrier.wait().is_leader() {
         catch_unwind(AssertUnwindSafe(|| {
-            let mut merged: HashMap<String, collect::Defaults> = HashMap::default();
-
-            for partial in partials.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
-                for (package, index) in partial {
-                    merged.entry(package).or_default().absorb(index);
-                }
-            }
-
-            for (at, _message) in skipped.lock().unwrap_or_else(PoisonError::into_inner).iter() {
-                if let Some(index) = files.get(*at).and_then(|file| merged.get_mut(&file.package)) {
-                    index.mark_incomplete();
-                }
-            }
-
-            let _first = defaults.set(merged);
+            let _first = defaults.set(shared.merged_defaults(files));
         }))
         .err()
     } else {
@@ -1497,8 +1757,8 @@ fn sorted<T: Ord + core::hash::Hash>(values: HashSet<T>) -> Vec<T> {
 /// cost time, never correctness — the reverse would silently skip a test that really does reach the
 /// mutated code and turn a survivor into a false clean bill of health.
 ///
-/// The metadata is loaded with `--no-deps`, so a dependency that is not itself a workspace member
-/// has no entry to walk into. A registry dependency cannot lead back into the workspace and can be
+/// This graph remains workspace-only, including when metadata contains external packages.
+/// A registry dependency cannot lead back into the workspace and can be
 /// ignored, but a *path* dependency outside the workspace can: `app -> facade -> core` is a real
 /// chain that this graph cannot see. Rather than skip a test binary that does reach the mutated
 /// code, a package with such a dependency reaches everything — and so does every package that can
@@ -1658,7 +1918,7 @@ fn strongly_connected_components(edges: &[Vec<usize>]) -> Vec<usize> {
                 } else {
                     index_of[neighbor] = Some(next_index);
                     low_link[neighbor] = next_index;
-                    next_index += 1;
+                    next_index = next_discovery_index(next_index);
                     stack.push(neighbor);
                     on_stack[neighbor] = true;
                     call_stack.push(Frame {
@@ -1822,16 +2082,47 @@ fn placed_under(root: &Utf8Path, absolute: &Utf8Path, package: &str) -> Result<U
 /// The feature selection has to match the one the build will use. Metadata decides which targets
 /// exist and which files are walked, so discovering under one feature set and compiling under
 /// another would place guards in files the compiler never sees.
-// #[gamma::skip(stmt.delete_call, reason = "Cargo metadata feature forwarding is exercised by integration fixtures; the command depends on an external Cargo process")]
+///
+/// Metadata and cfg/host queries are trusted, unbounded discovery setup. They do not use campaign
+/// process-tree ownership, build deadlines, or cooperative cancellation.
 pub fn load_metadata(dir: &Utf8Path, features: &FeatureArgs) -> Result<Metadata> {
+    load_metadata_using(dir, features, MetadataCommand::exec)
+}
+
+fn load_metadata_using(
+    dir: &Utf8Path,
+    features: &FeatureArgs,
+    read: impl FnOnce(&MetadataCommand) -> std::result::Result<Metadata, cargo_metadata::Error>,
+) -> Result<Metadata> {
     let mut command = MetadataCommand::new();
 
     let _builder = command.current_dir(dir).no_deps();
     apply_metadata_features(&mut command, features);
 
-    command
-        .exec()
-        .map_err(|cause| error!("could not read cargo metadata for `{dir}`").caused_by(cause))
+    read(&command).map_err(|cause| error!("could not read cargo metadata for `{dir}`").caused_by(cause))
+}
+
+fn load_survey_metadata_using(
+    dir: &Utf8Path,
+    features: &FeatureArgs,
+    cache_inputs: bool,
+    read: impl FnOnce(&MetadataCommand) -> std::result::Result<Metadata, cargo_metadata::Error>,
+) -> Result<Metadata> {
+    if cache_inputs {
+        return load_metadata_using(dir, features, read);
+    }
+
+    let mut command = MetadataCommand::new();
+    let _builder = command.current_dir(dir).other_options(vec!["--offline".to_owned()]);
+    apply_metadata_features(&mut command, features);
+
+    read(&command).map_err(|cause| {
+        error!(
+            "could not resolve resource dependencies for `{dir}` using offline Cargo metadata; \
+             run `cargo metadata` and `cargo fetch` in that workspace, then retry"
+        )
+        .caused_by(cause)
+    })
 }
 
 /// The local filesystem inputs Cargo's dependency graph exposes.
@@ -1839,6 +2130,7 @@ pub fn load_metadata(dir: &Utf8Path, features: &FeatureArgs) -> Result<Metadata>
 struct ExternalPathInputs {
     roots: Vec<Utf8PathBuf>,
     has_build_scripts: bool,
+    resource_dependencies: Vec<super::resource_dependencies::Dependency>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1890,8 +2182,8 @@ fn apply_metadata_features(command: &mut MetadataCommand, features: &FeatureArgs
 
 /// Finds local packages Cargo resolves outside the workspace root.
 ///
-/// The ordinary metadata pass intentionally uses `--no-deps`, because discovery only needs
-/// workspace targets. Cache provenance needs the opposite answer as well: a path dependency's
+/// Cache-enabled discovery first loads workspace targets with `--no-deps`. Its provenance pass
+/// also resolves the complete dependency graph: a path dependency's
 /// source is a filesystem input even though it is not a workspace target and can change without a
 /// workspace file moving. Registry and git packages are identified by their locked source and are
 /// covered by the lockfile; only local packages have no source identifier to carry that change.
@@ -1906,6 +2198,7 @@ fn external_path_inputs(dir: &Utf8Path, features: &FeatureArgs, root: &Utf8Path)
     let metadata = command
         .exec()
         .map_err(|cause| error!("could not read the external Cargo inputs for `{dir}`").caused_by(cause))?;
+    let resource_dependencies = super::resource_dependencies::of(&metadata);
     let workspace = crate::paths::physical(root)?;
     let mut roots = Vec::new();
     let mut has_build_scripts = false;
@@ -1933,7 +2226,11 @@ fn external_path_inputs(dir: &Utf8Path, features: &FeatureArgs, root: &Utf8Path)
     roots.sort();
     roots.dedup();
 
-    Ok(ExternalPathInputs { roots, has_build_scripts })
+    Ok(ExternalPathInputs {
+        roots,
+        has_build_scripts,
+        resource_dependencies,
+    })
 }
 
 /// Names the packages a run mutates, following cargo's own selection rules.
@@ -2254,6 +2551,10 @@ fn walk_rust_files(directory: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt as _;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStringExt as _;
 
     use tempfile::TempDir;
 
@@ -2265,6 +2566,510 @@ mod tests {
     /// Injected by name rather than by an armed flag so that nothing has to be disarmed and no
     /// other test running at the same time can trip it.
     const PANIC_PROBE: &str = "gamma_panic_probe.rs";
+
+    #[test]
+    fn survivor_every_item_kind_retains_the_attributes_that_disable_its_configuration() {
+        let cfg = CfgSet::parse("");
+        assert!(cfg.holds_for(&[]));
+        for declaration in [
+            "const C: i32 = 1;",
+            "enum E { A }",
+            "extern crate core;",
+            "fn f() {}",
+            "unsafe extern \"C\" { fn f(); }",
+            "impl S {}",
+            "make!();",
+            "mod m {}",
+            "static S: i32 = 1;",
+            "struct S;",
+            "trait T {}",
+            "trait T = Send;",
+            "type T = i32;",
+            "union U { x: i32 }",
+            "use core::fmt;",
+        ] {
+            let item: syn::Item = syn::parse_str(&format!("#[cfg(any())] {declaration}")).unwrap();
+            let attributes = item_attributes(&item);
+            assert_eq!(attributes.len(), 1, "{declaration}");
+            assert!(!cfg.holds_for(attributes), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn survivor_diff_extents_preserve_the_last_line_and_saturate_both_endpoints_without_allocating_source() {
+        let maximum = usize::try_from(u32::MAX).expect("supported targets have at least 32-bit usize");
+        let file = Utf8Path::new("src/lib.rs");
+        let changed = |line: u32| Diff::parse(&format!("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +{line},1 @@\n+changed\n"));
+        let last = changed(u32::MAX);
+        let previous = changed(u32::MAX - 1);
+        for (line, end_line, touches_previous, touches_last) in [
+            (maximum - 1, maximum - 1, true, false),
+            (maximum, maximum, false, true),
+            (maximum - 1, maximum, true, true),
+        ] {
+            let (start, end) = diff_extent(line, end_line);
+            assert_eq!(previous.touches(file, start, end), touches_previous);
+            assert_eq!(last.touches(file, start, end), touches_last);
+        }
+        if let Some(beyond) = maximum.checked_add(1) {
+            let (start, end) = diff_extent(beyond, beyond);
+            assert!(
+                !previous.touches(file, start, end),
+                "a saturated start must not admit the previous changed line"
+            );
+            assert!(
+                last.touches(file, start, end),
+                "a saturated end must still admit the final representable changed line"
+            );
+            let (start, end) = diff_extent(maximum - 1, beyond);
+            assert!(previous.touches(file, start, end));
+            assert!(
+                last.touches(file, start, end),
+                "an overflowing end must not shrink an otherwise valid extent"
+            );
+        }
+    }
+
+    #[test]
+    fn survivor_child_discovery_index_can_reach_the_u32_boundary_without_premature_overflow() {
+        let edges = [vec![1], vec![2], vec![1, 3], vec![]];
+        assert_eq!(strongly_connected_components(&edges), [2, 1, 1, 0]);
+        for (current, expected) in [(u32::MAX - 1, u32::MAX), (u32::MAX - 2, u32::MAX - 1)] {
+            assert_eq!(next_discovery_index(current), expected);
+        }
+    }
+
+    #[test]
+    fn survivor_declaration_batches_retain_every_path_sort_results_and_propagate_read_errors() {
+        let directory = crate::testing::workdir("declaration-survivors-");
+        let root = Utf8Path::from_path(directory.path()).unwrap();
+        let a = root.join("a.rs");
+        let z = root.join("z.rs");
+        fs::write(&a, "mod first;").unwrap();
+        fs::write(&z, "mod last;").unwrap();
+        let cfg = CfgSet::default();
+        let empty = parse_declarations_parallel(&[]).unwrap();
+        assert!(empty.declared.is_empty());
+        assert!(empty.defaults.is_empty());
+        for files in [
+            vec![(a.as_path(), &cfg, "a")],
+            vec![(z.as_path(), &cfg, "z"), (a.as_path(), &cfg, "a")],
+        ] {
+            let result = parse_declarations_parallel(&files).unwrap();
+            let expected = if files.len() == 1 {
+                vec![a.as_path()]
+            } else {
+                vec![a.as_path(), z.as_path()]
+            };
+            assert_eq!(result.declared.iter().map(|(path, _)| path.as_path()).collect::<Vec<_>>(), expected);
+            assert_eq!(result.defaults.len(), files.len());
+            assert!(result.skipped.is_empty());
+        }
+        let missing = root.join("missing.rs");
+        let result = parse_declarations_parallel(&[(a.as_path(), &cfg, "a"), (missing.as_path(), &cfg, "a")]);
+        let Err(failure) = result else {
+            panic!("missing declaration source must fail");
+        };
+        assert!(failure.to_string().contains("missing.rs"));
+        let result = parse_declarations_of(&missing, &cfg);
+        assert_eq!(result.unwrap_err().to_string(), failure.to_string());
+    }
+
+    #[test]
+    fn survivor_multiple_include_patterns_are_alternatives_not_requirements() {
+        let args = SelectArgs {
+            files: vec!["src/one.rs".to_owned(), "src/two.rs".to_owned()],
+            ..SelectArgs::default()
+        };
+        assert!(is_included(Utf8Path::new("src/one.rs"), &args));
+        assert!(is_included(Utf8Path::new("src/two.rs"), &args));
+        assert!(!is_included(Utf8Path::new("src/three.rs"), &args));
+    }
+
+    #[test]
+    fn survivor_declaration_parser_keeps_single_file_or_single_cpu_work_on_the_calling_thread() {
+        let root = Utf8Path::new("synthetic/declarations");
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        let cfg = CfgSet::default();
+        let files = [(first.as_path(), &cfg, "first"), (second.as_path(), &cfg, "second")];
+        let caller = thread::current().id();
+        for (count, available) in [(1, 4), (2, 1)] {
+            let observed = std::sync::Mutex::new(Vec::new());
+            let parsed = parse_declarations_with_parser(
+                &files[..count],
+                || Ok(NonZero::new(available).expect("the fixture supplies a positive CPU count")),
+                |path, _configuration| {
+                    observed
+                        .lock()
+                        .expect("no observer can panic while holding this lock")
+                        .push((path.to_owned(), thread::current().id()));
+                    Ok(DeclarationOutcome::Declared(
+                        path.to_owned(),
+                        Vec::new(),
+                        Box::default(),
+                        Vec::new(),
+                        String::new(),
+                    ))
+                },
+            )
+            .expect("the controlled parser returns declarations under the selected worker budget");
+            assert_eq!(parsed.declared.len(), count);
+            assert_eq!(
+                parsed.declared.iter().map(|(path, _)| path.as_path()).collect::<Vec<_>>(),
+                files[..count].iter().map(|(path, _, _)| *path).collect::<Vec<_>>()
+            );
+            assert!(parsed.skipped.is_empty());
+            let observed = observed.into_inner().expect("the observer never panics under its lock");
+            assert_eq!(observed.len(), count);
+            assert!(
+                observed.iter().all(|(_, worker)| *worker == caller),
+                "one file or one available CPU must not create unnecessary native worker threads: {observed:?}"
+            );
+            assert_eq!(
+                observed.iter().map(|(path, _)| path.as_path()).collect::<Vec<_>>(),
+                files[..count].iter().map(|(path, _, _)| *path).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn survivor_parallel_declarations_claim_the_first_file_and_retain_real_read_failures() {
+        let directory = crate::testing::workdir("parallel-declarations-");
+        let root = Utf8Path::from_path(directory.path()).expect("fixture paths are UTF-8");
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        fs::write(&first, "mod first_child;").expect("fixture is writable");
+        fs::write(&second, "mod second_child;").expect("fixture is writable");
+        let cfg = CfgSet::default();
+        let files = [(first.as_path(), &cfg, "first"), (second.as_path(), &cfg, "second")];
+        for available in [None, Some(1), Some(2), Some(4)] {
+            let parsed = parse_declarations_with_parallelism(&files, || {
+                available
+                    .and_then(NonZero::new)
+                    .ok_or_else(|| std::io::Error::other("parallelism unavailable"))
+            })
+            .expect("both actual source files parse");
+            assert_eq!(parsed.declared.iter().map(|(path, _)| path).collect::<Vec<_>>(), [&first, &second]);
+            assert!(parsed.defaults.contains_key("first"));
+            assert!(parsed.defaults.contains_key("second"));
+        }
+        fs::remove_file(&first).expect("the first source exists");
+        let result = parse_declarations_with_parallelism(&files, || Ok(NonZero::new(2).expect("two is nonzero")));
+        let Err(failure) = result else {
+            panic!("a missing first file must not silently disappear from the parallel scan");
+        };
+        assert!(failure.to_string().contains("first.rs"), "{failure}");
+    }
+
+    #[test]
+    fn survivor_scan_supplies_only_sorted_unselected_declarations_and_propagates_their_read_error() {
+        let directory = crate::testing::workdir("scan-extra-declarations-");
+        let root = Utf8Path::from_path(directory.path()).expect("fixture paths are UTF-8");
+        let selected = root.join("selected.rs");
+        let a = root.join("a.rs");
+        let z = root.join("z.rs");
+        fs::write(&selected, "pub fn value() -> i32 { 1 }").expect("fixture is writable");
+        fs::write(&a, "mod a_child;").expect("fixture is writable");
+        fs::write(&z, "mod z_child;").expect("fixture is writable");
+        let cfg = CfgSet::default();
+        let declarations = [(z.as_path(), &cfg, "p"), (selected.as_path(), &cfg, "p"), (a.as_path(), &cfg, "p")];
+        let target = TargetFile {
+            path: "selected.rs".into(),
+            absolute: selected.clone(),
+            package: "p".to_owned(),
+            source: None,
+        };
+        let selection = Selection::parse("literal.int_decrement").expect("a registered mutator");
+        let scanned = scan_with_declarations(
+            &[&target],
+            &declarations,
+            &[],
+            &selection,
+            &Cfgs::unconditional(),
+            &[],
+            &[],
+            |extras| {
+                assert_eq!(
+                    extras.iter().map(|(path, _, _)| *path).collect::<Vec<_>>(),
+                    [a.as_path(), z.as_path()]
+                );
+                parse_declarations_parallel(extras)
+            },
+        )
+        .expect("selected and unselected source files parse");
+        assert!(!scanned.mutants.is_empty());
+        fs::remove_file(&a).expect("the first extra source exists");
+        let result = scan(&[&target], &declarations, &[], &selection, &Cfgs::unconditional(), &[]);
+        let Err(failure) = result else {
+            panic!("an unreadable declaration file must fail the selected-file scan");
+        };
+        assert!(failure.to_string().contains("a.rs"), "{failure}");
+    }
+
+    #[test]
+    fn survivor_worker_error_selection_uses_input_order_even_when_completion_order_is_reversed() {
+        for order in [[2, 0, 1], [0, 2, 1], [1, 2, 0]] {
+            let mut failure = None;
+            for at in order {
+                retain_first_failure(&mut failure, at, error!("scripted parser failure {at}"));
+            }
+            let (at, failure) = failure.expect("three controlled errors were provided");
+            assert_eq!(at, 0);
+            assert_eq!(failure.message(), "scripted parser failure 0");
+        }
+    }
+
+    #[test]
+    fn survivor_trait_exclusions_skip_only_supported_parse_limits_and_ignore_inactive_implementations() {
+        let directory = crate::testing::workdir("trait-exclusion-errors-");
+        let root = Utf8Path::from_path(directory.path()).expect("fixture paths are UTF-8");
+        let source = root.join("source.rs");
+        let missing = root.join("missing.rs");
+        let target = |absolute: Utf8PathBuf| TargetFile {
+            path: absolute.file_name().expect("a fixture filename").into(),
+            absolute,
+            package: "p".to_owned(),
+            source: None,
+        };
+        let packages = std::iter::once(("p".to_owned(), Vec::<String>::new())).collect();
+        let cfgs = Cfgs::new(&CfgSet::parse(""), &packages);
+        let excluded = ["Visible".to_owned()];
+        fs::write(&source, "struct S; impl Visible for S {}").expect("fixture is writable");
+        validate_trait_exclusions(&excluded, &[target(source.clone())], &cfgs).expect("a real implementation is recognized");
+        let failure = validate_trait_exclusions(&excluded, &[target(missing.clone())], &cfgs)
+            .expect_err("ordinary read failures must not be treated as a parser limitation");
+        assert!(failure.to_string().contains("missing.rs"), "{failure}");
+        let deep = format!("fn deep() -> i32 {{ {}1{} }}", "(".repeat(512), ")".repeat(512));
+        fs::write(&source, &deep).expect("fixture is writable");
+        let failure = validate_trait_exclusions(&excluded, &[target(source.clone())], &cfgs)
+            .expect_err("a skipped file supplies no trait implementation evidence");
+        assert!(failure.to_string().contains("exclude-trait-impl"), "{failure}");
+        assert!(!failure.to_string().contains("nests deeper"), "{failure}");
+        fs::write(&source, "#[cfg(any())] impl Visible for S {}").expect("fixture is writable");
+        validate_trait_exclusions(&excluded, &[target(source.clone())], &cfgs)
+            .expect_err("an inactive implementation does not validate a requested exclusion");
+        fs::write(&source, "impl Visible for S {}").expect("fixture is writable");
+        validate_trait_exclusions(&excluded, &[target(source), target(missing)], &cfgs)
+            .expect("once all exclusions are proven, unrelated unreadable files are not scanned");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn survivor_native_non_utf8_source_names_are_errors_but_non_source_names_are_ignored() {
+        let directory = crate::testing::workdir("native-source-name-");
+        let root = Utf8Path::from_path(directory.path()).expect("fixture roots are UTF-8");
+        fs::write(root.join("valid.rs"), "fn valid() {}").expect("fixture is writable");
+        #[cfg(windows)]
+        let odd = std::ffi::OsString::from_wide(&[0xd800, 46, 114, 115]);
+        #[cfg(unix)]
+        let odd = std::ffi::OsString::from_vec(vec![0xff, b'.', b'r', b's']);
+        let path = directory.path().join(odd);
+        fs::write(&path, "fn unnamed() {}").expect("the native filesystem accepts this filename");
+        let failure = walk_rust_files(root).expect_err("an unnameable Rust source is not silently discarded");
+        assert!(failure.to_string().contains("not UTF-8"), "{failure}");
+        fs::rename(&path, path.with_extension("txt")).expect("the native file can be renamed");
+        assert_eq!(
+            walk_rust_files(root).expect("non-source names do not enter the population"),
+            [root.join("valid.rs")]
+        );
+    }
+
+    fn survivor_nested_workspace() -> (TempDir, Utf8PathBuf) {
+        let directory = crate::testing::workdir("survey-nested-members-");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_owned()).expect("fixture paths are UTF-8");
+        crate::testing::write_project(
+            root.as_std_path(),
+            &[(
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"outer\", \"outer/inner\", \"sibling\"]\nresolver = \"2\"\n",
+            )],
+        );
+        for (path, name) in [("outer", "outer"), ("outer/inner", "inner"), ("sibling", "sibling")] {
+            crate::testing::write_project(
+                root.join(path).as_std_path(),
+                &[(
+                    "Cargo.toml",
+                    &format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
+                )],
+            );
+            crate::testing::write_fixture(
+                root.join(path).as_std_path(),
+                &[(
+                    "src/lib.rs",
+                    &format!("pub fn value() -> i32 {{ 1 }}\n#[test] fn {name}_case() {{}}\n"),
+                )],
+            );
+        }
+        (directory, root)
+    }
+
+    #[test]
+    fn survivor_owning_package_uses_the_deepest_real_manifest_and_ignores_unrelated_members_in_every_order() {
+        let (_directory, root) = survivor_nested_workspace();
+        let mut metadata = load_metadata(&root, &FeatureArgs::default()).expect("the offline workspace is valid");
+        metadata.packages.sort_by_key(|package| package.manifest_path.components().count());
+        for reversed in [false, true] {
+            if reversed {
+                metadata.packages.reverse();
+            }
+            for (path, expected) in [
+                ("", None),
+                ("outside", None),
+                ("outer", Some("outer")),
+                ("outer/src", Some("outer")),
+                ("outer/inner", Some("inner")),
+                ("outer/inner/src", Some("inner")),
+                ("sibling/src", Some("sibling")),
+            ] {
+                assert_eq!(owning_package(&metadata, &root.join(path)).as_deref(), expected, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn survivor_metadata_loading_really_applies_requested_features_to_cargo() {
+        let (_directory, root) = survivor_nested_workspace();
+        load_metadata(&root, &FeatureArgs::default()).expect("ordinary metadata succeeds");
+        let manifest = root.join("outer/Cargo.toml");
+        let original = fs::read_to_string(&manifest).expect("fixture manifest exists");
+        fs::write(&manifest, format!("{original}\n[features]\nobserved = []\n")).expect("a real feature can be declared");
+        load_metadata_using(
+            &root,
+            &FeatureArgs {
+                features: vec!["outer/observed".to_owned()],
+                all_features: true,
+                no_default_features: true,
+            },
+            |metadata| {
+                let command = metadata.cargo_command();
+                let arguments: Vec<_> = command.get_args().map(|argument| argument.to_string_lossy().into_owned()).collect();
+                assert!(arguments.iter().any(|argument| argument == "--all-features"), "{arguments:?}");
+                assert!(
+                    arguments.iter().any(|argument| argument == "--no-default-features"),
+                    "{arguments:?}"
+                );
+                assert!(arguments.iter().any(|argument| argument == "outer/observed"), "{arguments:?}");
+                metadata.exec()
+            },
+        )
+        .expect("the observed command executes actual offline metadata for a declared feature");
+    }
+
+    #[test]
+    fn survivor_killer_discovery_retains_real_test_locations_and_marks_walk_failures_incomplete() {
+        let (_directory, root) = survivor_nested_workspace();
+        let mut survey = Survey::new(
+            &SelectArgs {
+                dir: root.clone(),
+                ..SelectArgs::default()
+            },
+            None,
+        )
+        .expect("the fixture can be surveyed");
+        let expected = crate::paths::physical(&root)
+            .expect("actual fixture roots can be normalized")
+            .join("outer/src/lib.rs");
+        let killers = survey.killers();
+        assert!(killers.is_complete());
+        assert_eq!(killers.file_for("outer_case"), Some(expected.as_path()));
+        survey.source_dirs.push(root.join("missing-source-directory"));
+        let killers = survey.killers();
+        assert!(!killers.is_complete());
+        assert_eq!(killers.file_for("outer_case"), Some(expected.as_path()));
+    }
+
+    #[test]
+    fn survivor_sharding_keeps_source_suppressed_and_settled_mutants_without_charging_them_as_live_work() {
+        let (_directory, root) = survivor_nested_workspace();
+        fs::write(
+            root.join("outer/src/lib.rs"),
+            "#[gamma::skip(literal.int_increment, reason = \"source policy\")]\npub fn value() -> i32 { 1 }\n",
+        )
+        .expect("fixture is writable");
+        let mut survey = Survey::new(
+            &SelectArgs {
+                dir: root,
+                ..SelectArgs::default()
+            },
+            None,
+        )
+        .expect("the fixture can be surveyed");
+        let selection = Selection::parse("all").expect("a valid selection");
+        let original = survey.scan(None, &selection, &mut 0).expect("the population scans");
+        assert!(original.suppressed > 0);
+        let settled = original
+            .mutants
+            .iter()
+            .find(|mutant| mutant.outcome == Outcome::Pending)
+            .expect("the fixture has live mutants")
+            .id
+            .clone();
+        survey.settle(std::iter::once((settled.clone(), Outcome::Killed)).collect());
+        let whole = survey.scan(None, &selection, &mut 0).expect("the settled population scans");
+        let count = NonZeroU32::new(2).expect("two is nonzero");
+        let index = 1 - shard_of(&settled, count);
+        survey.shard = Some((count.get(), index));
+        let sharded = survey.scan(None, &selection, &mut 0).expect("the sharded population scans");
+        assert!(
+            sharded
+                .mutants
+                .iter()
+                .any(|mutant| mutant.id == settled && mutant.outcome == Outcome::Killed)
+        );
+        for ignored in whole.mutants.iter().filter(|mutant| mutant.outcome == Outcome::Ignored) {
+            assert!(sharded.mutants.iter().any(|mutant| mutant.id == ignored.id));
+        }
+        let live = |mutants: &[Mutant]| mutants.iter().filter(|mutant| mutant.outcome == Outcome::Pending).count();
+        assert_eq!(sharded.sharded_out, live(&whole.mutants) - live(&sharded.mutants));
+        assert_eq!(sharded.settled_out, 1);
+        assert_eq!(sharded.suppressed, whole.suppressed);
+    }
+
+    #[test]
+    fn survivor_trait_configuration_continues_after_free_functions_and_does_not_replace_source_suppression() {
+        let text = "pub fn free() -> i32 { 7 }\ntrait Excluded { fn chosen() -> i32; }\nstruct S;\n\
+            impl Excluded for S {\n\
+            #[gamma::skip(literal.int_increment, reason = \"source policy\")]\n\
+            fn chosen() -> i32 { 2 }\n}\n";
+        let source = SourceFile::parse("source.rs", text.to_owned()).expect("the fixture is valid Rust syntax");
+        let cfgs = Cfgs::unconditional();
+        let target = TargetFile {
+            path: "source.rs".into(),
+            absolute: "source.rs".into(),
+            package: "p".to_owned(),
+            source: None,
+        };
+        let defaults = collect::Defaults::of_in(source.ast(), cfgs.for_package("p"));
+        let selection = Selection::parse("literal.int_increment,literal.int_decrement").expect("registered mutators");
+        let parsed = mutate(&target, &source, &selection, &cfgs, &defaults, &["Excluded".to_owned()])
+            .expect("configuration and source directives are valid");
+        let in_impl = |mutator: &str| {
+            parsed
+                .mutants
+                .iter()
+                .find(|mutant| mutant.line == 6 && mutant.mutator.as_ref() == mutator)
+                .expect("the implementation has both integer mutants")
+        };
+        let configured = in_impl("literal.int_decrement");
+        assert_eq!(configured.outcome, Outcome::Ignored);
+        assert_eq!(
+            configured.suppression.as_ref().expect("config suppression exists").channel,
+            Channel::Config
+        );
+        let original = in_impl("literal.int_increment");
+        assert_eq!(original.outcome, Outcome::Ignored);
+        let suppression = original.suppression.as_ref().expect("source suppression exists");
+        assert_eq!(suppression.channel, Channel::Attribute);
+        assert_eq!(suppression.reason.as_deref(), Some("source policy"));
+        assert_eq!(parsed.suppressed, 2);
+        assert!(
+            parsed
+                .mutants
+                .iter()
+                .any(|mutant| mutant.line == 1 && mutant.outcome == Outcome::Pending)
+        );
+    }
 
     #[test]
     fn retained_source_restores_only_a_leading_byte_order_mark() {
@@ -3719,18 +4524,37 @@ mod tests {
     }
 
     #[test]
-    fn survey_retains_cargos_resolved_target_directory() {
-        let (_directory, root) = workspace();
-        let target = root.join("configured-target");
+    fn survey_retains_the_injected_cargo_target_directory() {
+        let root = Utf8PathBuf::from("synthetic/workspace");
+        let target = Utf8PathBuf::from("synthetic/distinct-metadata-target");
+        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+            "packages": [],
+            "workspace_members": [],
+            "workspace_default_members": [],
+            "resolve": null,
+            "workspace_root": root,
+            "target_directory": target,
+            "build_directory": target,
+            "metadata": {},
+            "version": 1
+        }))
+        .expect("fixture metadata parses");
+        let args = SelectArgs {
+            dir: root,
+            ..SelectArgs::default()
+        };
 
-        write(
-            &root,
-            ".cargo/config.toml",
-            &format!("[build]\ntarget-dir = '{}'\n", target.as_str()),
-        );
-        assert_offline_configuration(&root);
-
-        let survey = survey(&root, SelectArgs::default());
+        let survey = Survey::for_build_with_metadata(
+            &args,
+            None,
+            &CargoOptions::default(),
+            &FeatureArgs::default(),
+            &metadata,
+            ExternalPathInputs::default(),
+            false,
+            |_root, _cargo, _enabled| Cfgs::default(),
+        )
+        .expect("the injected metadata must survey");
 
         assert_eq!(survey.target, target);
     }
@@ -3803,6 +4627,29 @@ mod tests {
             "{:?}",
             scanned.mutants.iter().map(|mutant| mutant.file.as_str()).collect::<Vec<_>>()
         );
+        let skipped_path = Utf8Path::new("core/src/deep.rs");
+        assert!(!scanned.digests.contains_key(skipped_path));
+        assert!(!scanned.sources.contains_key(skipped_path));
+        let plan = survey.into_plan(scanned);
+        let skipped_file = plan
+            .files
+            .iter()
+            .find(|file| file.path.as_path() == skipped_path)
+            .expect("the source was selected");
+        assert!(skipped_file.source.is_none());
+        assert!(!plan.digests.contains_key(skipped_path));
+        let info = crate::fixtures::report_with(None, 200, Vec::new()).config;
+        let newer = crate::elements::build(&plan, crate::elements::Thresholds::default(), info).unwrap();
+        assert!(newer.config.as_ref().unwrap().population_complete);
+        assert!(!newer.files.contains_key(skipped_path.as_str()));
+        assert!(newer.files.contains_key("core/src/lib.rs"));
+        let mut old = crate::fixtures::report_with(None, 100, vec![crate::fixtures::mutant_result_at("last", 1, "Survived")]);
+        let previous_file = old.files.remove("src/lib.rs").unwrap();
+        let _previous = old.files.insert(skipped_path.to_string(), previous_file);
+        let merged = crate::merge::merge(&[("old".into(), old), ("new".into(), newer)], 300, None);
+        assert_eq!(merged.withdrawn, 0);
+        let report = merged.report.unwrap();
+        assert_eq!(report.files[skipped_path.as_str()].mutants[0].status, "Survived");
     }
 
     /// Source deliberately deeper than the parser accepts, without reading the implementation
@@ -4460,6 +5307,180 @@ mod tests {
         );
     }
 
+    #[test]
+    fn evidence_only_aliases_and_reexports_do_not_suppress_imported_default_mutants() {
+        for export in [
+            "pub type Artifact = std::time::Duration;",
+            "pub use std::time::Duration as Artifact;",
+        ] {
+            let (_directory, root) = workspace();
+            write(
+                &root,
+                "core/src/lib.rs",
+                "mod other; mod exports; use crate::exports::Artifact; \
+                 pub fn make() -> Artifact { Artifact::from_secs(5) }",
+            );
+            write(&root, "core/src/other.rs", "pub struct Artifact;");
+            write(&root, "core/src/exports.rs", export);
+            for args in [
+                SelectArgs {
+                    files: vec!["core/src/lib.rs".to_owned()],
+                    ..SelectArgs::default()
+                },
+                SelectArgs {
+                    exclude_files: vec!["core/src/exports.rs".to_owned(), "core/src/other.rs".to_owned()],
+                    ..SelectArgs::default()
+                },
+            ] {
+                let survey = survey(&root, args);
+                for selector in ["all", "fn_value.default"] {
+                    let scanned = survey.scan(Some("core"), &Selection::parse(selector).unwrap(), &mut 0).unwrap();
+                    assert!(
+                        scanned
+                            .mutants
+                            .iter()
+                            .any(|mutant| mutant.file.as_str() == "core/src/lib.rs" && mutant.mutator.as_ref() == "fn_value.default"),
+                        "{export}: {selector}"
+                    );
+                    assert!(
+                        scanned
+                            .mutants
+                            .iter()
+                            .all(|mutant| !matches!(mutant.file.as_str(), "core/src/other.rs" | "core/src/exports.rs"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_filters_preserve_default_evidence_without_mutating_evidence_only_files() {
+        let (_directory, root) = workspace();
+        write(
+            &root,
+            "core/src/lib.rs",
+            "mod model;\nmod generated;\nuse crate::model::{Missing, Ready};\n\
+             pub fn missing() -> Missing { Missing }\n\
+             pub fn ready() -> Ready { Ready }\n\
+             pub fn external() -> std::net::TcpListener { unimplemented!() }\n",
+        );
+        write(&root, "core/src/model.rs", "pub struct Missing;\npub struct Ready;\n");
+        write(
+            &root,
+            "core/src/generated.rs",
+            "impl Default for crate::model::Ready { fn default() -> Self { Self } }\n\
+             pub fn helper() -> crate::model::Ready { crate::model::Ready }\n",
+        );
+        write(
+            &root,
+            "change.patch",
+            "--- a/core/src/lib.rs\n+++ b/core/src/lib.rs\n@@ -4,3 +4,3 @@\n\
+             +pub fn missing() -> Missing { Missing }\n\
+             +pub fn ready() -> Ready { Ready }\n\
+             +pub fn external() -> std::net::TcpListener { unimplemented!() }\n",
+        );
+
+        for args in [
+            SelectArgs {
+                exclude_files: vec!["core/src/generated.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+            SelectArgs {
+                files: vec!["core/src/lib.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+            SelectArgs {
+                in_diff: Some(root.join("change.patch")),
+                ..SelectArgs::default()
+            },
+        ] {
+            let survey = survey(&root, args);
+            let selection = Selection::parse("fn_value.default").expect("the registered mutator resolves");
+            let scanned = survey.scan(None, &selection, &mut 0).expect("the fixture sources are readable");
+            let found: Vec<_> = scanned
+                .mutants
+                .iter()
+                .map(|mutant| (mutant.item_path.as_ref(), mutant.replacement.as_str()))
+                .collect();
+
+            assert_eq!(
+                found,
+                [("ready", "Default::default()"), ("external", "Default::default()")],
+                "filters must preserve cross-file implementations and unknown external types, but screen Missing"
+            );
+            assert!(
+                scanned.mutants.iter().all(|mutant| mutant.file.as_str() == "core/src/lib.rs"),
+                "evidence-only files must not contribute mutants: {:?}",
+                scanned.mutants
+            );
+        }
+    }
+
+    #[test]
+    fn an_exclusion_does_not_disable_negative_default_evidence_in_either_package() {
+        let (_directory, root) = workspace();
+        write(
+            &root,
+            "core/src/lib.rs",
+            "mod generated;\npub struct Shape;\npub fn build() -> Shape { Shape }\n",
+        );
+        write(
+            &root,
+            "app/src/main.rs",
+            "struct Shape;\nfn build() -> Shape { Shape }\nfn main() {}\n",
+        );
+        let survey = survey(
+            &root,
+            SelectArgs {
+                exclude_files: vec!["core/src/generated.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+        );
+        let selection = Selection::parse("fn_value.default").expect("the registered mutator resolves");
+        for package in [None, Some("core"), Some("app")] {
+            let scanned = survey.scan(package, &selection, &mut 0).expect("the fixture sources are readable");
+            assert!(scanned.mutants.is_empty(), "{:?}", scanned.mutants);
+        }
+    }
+
+    #[test]
+    fn an_unanalyzable_excluded_file_disables_evidence_only_for_its_own_package() {
+        let (_directory, root) = workspace();
+        write(
+            &root,
+            "core/src/lib.rs",
+            "mod generated;\npub struct Shape;\npub fn build() -> Shape { Shape }\n",
+        );
+        write(
+            &root,
+            "core/src/generated.rs",
+            &format!(
+                "impl Default for crate::Shape {{ fn default() -> Self {{ Self }} }}\n{}",
+                too_deep_source()
+            ),
+        );
+        write(
+            &root,
+            "app/src/main.rs",
+            "struct Shape;\nfn build() -> Shape { Shape }\nfn main() {}\n",
+        );
+        let survey = survey(
+            &root,
+            SelectArgs {
+                exclude_files: vec!["core/src/generated.rs".to_owned()],
+                ..SelectArgs::default()
+            },
+        );
+        let selection = Selection::parse("fn_value.default").expect("the registered mutator resolves");
+        let scanned = survey
+            .scan(None, &selection, &mut 0)
+            .expect("a skippable source does not abort discovery");
+        assert_eq!(scanned.skipped.len(), 1, "{:?}", scanned.skipped);
+        assert_eq!(scanned.mutants.len(), 1, "{:?}", scanned.mutants);
+        assert_eq!(scanned.mutants[0].package.as_ref(), "core");
+        assert_eq!(scanned.mutants[0].replacement, "Default::default()");
+    }
+
     /// A diff path that cannot be read at all has to fail the survey up front, naming the diff,
     /// rather than falling through to a scan that silently behaves as though `--in-diff` had never
     /// been given: a run over the wrong set of lines because a diff path was mistyped is far harder
@@ -4483,8 +5504,7 @@ mod tests {
 
     #[test]
     fn a_file_the_diff_never_mentions_is_dropped_before_it_is_parsed() {
-        // This is most of what makes `--in-diff` affordable on a pull request: the files the change
-        // did not touch are skipped without ever being read, let alone parsed.
+        // Unchanged files supply declaration evidence but do not enter the mutation selection.
         let (_directory, root) = workspace();
 
         write(

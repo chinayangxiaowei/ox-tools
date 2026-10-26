@@ -138,14 +138,12 @@ The shared recipe queries `_anvil-impact-include affected` after its
 Tree Borrows, strict-provenance, and race-coverage parameter values to their
 recipe names and profile flags before invoking Cargo.
 
-Cargo metadata and the compiler-artifact stream must come from the same pinned
-nightly Cargo. Cargo changed package-ID formatting in 1.78, so joining metadata
-from a stable or MSRV Cargo to nightly compiler artifacts would fail for older
-adopters. Metadata supplies the workspace-member set, package labels, manifest
-directories, and `[package.metadata.anvil.miri] exclude` policy. Full-workspace
-selection translates exclusions to Cargo `--exclude` arguments; impact-scoped
-selection removes excluded version-qualified package selectors before
-compilation. Excluded packages remain available as dependencies.
+Metadata comes from the same pinned nightly Cargo that compiles the artifacts.
+It supplies the workspace-member set, package labels, manifest
+directories, and `[package.metadata.anvil.miri] exclude` policy. Selection is
+`--workspace --exclude ...`, and Miri opt-outs are added to the exclusions; an
+explicitly selected opted-out package skips before compilation. Excluded
+packages remain available as dependencies.
 
 The compile phase uses `cargo miri test --all-features --tests --no-run` with
 Cargo's JSON diagnostic stream. Executable `compiler-artifact` records whose
@@ -256,8 +254,10 @@ The recipe keeps two independently keyed snapshots under `target/anvil/impact/sn
 The composite baseline key is why the base worktree is retaken when the base moves *or*
 `.delta.toml` changes; `baseline_regenerates_when_delta_config_changes_without_moving_the_base`
 pins that second input. The worktree lives under the runner-managed scratch dir
-(`RUNNER_TEMP` → `AGENT_TEMPDIRECTORY` → system temp) and is named with `$PID` so concurrent
-runs never collide or remove each other's checkout; it is always removed in a `finally`.
+(`RUNNER_TEMP` → `AGENT_TEMPDIRECTORY` → system temp) and is named with `$PID` and a fresh
+GUID. Reused process IDs cannot select abandoned directories, and a run never removes a
+pre-existing checkout to claim its path. Its own worktree is removed in a `finally`.
+Creation failures include Git's diagnostic output.
 
 ### Fail-closed mapping and the dirty-tree safety net
 

@@ -110,6 +110,7 @@ pub(super) fn stated_range(attrs: &[Attribute]) -> Option<Range<usize>> {
     }
 
     let mut tokens = arguments.into_iter();
+    // #[gamma::skip(try.propagate_to_unwrap, reason = "parse2 accepted a Rust expression above, which requires at least one token")]
     let first = tokens.next()?.span().byte_range();
     let last = tokens.last().map_or_else(|| first.clone(), |tree| tree.span().byte_range());
 
@@ -266,6 +267,7 @@ impl Audit {
 impl<'ast> Visit<'ast> for Audit {
     fn visit_attribute(&mut self, node: &'ast Attribute) {
         self.on_attribute(node);
+        // #[gamma::skip(stmt.delete_call, reason = "syn attributes contain opaque tokens and no recursively visitable Rust attributes or function nodes")]
         visit::visit_attribute(self, node);
     }
 
@@ -323,6 +325,7 @@ fn arguments(attribute: &Attribute) -> Option<TokenStream> {
     }
 
     match &attribute.meta {
+        // #[gamma::skip(match_guard.always_true, reason = "all callers parse the returned tokens as an expression; an empty token stream fails parsing just as None fails admission")]
         Meta::List(list) if !list.tokens.is_empty() => Some(list.tokens.clone()),
         _other => None,
     }
@@ -332,6 +335,43 @@ fn arguments(attribute: &Attribute) -> Option<TokenStream> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_misplacements_and_bodiless_methods_keep_their_exact_diagnostics() {
+        for source in [
+            "fn f(){ #[gamma::value(1)] let n = 1; }",
+            "struct S; impl S { fn f(){ #[gamma::value(1)] let n = 1; } }",
+            "trait S { fn f(){ #[gamma::value(1)] let n = 1; } }",
+        ] {
+            let error = check(&file(source)).unwrap_err();
+            assert!(error.to_string().contains(MISPLACED), "{error}");
+            assert!(error.is_usage());
+        }
+        let error = check(&file("trait S { #[gamma::value(7)] fn f() -> u8; }")).unwrap_err();
+        assert!(error.to_string().contains(BODILESS), "{error}");
+        assert!(!error.to_string().contains(EMPTY));
+        check(&file("#[gamma::value::extra(1)] fn f(){ 2 }")).unwrap();
+    }
+
+    #[test]
+    fn extended_stated_attribute_paths_remain_unclaimed_even_with_invalid_value_tokens() {
+        for source in [
+            "#[gamma::value::metadata(1 +)] fn f() { 2; }",
+            "#[gamma::value::metadata(1 +)] struct S;",
+            "trait S { #[gamma::value::metadata(1 +)] fn f(); }",
+        ] {
+            let parsed = file(source);
+            check(&parsed).unwrap();
+            let mut audit = Audit::default();
+            audit.visit_file(&parsed.ast);
+            assert!(audit.stated.is_empty(), "{source}");
+            assert!(audit.on_functions.is_empty(), "{source}");
+            assert!(audit.faults.is_empty(), "{source}");
+        }
+        let error = check(&file("#[gamma::value(1 +)] fn f() { 2; }")).unwrap_err();
+        assert!(error.is_usage());
+        assert!(error.to_string().contains(MALFORMED));
+    }
 
     fn file(source: &str) -> SourceFile {
         SourceFile::parse("test.rs", source.to_owned()).expect("the fixture must parse")
