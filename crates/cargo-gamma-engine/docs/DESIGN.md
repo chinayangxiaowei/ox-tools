@@ -23,6 +23,9 @@ and whose killing tests are not exclusive may be withheld from the default;
 a non-default selector that resolves to their mutator admits them without
 changing their stable identity. The standalone `check_stated` API has no build
 configuration and therefore audits the whole file.
+The default mutator selection includes `fn_value.some` for constructible
+`Option<T>` payloads. The `@pedantic` preset still selects that mutator for
+focused runs and existing scripts.
 
 ## Boundaries
 
