@@ -2,6 +2,231 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-24
+
+- ✨ Features
+
+  - cargo-anvil: manage JSON array entries
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: stabilize GitHub mutation gate
+  - cargo-anvil: repair body-local JSON corruption
+  - cargo-anvil: validate projected JSON placement
+  - cargo-anvil: sort manifest sections
+  - cargo-anvil: preserve changelog history
+  - cargo-anvil: address final review feedback
+  - cargo-anvil: preserve legacy retirement scanning
+  - cargo-anvil: verify generated JSON regions
+  - cargo-anvil: validate scanner-only splices
+  - cargo-anvil: require active JSON regions
+  - cargo-anvil: preserve structural provenance edges
+  - cargo-anvil: refuse unmatched XML closes
+  - cargo-anvil: refuse incomplete JSON scans
+  - cargo-anvil: guard retained JSON syntax
+  - cargo-anvil: retain scanner on edited retirement
+  - cargo-anvil: harden JSON scanner lifecycle
+  - cargo-anvil: persist JSON scanner hosts
+  - cargo-anvil: preserve renamed JSON tracking
+  - cargo-anvil: scan bare CR line endings
+  - cargo-anvil: retain scanner provenance on refusal
+  - cargo-anvil: retain JSON scanner provenance
+  - cargo-anvil: scan mixed JSON retirement safely
+  - cargo-anvil: scan mixed JSON hosts safely
+  - cargo-anvil: reject moved JSON regions
+  - cargo-anvil: isolate structural JSON scanning
+  - cargo-anvil: preserve JSON region provenance
+  - cargo-anvil: sequence JSON requirement checks
+  - cargo-anvil: validate required JSON entries
+  - cargo-anvil: validate composed JSON hosts
+  - cargo-anvil: harden JSON array splicing
+
+- 📚 Documentation
+
+  - cargo-anvil: record JSONC parser policy
+  - cargo-anvil: clarify JSON retirement provenance
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: key JSON specs by region
+  - cargo-anvil: clarify JSON array invariants
+
+- 🧩 Miscellaneous
+
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge remote-tracking branch 'origin/main' into makolnek-microsoft-json-array-regions
+
+## [0.18.0] - 2026-10-24
+
+- ✨ Features
+
+  - cargo-anvil: manage JSON array entries
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: repair body-local JSON corruption
+  - cargo-anvil: validate projected JSON placement
+  - cargo-anvil: sort manifest sections
+  - cargo-anvil: preserve changelog history
+  - cargo-anvil: address final review feedback
+  - cargo-anvil: preserve legacy retirement scanning
+  - cargo-anvil: verify generated JSON regions
+  - cargo-anvil: validate scanner-only splices
+  - cargo-anvil: require active JSON regions
+  - cargo-anvil: preserve structural provenance edges
+  - cargo-anvil: refuse unmatched XML closes
+  - cargo-anvil: refuse incomplete JSON scans
+  - cargo-anvil: guard retained JSON syntax
+  - cargo-anvil: retain scanner on edited retirement
+  - cargo-anvil: harden JSON scanner lifecycle
+  - cargo-anvil: persist JSON scanner hosts
+  - cargo-anvil: preserve renamed JSON tracking
+  - cargo-anvil: scan bare CR line endings
+  - cargo-anvil: retain scanner provenance on refusal
+  - cargo-anvil: retain JSON scanner provenance
+  - cargo-anvil: scan mixed JSON retirement safely
+  - cargo-anvil: scan mixed JSON hosts safely
+  - cargo-anvil: reject moved JSON regions
+  - cargo-anvil: isolate structural JSON scanning
+  - cargo-anvil: preserve JSON region provenance
+  - cargo-anvil: sequence JSON requirement checks
+  - cargo-anvil: validate required JSON entries
+  - cargo-anvil: validate composed JSON hosts
+  - cargo-anvil: harden JSON array splicing
+
+- 📚 Documentation
+
+  - cargo-anvil: record JSONC parser policy
+  - cargo-anvil: clarify JSON retirement provenance
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: key JSON specs by region
+  - cargo-anvil: clarify JSON array invariants
+
+- 🧩 Miscellaneous
+
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge remote-tracking branch 'origin/main' into makolnek-microsoft-json-array-regions
+
+## [0.17.0] - 2026-10-23
+
+- ✨ Features
+
+  - cargo-anvil: manage JSON array entries
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: validate projected JSON placement
+  - cargo-anvil: sort manifest sections
+  - cargo-anvil: preserve changelog history
+  - cargo-anvil: address final review feedback
+  - cargo-anvil: preserve legacy retirement scanning
+  - cargo-anvil: verify generated JSON regions
+  - cargo-anvil: validate scanner-only splices
+  - cargo-anvil: require active JSON regions
+  - cargo-anvil: preserve structural provenance edges
+  - cargo-anvil: refuse unmatched XML closes
+  - cargo-anvil: refuse incomplete JSON scans
+  - cargo-anvil: guard retained JSON syntax
+  - cargo-anvil: retain scanner on edited retirement
+  - cargo-anvil: harden JSON scanner lifecycle
+  - cargo-anvil: persist JSON scanner hosts
+  - cargo-anvil: preserve renamed JSON tracking
+  - cargo-anvil: scan bare CR line endings
+  - cargo-anvil: retain scanner provenance on refusal
+  - cargo-anvil: retain JSON scanner provenance
+  - cargo-anvil: scan mixed JSON retirement safely
+  - cargo-anvil: scan mixed JSON hosts safely
+  - cargo-anvil: reject moved JSON regions
+  - cargo-anvil: isolate structural JSON scanning
+  - cargo-anvil: preserve JSON region provenance
+  - cargo-anvil: sequence JSON requirement checks
+  - cargo-anvil: validate required JSON entries
+  - cargo-anvil: validate composed JSON hosts
+  - cargo-anvil: harden JSON array splicing
+
+- 📚 Documentation
+
+  - cargo-anvil: clarify JSON retirement provenance
+
+- ♻️ Code Refactoring
+
+  - cargo-anvil: key JSON specs by region
+  - cargo-anvil: clarify JSON array invariants
+
+- 🧩 Miscellaneous
+
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge origin/main into makolnek-microsoft-json-array-regions
+  - Merge remote-tracking branch 'origin/main' into makolnek-microsoft-json-array-regions
+
+## [0.16.0] - 2026-10-23
+
+- ✨ Features
+
+  - cargo-anvil: execute examples during verification ([#286](https://github.com/microsoft/ox-tools/pull/286))
+
+## [0.15.2] - 2026-10-23
+
+- ✨ Features
+
+  - cargo-anvil: roll out filtered coverage reports
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: clarify coverage adoption boundaries
+
+- 📚 Documentation
+
+  - cargo-anvil: explain Windows ARM coverage fallback
+  - align coverage topology and helper names
+
+- ✔️ Tasks
+
+  - cargo-anvil: prepare 0.15.2 release
+  - cargo-anvil: pin coverage gate 0.7.1
+
+- 🧩 Miscellaneous
+
+  - Merge cargo-anvil 0.15.1 from main
+  - Merge cargo-deny cleanup from main
+  - Merge current main into coverage rollout
+  - Merge main into coverage rollout
+  - Merge origin/main into anvil coverage rollout
+
+## [0.15.1] - 2026-10-22
+
+- ✨ Features
+
+  - cargo-gamma: improve campaign reliability and mutation detection ([#282](https://github.com/microsoft/ox-tools/pull/282))
+
+- 🐛 Bug Fixes
+
+  - cargo-anvil: hide internal recipes from just listings ([#272](https://github.com/microsoft/ox-tools/pull/272))
+  - cargo-anvil: preserve immutable action tags
+  - cargo-anvil: synchronize advisory and coverage action pins
+  - pass release and container inputs explicitly ([#265](https://github.com/microsoft/ox-tools/pull/265))
+  - cargo-anvil: use just_executable for nested invocations ([#266](https://github.com/microsoft/ox-tools/pull/266))
+
+- ⚡ Performance
+
+  - cargo-anvil: keep Miri under 30 minutes ([#279](https://github.com/microsoft/ox-tools/pull/279))
+
+- ✔️ Tasks
+
+  - clean up cargo-deny warnings without narrowing license policy ([#287](https://github.com/microsoft/ox-tools/pull/287))
+  - cargo-anvil: prepare 0.15.1 release
+
+- 🧩 Miscellaneous
+
+  - Merge main after #287 and regenerate Anvil
+  - Merge main into pin alignment
+
 ## [0.15.0] - 2026-10-13
 
 - ✨ Features

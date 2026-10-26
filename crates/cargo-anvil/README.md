@@ -107,7 +107,7 @@ Other useful entry points are:
 just anvil-build
 just anvil-build --package my-crate
 just anvil-doc-build --open
-just anvil-examples --run
+just anvil-examples
 just anvil-fmt --fix
 just anvil-miri --package my-crate --example basic
 just anvil-readme --fix
@@ -129,7 +129,7 @@ the generated cloud workflow:
 * **fast checks** cover formatting, Clippy, documentation, dependency
   policy, spelling, README drift, API compatibility, and metadata;
 * **tests and coverage** run tests, documentation tests, coverage gates,
-  and example compilation;
+  example compilation, and execution of selected examples;
 * **MSRV tests** execute affected tests with the repository’s declared
   minimum supported Rust version;
 * **runtime analysis** runs Miri, cargo-careful, Loom, and a short Bolero
@@ -197,7 +197,7 @@ above compose these recipes into the default policy:
 * **Tests and coverage:** tests under the declared MSRV, coverage with
   [`cargo-llvm-cov`][__link17] and
   [`cargo-coverage-gate`][__link18],
-  documentation tests, and example compilation or optional execution.
+  documentation tests, example compilation, and execution of selected examples.
 * **Runtime analysis:** [`Miri`][__link19],
   [`cargo-careful`][__link20],
   [`Loom`][__link21], and
@@ -253,9 +253,31 @@ dictionary format expected by cargo-spellcheck.
 
 [`cargo-coverage-gate`][__link25]
 metadata controls workspace and package thresholds, target-specific policy,
-and intentional exclusions. Coverage enforcement is local to the generated
-check; a hosted coverage service is optional reporting rather than the
-source of the verdict.
+and intentional exclusions. The generated check delegates both supported
+feature configurations to `cargo coverage-gate run`, which filters coverage
+to released Cargo library and binary surfaces before atomically publishing
+`target/coverage/lcov-all-features.info` and
+`target/coverage/lcov-no-default.info`. The local gate and hosted reporting
+consume those exact files, so provably test-only regions such as
+`#[cfg(test)]` modules and their assertion guards or helpers need no
+`coverage(off)` annotations merely to stay out of production coverage.
+Feature-exposed helpers such as `cfg(feature = "test-util")` remain part of
+the released surface and are still counted. Hosted coverage remains
+reporting rather than the source of the verdict.
+
+Impact selection controls which packages are tested and gated, while the
+released-surface source index validates every target in the workspace.
+Unsupported or ambiguous module layouts anywhere in the workspace therefore
+fail closed. Adoption may require semantics-preserving changes to test
+fixtures so their source remains available to parser or discovery tests
+without mounting an unsupported layout as a Cargo target.
+
+The generated recipe intentionally uses the invoking rustc host target.
+`cargo coverage-gate run` passes that target explicitly, overriding
+`CARGO_BUILD_TARGET` and Cargo `build.target`; each Anvil matrix leg measures
+its native target. Repositories that require non-host coverage need a native
+runner for that target or a documented repository-specific check until the
+catalog supports explicit coverage-target configuration.
 
 #### Miri
 
@@ -319,15 +341,18 @@ declares Loom support but exposes no matching test target.
 
 #### Examples
 
-`anvil-examples` always compiles selected examples. An unfiltered
-`--run` skips interactive, credentialed, or otherwise unsuitable examples
-declared by their package:
+`anvil-examples` always builds and runs selected examples, whether invoked
+directly or through PR and scheduled tests. Runs use `ANVIL_EXAMPLE=1`, no
+application arguments, and a 30-second per-example timeout. Nonzero exits
+and timeouts fail the check. Unfiltered runs skip interactive, credentialed,
+service-dependent, or otherwise unsuitable examples declared by their package:
 
 ```toml
 [package.metadata.anvil.examples]
 no-run = ["interactive-demo", "needs-production-credentials"]
 ```
 
+Excluded examples still compile.
 Explicit `--package` and `--example` selection overrides the default
 exclusion because the caller has deliberately chosen that example.
 
@@ -409,7 +434,7 @@ More detailed design and operational guidance is available in the
 This crate was developed as part of <a href="../..">The Oxidizer Project</a>. Browse this crate's <a href="https://github.com/microsoft/ox-tools/tree/main/crates/cargo-anvil">source code</a>.
 </sub>
 
- [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQblRYhli3L8qob_NSi_WYo69wbWnMVqZw3jJwb3u56HnT6RDphYvRhcoQb5STqOPWzBuIbGKo1M8rA_gwbnEE39p8Pne4bJAiNAgNsx6thZIGDa2NhcmdvLWFudmlsZjAuMTUuMGtjYXJnb19hbnZpbA
+ [__cargo_doc2readme_dependencies_info]: ggGmYW0CYXZlMC43LjNhdIQblRYhli3L8qob_NSi_WYo69wbWnMVqZw3jJwb3u56HnT6RDphYvRhcoQbExZV6pDtcbYb97iufUocbo0bFyAWg29fSoYbXVvSuxITYxRhZIGDa2NhcmdvLWFudmlsZjAuMTkuMGtjYXJnb19hbnZpbA
  [__link0]: https://github.com/casey/just
  [__link1]: https://rust-lang.github.io/rustfmt/
  [__link10]: https://www.conventionalcommits.org/
@@ -429,9 +454,9 @@ This crate was developed as part of <a href="../..">The Oxidizer Project</a>. Br
  [__link23]: https://mutants.rs/
  [__link24]: https://crates.io/crates/cargo-hack
  [__link25]: https://crates.io/crates/cargo-coverage-gate
- [__link26]: https://docs.rs/cargo-anvil/0.15.0/cargo_anvil/?search=Catalog::anvil
- [__link27]: https://docs.rs/cargo-anvil/0.15.0/cargo_anvil/?search=Artifact
- [__link28]: https://docs.rs/cargo-anvil/0.15.0/cargo_anvil/fn.run_app.html
+ [__link26]: https://docs.rs/cargo-anvil/0.19.0/cargo_anvil/?search=Catalog::anvil
+ [__link27]: https://docs.rs/cargo-anvil/0.19.0/cargo_anvil/?search=Artifact
+ [__link28]: https://docs.rs/cargo-anvil/0.19.0/cargo_anvil/fn.run_app.html
  [__link3]: https://crates.io/crates/cargo-each
  [__link4]: https://crates.io/crates/cargo-sort
  [__link5]: https://crates.io/crates/cargo-heather
