@@ -5,7 +5,9 @@
 
 use camino::Utf8Path;
 
-use crate::discover::{GeneralizedHints, Hints, Killer, RunRecord, SiteIdentity};
+#[cfg(test)]
+use crate::discover::SiteIdentity;
+use crate::discover::{GeneralizedHints, Hints, Killer, RunRecord};
 use crate::model::{Mutant, MutantId};
 use crate::{HashMap, HashSet};
 
@@ -26,7 +28,7 @@ use crate::{HashMap, HashSet};
 /// the run immediately checks by running the named test, and a guess that does not convict costs
 /// one filtered process and is discarded. Nothing here can move a verdict, so nothing here needs
 /// invalidating.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Killers {
     /// The killing test of each mutant that had one, keyed by [`crate::model::Mutant::id`].
     ///
@@ -51,10 +53,14 @@ impl Killers {
     /// written by another version without anyone having to care.
     pub(super) fn load(base: &Utf8Path, root: &Utf8Path) -> Self {
         let promoted = Hints::load(root);
-        let mut entries = promoted.probes();
-        let mut generalized = promoted.generalized();
         let record = RunRecord::load(base);
         let incomplete = RunRecord::load_incomplete(base);
+        Self::from_records(&promoted, &record, &incomplete)
+    }
+
+    fn from_records(promoted: &Hints, record: &RunRecord, incomplete: &RunRecord) -> Self {
+        let mut entries = promoted.probes();
+        let mut generalized = promoted.generalized();
 
         // The record last, so this machine's own last answer wins over the committed one wherever
         // both name a mutant: a probe is checked either way, but the fresher guess is likelier to
@@ -70,6 +76,10 @@ impl Killers {
     /// What caught this mutant last time, if anything did.
     pub(super) fn hint(&self, id: &str) -> Option<&Killer> {
         self.entries.get(id)
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&MutantId, &Killer)> {
+        self.entries.iter()
     }
 
     /// Records what caught a mutant this run.
@@ -94,6 +104,11 @@ impl Killers {
         self.generalized = generalized;
     }
 
+    pub(super) fn absorb_generalized(&mut self, record: &RunRecord) {
+        Self::merge_generalized(&mut self.generalized, record.generalized());
+    }
+
+    #[cfg(test)]
     pub(super) fn reach_hints(&self, site: &SiteIdentity) -> Vec<Killer> {
         self.generalized
             .reach
@@ -132,16 +147,50 @@ impl Killers {
         if newer.supported().is_none() {
             return;
         }
-        for item in newer.items {
-            target
-                .items
-                .retain(|current| current.file != item.file || current.item != item.item);
-            target.items.push(item);
+        if target.supported().is_none() {
+            *target = GeneralizedHints::empty_supported();
         }
-        for binary in newer.binaries {
-            target.binaries.retain(|current| current.file != binary.file);
-            target.binaries.push(binary);
-        }
+        let items: HashMap<_, _> = newer
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| ((item.file.as_path(), item.item.as_str()), index))
+            .collect();
+        target
+            .items
+            .retain(|item| !items.contains_key(&(item.file.as_path(), item.item.as_str())));
+        let keep = newer
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| items.get(&(item.file.as_path(), item.item.as_str())) == Some(&index))
+            .collect::<Vec<_>>();
+        drop(items);
+        target
+            .items
+            .extend(newer.items.into_iter().zip(keep).filter(|(_, keep)| *keep).map(|(item, _)| item));
+        let binaries: HashMap<_, _> = newer
+            .binaries
+            .iter()
+            .enumerate()
+            .map(|(index, binary)| (binary.file.as_path(), index))
+            .collect();
+        target.binaries.retain(|binary| !binaries.contains_key(binary.file.as_path()));
+        let keep = newer
+            .binaries
+            .iter()
+            .enumerate()
+            .map(|(index, binary)| binaries.get(binary.file.as_path()) == Some(&index))
+            .collect::<Vec<_>>();
+        drop(binaries);
+        target.binaries.extend(
+            newer
+                .binaries
+                .into_iter()
+                .zip(keep)
+                .filter(|(_, keep)| *keep)
+                .map(|(binary, _)| binary),
+        );
         // #[gamma::skip(all, reason = "the branch handles process, filesystem, platform, or synchronization state that cannot be forced safely and deterministically in unit tests")]
         if !newer.reach.is_empty() {
             target.test_sets = newer.test_sets;
@@ -201,6 +250,83 @@ mod tests {
 
         assert_eq!(read.len(), 1);
         assert_eq!(read.hint("abc"), Some(&killer("tests::round_trip")));
+    }
+
+    fn completed_record() -> RunRecord {
+        let population = [mutant("fedcba987654")];
+        let mut learned = Killers::default();
+        learned.record("fedcba987654".into(), killer("tests::completed"));
+        learned.replace_generalized(GeneralizedHints {
+            binaries: vec![FileBinaryHints {
+                file: "src/completed.rs".into(),
+                candidates: vec![RankedHint {
+                    candidate: BinaryHint {
+                        package: "alpha".into(),
+                        target: "lib".into(),
+                    },
+                    seeds: 2,
+                    hits: 3,
+                    misses: 1,
+                    measured_ms: 37,
+                    samples: 2,
+                    order: 11,
+                }],
+            }],
+            ..GeneralizedHints::empty_supported()
+        });
+        let mut record = RunRecord::default();
+        learned.stage(&mut record, &population);
+        record
+    }
+
+    #[test]
+    fn completed_records_round_trip_without_incomplete_fallback() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8Path::from_path(directory.path()).unwrap();
+        let base = root.join("cache");
+        std::fs::create_dir(&base).unwrap();
+        let record = completed_record();
+        record.store_completed(&base).unwrap();
+        assert_eq!(
+            RunRecord::load(&base).probes().get("fedcba987654"),
+            Some(&killer("tests::completed"))
+        );
+        assert!(RunRecord::load_incomplete(&base).probes().is_empty());
+        let loaded = Killers::load(&base, root);
+        assert_completed_knowledge(&loaded);
+    }
+
+    #[test]
+    fn completed_records_supply_exact_probes_and_generalized_file_knowledge() {
+        let record = completed_record();
+        let loaded = Killers::from_records(&Hints::default(), &record, &RunRecord::default());
+        assert_completed_knowledge(&loaded);
+    }
+
+    fn assert_completed_knowledge(loaded: &Killers) {
+        assert_eq!(loaded.hint("fedcba987654"), Some(&killer("tests::completed")), "{loaded:?}");
+        let hints = loaded.generalized().supported().unwrap();
+        assert_eq!(hints.binaries.len(), 1);
+        assert_eq!(hints.binaries[0].file, Utf8Path::new("src/completed.rs"));
+        let candidate = &hints.binaries[0].candidates[0];
+        assert_eq!(
+            (
+                candidate.seeds,
+                candidate.hits,
+                candidate.misses,
+                candidate.measured_ms,
+                candidate.samples,
+                candidate.order
+            ),
+            (2, 3, 1, 37, 2, 11)
+        );
+        assert_eq!(
+            candidate.candidate,
+            BinaryHint {
+                package: "alpha".into(),
+                target: "lib".into()
+            }
+        );
     }
 
     #[test]
@@ -376,6 +502,41 @@ mod tests {
         assert_eq!(target.binaries, newer.binaries);
         assert_eq!(target.test_sets, newer.test_sets);
         assert_eq!(target.reach, newer.reach);
+    }
+
+    #[test]
+    fn indexed_merge_preserves_last_duplicate_precedence_and_order() {
+        let item = |name: &str, test: &str| ItemHints {
+            file: "src/lib.rs".into(),
+            item: name.into(),
+            candidates: vec![ranked(killer(test))],
+        };
+        let binary = |file: &str, target: &str| FileBinaryHints {
+            file: file.into(),
+            candidates: vec![ranked(BinaryHint {
+                package: "subject".into(),
+                target: target.into(),
+            })],
+        };
+        let mut target = GeneralizedHints::empty_supported();
+        target.items = vec![item("replace", "old"), item("keep", "keep"), item("replace", "older")];
+        target.binaries = vec![binary("src/a.rs", "old"), binary("src/keep.rs", "keep")];
+        let mut newer = GeneralizedHints::empty_supported();
+        newer.items = vec![item("replace", "first"), item("other", "other"), item("replace", "last")];
+        newer.binaries = vec![binary("src/a.rs", "first"), binary("src/b.rs", "other"), binary("src/a.rs", "last")];
+        Killers::merge_generalized(&mut target, newer);
+        assert_eq!(
+            target.items,
+            vec![item("keep", "keep"), item("other", "other"), item("replace", "last")]
+        );
+        assert_eq!(
+            target.binaries,
+            vec![
+                binary("src/keep.rs", "keep"),
+                binary("src/b.rs", "other"),
+                binary("src/a.rs", "last")
+            ]
+        );
     }
 
     #[test]

@@ -213,7 +213,13 @@ impl Mutant {
             // The `Either` wrapper an `IterBlock` splices around both arms is scaffolding the
             // reader never wrote and cannot act on, so the change is reported as the replacement
             // alone, exactly as for any other body.
-            Shape::Expr | Shape::Block | Shape::IterBlock | Shape::IterExpr | Shape::Continue | Shape::Break => {
+            Shape::Expr
+            | Shape::Block
+            | Shape::IterBlock
+            | Shape::IterExpr
+            | Shape::IterWrappedBlock { .. }
+            | Shape::Continue
+            | Shape::Break => {
                 format!("replace {} with {}", one_line(&self.original, 40), one_line(&self.replacement, 32))
             }
         }
@@ -248,6 +254,20 @@ mod tests {
 
     use super::*;
     use crate::fixtures;
+
+    #[test]
+    fn one_line_truncation_preserves_both_ends_and_uses_the_requested_character_budget() {
+        for (text, width, expected) in [
+            ("alpha\n  beta\tgamma", 40, "alpha beta gamma"),
+            ("abcdefghijk", 7, "ab...jk"),
+            ("abcdefghijk", 8, "ab...ijk"),
+            ("界甲乙丙丁戊己庚", 7, "界甲...己庚"),
+            ("abcdefghijk", 3, "..."),
+            ("a b", 3, "a b"),
+        ] {
+            assert_eq!(one_line(text, width), expected, "{text:?} at width {width}");
+        }
+    }
 
     /// A minimal mutant, with only the fields `summary` reads set to something meaningful.
     ///

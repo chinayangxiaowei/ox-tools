@@ -4,7 +4,7 @@
 [package]
 name = "cargo-gamma-unsafe"
 description = "The platform calls cargo-gamma cannot make safely, behind a safe interface"
-version = "0.2.1"
+version = "0.3.0"
 readme = "README.md"
 keywords = ["cargo", "mutation-testing", "testing"]
 categories = ["development-tools::testing"]
@@ -57,6 +57,9 @@ windows-sys = { workspace = true, features = [
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+cargo-gamma-rt = { workspace = true }
 
 [[test]]
 name = "loom"

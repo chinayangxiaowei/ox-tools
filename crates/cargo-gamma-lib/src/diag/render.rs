@@ -97,16 +97,32 @@ pub fn render(plan: &Plan, session: Option<&Session>, jobs: usize, wall: Duratio
     let _ = writeln!(text, "outcomes  {}", counts.join(", "));
 
     if let Some(session) = session {
+        // #[gamma::skip(call_result.default, reason = "write_session returns unit and this mutator still executes the call, replacing unit with unit")]
         write_session(&mut text, session);
     }
 
+    // #[gamma::skip(call_result.default, reason = "write_throughput returns unit and this mutator still executes the call, replacing unit with unit")]
     write_throughput(&mut text, &plan.mutants, session, jobs, testing);
+    // #[gamma::skip(call_result.default, reason = "write_slowest returns unit and this mutator still executes the call, replacing unit with unit")]
     write_slowest(&mut text, &plan.mutants);
-    write_breakdown(&mut text, "mutator", &group(&plan.mutants, |mutant| mutant.mutator.to_string()));
-    write_breakdown(&mut text, "package", &group(&plan.mutants, |mutant| mutant.package.to_string()));
-    write_breakdown(&mut text, "file", &group(&plan.mutants, |mutant| mutant.file.to_string()));
+    {
+        let buckets = group(&plan.mutants, |mutant| mutant.mutator.to_string());
+        // #[gamma::skip(call_result.default, reason = "write_breakdown returns unit and this mutator still renders the same buckets before replacing unit with unit")]
+        write_breakdown(&mut text, "mutator", &buckets);
+    }
+    {
+        let buckets = group(&plan.mutants, |mutant| mutant.package.to_string());
+        // #[gamma::skip(call_result.default, reason = "write_breakdown returns unit and this mutator still renders the same buckets before replacing unit with unit")]
+        write_breakdown(&mut text, "package", &buckets);
+    }
+    {
+        let buckets = group(&plan.mutants, |mutant| mutant.file.to_string());
+        // #[gamma::skip(call_result.default, reason = "write_breakdown returns unit and this mutator still renders the same buckets before replacing unit with unit")]
+        write_breakdown(&mut text, "file", &buckets);
+    }
 
     if let Some(session) = session {
+        // #[gamma::skip(call_result.default, reason = "write_binaries returns unit and this mutator still executes the call, replacing unit with unit")]
         write_binaries(&mut text, session);
     }
 
@@ -124,9 +140,13 @@ fn write_session(text: &mut String, session: &Session) {
         if session.widened { "widened to the workspace" } else { "kept" }
     );
 
+    // #[gamma::skip(call_result.default, reason = "write_rounds returns unit and this mutator still executes the call, replacing unit with unit")]
     write_rounds(text, session);
+    // #[gamma::skip(call_result.default, reason = "write_ordering returns unit and this mutator still executes the call, replacing unit with unit")]
     write_ordering(text, session);
+    // #[gamma::skip(call_result.default, reason = "write_census returns unit and this mutator still executes the call, replacing unit with unit")]
     write_census(text, session);
+    // #[gamma::skip(call_result.default, reason = "write_phases returns unit and this mutator still executes the call, replacing unit with unit")]
     write_phases(text, session);
 
     let _ = writeln!(
@@ -180,39 +200,23 @@ fn write_session(text: &mut String, session: &Session) {
 
 /// Reports where the run's time went, phase by phase.
 ///
-/// The build total folds the copy, the preflight and the compile into one number, and the census's
-/// cost hides inside it too — so whether the per-test census pays for itself against the launches it
-/// spares the sweep cannot be read from the aggregates alone. These phase timings are what make that
-/// trade visible: the census's `walked` count against the sweep's `launches`, with the probe count
-/// saying whether the killer hints earn their keep. The copy and the preflight are components of the
-/// build, and the census and the sweep of the testing window, so neither set sums to its aggregate.
+/// The copy and preflight are components of the build; the sweep is a component of the testing
+/// window. The probe and launch counts show whether hints reduced the work done during that window.
 fn write_phases(text: &mut String, session: &Session) {
     let phases = &session.phases;
 
     let _ = writeln!(
         text,
-        "phases    copy {}, preflight {}, baseline {}, census {}",
+        "phases    copy {}, preflight {}, baseline {}",
         human(phases.copy),
         human(phases.preflight),
-        human(session.baseline_wall),
-        phases.census_status.as_str()
+        human(session.baseline_wall)
     );
-
-    if let Some(census) = &phases.census {
-        let _ = writeln!(
-            text,
-            "          census {}, {} over {} binaries (up to {} sweep savings)",
-            human(census.elapsed),
-            quantity(census.walked, "test"),
-            census.binaries,
-            human(census.maximum_savings),
-        );
-    }
 
     if let Some(sweep) = &phases.sweep {
         let _ = writeln!(
             text,
-            "          sweep {}, {} launches, {} probes, {} saved ({} from reach; exact {}/{}, generalized {}/{}, {} rejected)",
+            "          sweep {}, {} launches, {} probes, {} saved ({} from reach; exact {}/{}, inferred tests {}/{}, {} rejected)",
             human(sweep.elapsed),
             sweep.launches,
             sweep.probes,
@@ -220,20 +224,14 @@ fn write_phases(text: &mut String, session: &Session) {
             sweep.reach_launches_saved,
             sweep.exact_hits,
             sweep.exact_probes,
-            sweep.generalized_hits,
-            sweep.generalized_probes,
-            sweep.generalized_rejected,
+            sweep.inferred_hits,
+            sweep.inferred_probes,
+            sweep.inferred_rejected,
         );
         let _ = writeln!(
             text,
-            "          selection {} whole, {} narrowed, {} hinted ({} fell back), {} uncovered; {} of {} named tests selected",
-            sweep.whole_selections,
-            sweep.case_selections,
-            sweep.hinted_selections,
-            sweep.hinted_fallbacks,
-            sweep.uncovered_selections,
-            sweep.selected_tests,
-            sweep.available_tests,
+            "          selection {} whole, {} uncovered",
+            sweep.whole_selections, sweep.uncovered_selections,
         );
     }
 }
@@ -662,6 +660,178 @@ mod tests {
     }
 
     #[test]
+    fn survivor_throughput_distribution_filters_zeroes_and_rounds_rank_boundaries() {
+        let mutants = [
+            mutant("a.rs", "m", Outcome::Killed, 0),
+            mutant("a.rs", "m", Outcome::Killed, 900),
+            mutant("a.rs", "m", Outcome::Survived, 100),
+            mutant("a.rs", "m", Outcome::Timeout, 300),
+            mutant("a.rs", "m", Outcome::Killed, 200),
+        ];
+        let mut text = String::new();
+        write_throughput(&mut text, &mutants, None, 7, Duration::from_millis(500));
+        assert_eq!(
+            text,
+            "mutants   4 evaluated, 1.5s cpu, 3.0 effective jobs of 7\n          min 100ms, p50 300ms, p90 900ms, p99 900ms, max 900ms\n"
+        );
+        for (fraction, expected) in [(0.0, 100), (0.49, 200), (0.5, 300), (0.9, 900), (1.0, 900)] {
+            assert_eq!(
+                percentile(&[100, 200, 300, 900].map(Duration::from_millis), fraction),
+                Duration::from_millis(expected)
+            );
+        }
+        let mut text = String::new();
+        write_throughput(&mut text, &mutants[..1], None, 7, Duration::ZERO);
+        assert_eq!(text, "mutants   nothing was run\n");
+    }
+
+    #[test]
+    fn survivor_ranked_tables_keep_ten_rows_in_cost_order_and_report_the_total_population() {
+        let mutants: Vec<_> = (1..=11)
+            .map(|index| mutant(&format!("f{index:02}.rs"), "m", Outcome::Survived, index * 100))
+            .collect();
+        let mut text = String::new();
+        write_slowest(&mut text, &mutants);
+        let rows: Vec<_> = text.lines().skip(2).collect();
+        assert_eq!(rows.len(), 10);
+        assert!(rows[0].contains("f11.rs"));
+        assert!(rows[9].contains("f02.rs"));
+        assert!(!text.contains("f01.rs"));
+        let mut breakdown = String::new();
+        write_breakdown(&mut breakdown, "file", &group(&mutants, |mutant| mutant.file.to_string()));
+        assert!(breakdown.starts_with("\nby file (10 of 11)\n"));
+        let rows: Vec<_> = breakdown.lines().skip(3).collect();
+        assert_eq!(rows.len(), 10);
+        assert!(rows[0].ends_with("f11.rs"));
+        assert!(rows[9].ends_with("f02.rs"));
+        let mut empty = String::new();
+        write_slowest(&mut empty, &[]);
+        write_breakdown(&mut empty, "file", &HashMap::default());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn survivor_ordering_diagnostics_show_either_nonzero_dimension() {
+        for (offered, rounds, expected) in [
+            (0, 0, ""),
+            (
+                1,
+                0,
+                "hints     1 mutant front-loaded over 0 probe rounds, 2 confirmed unviable by the compiler\n",
+            ),
+            (
+                0,
+                1,
+                "hints     0 mutants front-loaded over 1 probe round, 2 confirmed unviable by the compiler\n",
+            ),
+            (
+                3,
+                4,
+                "hints     3 mutants front-loaded over 4 probe rounds, 2 confirmed unviable by the compiler\n",
+            ),
+        ] {
+            let mut session = session(Vec::new());
+            session.ordering.offered = offered;
+            session.ordering.rounds = rounds;
+            session.ordering.confirmed = 2;
+            let mut text = String::new();
+            write_ordering(&mut text, &session);
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn survivor_complete_diagnostic_render_retains_jobs_slowest_tables_and_all_dimension_labels() {
+        let mut first = mutant("left.rs", "arith.add_to_sub", Outcome::Killed, 100);
+        first.package = "left-package".into();
+        let mut second = mutant("right.rs", "relational.lt_to_le", Outcome::Survived, 200);
+        second.package = "right-package".into();
+        let plan = plan(vec![first, second]);
+        let mut measured = session(Vec::new());
+        measured.ordering.offered = 3;
+        measured.ordering.rounds = 2;
+        measured.ordering.confirmed = 1;
+        let text = render(&plan, Some(&measured), 7, Duration::from_secs(10));
+        assert!(text.contains("0.3 effective jobs of 7"), "{text}");
+        assert!(
+            text.contains("hints     3 mutants front-loaded over 2 probe rounds, 1 confirmed unviable by the compiler\n"),
+            "{text}"
+        );
+        let slowest = text
+            .split_once("\nslowest mutants\n")
+            .unwrap()
+            .1
+            .split_once("\nby mutator")
+            .unwrap()
+            .0;
+        assert!(slowest.contains("left.rs"), "{slowest}");
+        assert!(slowest.contains("right.rs"), "{slowest}");
+        let mut previous = 0;
+        for label in ["mutator", "package", "file"] {
+            let heading = format!("\nby {label} (2 of 2)\n");
+            let position = text.find(&heading).unwrap();
+            assert!(position > previous, "diagnostic dimensions must retain their user-visible order");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn survivor_census_and_binary_rank_limits_preserve_ten_rows_and_exact_omitted_counts() {
+        let binaries: Vec<_> = (1..=11)
+            .map(|index| {
+                let mut binary = crate::testing::test_binary(&format!("target/binary-{index:02}"));
+                binary.baseline = Duration::from_millis(index * 100);
+                binary
+            })
+            .collect();
+        let mut measured = session(binaries);
+        measured.census = (1..=11)
+            .map(|index| crate::exec::Withdrawal {
+                package: format!("package-{index:02}"),
+                code: format!("E{index:04}"),
+                category: "fixture category".into(),
+                replacement_site: true,
+                mutator: "literal.int_decrement".into(),
+                mutants: index,
+            })
+            .collect();
+        let mut census = String::new();
+        write_census(&mut census, &measured);
+        assert_eq!(census.lines().count(), 12, "{census}");
+        assert!(census.contains("E0010"), "{census}");
+        assert!(!census.contains("E0011"), "{census}");
+        assert!(
+            census.ends_with("  1 withdrawal group omitted, accounting for 11 mutants\n"),
+            "{census}"
+        );
+        let mut binaries = String::new();
+        write_binaries(&mut binaries, &measured);
+        let rows: Vec<_> = binaries.lines().skip(3).collect();
+        assert_eq!(rows.len(), 10, "{binaries}");
+        assert!(rows[0].ends_with("binary-11"), "{binaries}");
+        assert!(rows[9].ends_with("binary-02"), "{binaries}");
+        assert!(!binaries.contains("binary-01"), "{binaries}");
+        let mut empty = String::new();
+        write_binaries(&mut empty, &session(Vec::new()));
+        assert_eq!(empty, "");
+    }
+
+    #[test]
+    fn survivor_zero_duration_convergence_rounds_report_zero_not_one_percent() {
+        let mut measured = session(Vec::new());
+        for round in &mut measured.rounds_taken {
+            round.elapsed = Duration::ZERO;
+        }
+        let mut text = String::new();
+        write_rounds(&mut text, &measured);
+        assert!(
+            text.starts_with("rounds    first 0ms, then 0ms over 1 further round (0% of the build's rounds)\n"),
+            "{text}"
+        );
+        assert!(!crowded_timeout(Duration::from_secs(1), Duration::ZERO));
+    }
+
+    #[test]
     fn a_percentile_of_nothing_is_zero_rather_than_a_panic() {
         assert_eq!(percentile(&[], 0.9), Duration::ZERO);
     }
@@ -795,32 +965,54 @@ mod tests {
         assert!(text.contains(&format!("disk      2.0 KB under {base}")), "{text}");
     }
 
-    /// The build total folds the copy, the preflight and the census into one number, so the phase
-    /// line is the only place the dump says where the fixed and testing time actually went — the
-    /// census's walk against the sweep's launches, with the probe count on whether the hints paid.
+    #[test]
+    fn telemetry_does_not_change_terminal_diagnostic_prose() {
+        let plan = plan(Vec::new());
+        let mut live = session(Vec::new());
+        live.scratch = r"C:\gamma-in-process\missing".into();
+        live.phases.sweep = Some(crate::exec::SweepCost {
+            elapsed: Duration::from_secs(42),
+            launches: 47,
+            probes: 12,
+            ..crate::exec::SweepCost::default()
+        });
+        let before = render(&plan, Some(&live), 4, Duration::from_mins(1));
+        live.phases.sweep.as_mut().unwrap().accounting = Some(crate::exec::SweepAccounting {
+            complete: true,
+            initial_population: Some(43_164),
+            initial_exact_hints: Some(34_603),
+            initial_killer_confirmed: Some(245),
+            exact: crate::exec::AttemptCost {
+                launches: 50,
+                execution_ms: 200_000,
+                ..crate::exec::AttemptCost::default()
+            },
+            duplicate_launches_avoided: 999,
+            ..crate::exec::SweepAccounting::default()
+        });
+        assert_eq!(render(&plan, Some(&live), 4, Duration::from_mins(1)), before);
+    }
+
+    /// Phase timings distinguish fixed preparation from the sweep's launches and hint probes.
     #[test]
     fn a_live_run_reports_where_each_phase_spent_its_time() {
         let live = Session {
             phases: crate::exec::Phases {
+                initial_hints: None,
                 copy: Duration::from_secs(1),
                 preflight: Duration::from_secs(2),
-                census_status: crate::exec::CensusStatus::Complete,
-                census: Some(crate::exec::CensusCost {
-                    elapsed: Duration::from_secs(8),
-                    walked: 1_681,
-                    binaries: 30,
-                    ..crate::exec::CensusCost::default()
-                }),
                 sweep: Some(crate::exec::SweepCost {
                     elapsed: Duration::from_secs(42),
                     launches: 47,
                     probes: 12,
                     exact_probes: 5,
                     exact_hits: 4,
-                    generalized_probes: 7,
-                    generalized_hits: 3,
+                    inferred_probes: 7,
+                    inferred_hits: 3,
                     launches_saved: 9,
                     reach_launches_saved: 4,
+                    whole_selections: 31,
+                    uncovered_selections: 6,
                     ..crate::exec::SweepCost::default()
                 }),
             },
@@ -830,21 +1022,11 @@ mod tests {
         let text = render(&plan(Vec::new()), Some(&live), 4, Duration::from_mins(1));
 
         assert!(text.contains("phases    copy 1.0s, preflight 2.0s, baseline 2.0s"), "{text}");
-        assert!(text.contains("census 8.0s, 1681 tests over 30 binaries"), "{text}");
         assert!(
-            text.contains("sweep 42.0s, 47 launches, 12 probes, 9 saved (4 from reach; exact 4/5, generalized 3/7, 0 rejected)"),
+            text.contains("sweep 42.0s, 47 launches, 12 probes, 9 saved (4 from reach; exact 4/5, inferred tests 3/7, 0 rejected)"),
             "{text}"
         );
-    }
-
-    /// A census that did not run leaves no census line, because a run that was not asked to census
-    /// did not census in zero time — it did not census, and inventing a zero would say otherwise.
-    #[test]
-    fn a_live_run_without_a_census_prints_no_census_phase() {
-        let text = render(&plan(Vec::new()), Some(&session(Vec::new())), 4, Duration::from_secs(20));
-
-        assert!(text.contains("phases    copy"), "{text}");
-        assert!(!text.contains("census 0"), "an unrun census must not be printed: {text}");
+        assert!(text.contains("selection 31 whole, 6 uncovered"), "{text}");
     }
 
     /// The withdrawal count says a number; only the codes behind it say whether the number is a

@@ -328,6 +328,10 @@ mod tests {
         })
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
     fn checks_just_template_includes_all_catalog_checks() {
         let checks = all_check_bodies();
@@ -348,14 +352,23 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
-    fn checks_fail_closed_and_preserve_opted_out_tests() {
+    fn checks_fail_closed_and_delegate_coverage_safety() {
         let checks = all_check_bodies();
         for needle in [
             "anvil-bolero: target discovery failed",
             "${prefix}: cargo metadata failed",
-            "running tests without coverage for opted-out packages",
-            "all affected packages opted out of coverage",
+            "anvil-llvm-cov: no affected packages; skipping",
+            "coverage-gate run @packageArgs @collectionArgs",
+            "'--configuration', 'all-features'",
+            "'--configuration', 'no-default-features'",
+            "'--coverage-dir', 'target/coverage'",
+            "'--no-coverage-target', 'aarch64-pc-windows-msvc'",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "could not resolve the cargo-careful executable",
             "anvil-mutants-full: aarch64-pc-windows-msvc",
         ] {
@@ -365,7 +378,7 @@ mod tests {
             assert!(checks.contains(needle), "checks tree missing advisory behavior '{needle}'");
         }
         assert!(
-            checks.contains("bolero list --profile release --package $packageName"),
+            checks.contains("bolero list --profile release --package '{cargo-spec}'"),
             "bolero discovery must use the execution profile once per affected package"
         );
         assert!(
@@ -377,6 +390,109 @@ mod tests {
             "bolero discovery must not pass repeated --package arguments"
         );
         assert!(!checks.contains("bolero list failed; assuming no targets"));
+        // Each discovered target runs under the member that reported it, and
+        // one failing target does not stop the remaining targets.
+        for needle in [
+            "$target | Add-Member -NotePropertyName anvilPackageSpec -NotePropertyValue $packageSpec",
+            "each --package $t.anvilPackageSpec '--' cargo '+{{ rust_nightly }}' bolero test --profile release --engine libfuzzer -T 60s --package '{cargo-spec}' $testName",
+            "if ($LASTEXITCODE -ne 0) { $failed = $true }",
+            "if ($failed) { exit 1 }",
+        ] {
+            assert!(checks.contains(needle), "bolero dispatch contract missing '{needle}'");
+        }
+    }
+
+    // Protect ordinal member selection and source-qualified example execution.
+    #[test]
+    fn examples_select_and_run_members_by_exact_identity() {
+        let examples = CHECK_FILES
+            .iter()
+            .find_map(|(path, body)| path.ends_with("/examples.just").then_some(*body))
+            .expect("examples.just is registered in CHECK_FILES");
+        // Package names that differ only by case are distinct members, so
+        // selection must compare ordinally rather than with `-in`/`-notin`.
+        for needle in [
+            "$excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)",
+            "$selectedIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)",
+            "[string]::Equals($package, $p.name, [System.StringComparison]::Ordinal)",
+        ] {
+            assert!(examples.contains(needle), "examples selection must be ordinal: missing '{needle}'");
+        }
+        assert!(!examples.contains("-notin $excluded"));
+        // The metadata package ID is a source-qualified package spec on every
+        // supported Cargo; a manifest path would follow `default-members`.
+        assert!(examples.contains("'run', '--package', $target.id, '--example', $target.example"));
+        assert!(examples.contains("$start.WorkingDirectory = [string]$meta.workspace_root"));
+        assert!(!examples.contains("'--manifest-path', $target"));
+    }
+
+    // An explicitly selected opted-out package must skip before compilation;
+    // metadata discovery must not shadow the caller's package selector.
+    #[test]
+    fn miri_opt_out_reads_the_callers_package_selection() {
+        let miri = CHECK_FILES
+            .iter()
+            .find_map(|(path, body)| path.ends_with("/miri.just").then_some(*body))
+            .expect("miri.just is registered in CHECK_FILES");
+        assert!(!miri.contains("foreach ($package in"));
+        assert!(miri.contains("} elseif ($excludedPackages.Contains(($package -split '@', 2)[0])) {"));
+    }
+
+    // Package discovery must use the compiler validated for Miri, not the repository default.
+    #[test]
+    fn miri_selection_uses_the_validated_toolchain() {
+        let miri = CHECK_FILES
+            .iter()
+            .find_map(|(path, body)| path.ends_with("/miri.just").then_some(*body))
+            .expect("miri.just is registered in CHECK_FILES");
+        let (before_selection, _) = miri
+            .split_once("    $include = (& \"{{ just_executable() }}\" _anvil-impact-exclude affected)")
+            .expect("Miri resolves affected packages through workspace exclusions");
+        assert!(before_selection.contains("    $env:RUSTUP_TOOLCHAIN = '{{ rust_nightly }}'"));
+    }
+
+    // A missing MSRV skips without discovery; otherwise discovery inherits the validated compiler.
+    #[test]
+    fn msrv_selection_uses_the_validated_toolchain_after_the_no_msrv_skip() {
+        let msrv = CHECK_FILES
+            .iter()
+            .find_map(|(path, body)| path.ends_with("/msrv-test.just").then_some(*body))
+            .expect("msrv-test.just is registered in CHECK_FILES");
+        let (before_selection, _) = msrv
+            .split_once("    $include = (& \"{{ just_executable() }}\" _anvil-impact-exclude affected)")
+            .expect("MSRV tests resolve affected packages through workspace exclusions");
+        let (before_binding, _) = before_selection
+            .split_once("    $env:RUSTUP_TOOLCHAIN = $toolchain")
+            .expect("package discovery must inherit the validated MSRV toolchain");
+        assert!(before_binding.contains("    if ($resolverExit -ne 0) { exit $resolverExit }"));
+        assert!(before_binding.contains(
+            "    if ([string]::IsNullOrWhiteSpace($toolchain)) {\n\
+             \x20       Write-Host 'anvil-msrv-test: no root MSRV declared; skipping'\n\
+             \x20       exit 0\n\
+             \x20   }"
+        ));
+        assert!(!before_selection.contains("& cargo"));
+    }
+
+    // Both probes must recognize `cargo install --list` entries from path and Git installs.
+    #[test]
+    fn tool_version_probe_accepts_source_installs() {
+        assert_eq!(
+            TOOLS_JUST.matches(r"' v(\S+?)(?: \(.*\))?:$'").count(),
+            2,
+            "install and check probes must both accept source-qualified install lines"
+        );
+    }
+
+    // Each resolver runs in its own PowerShell process and needs its own runtime checks.
+    #[test]
+    fn selection_resolvers_enable_strict_mode() {
+        for declaration in ["_anvil-impact-exclude tier:", "_anvil-workspace-exclude +specs:"] {
+            let (_, body) = IMPACT_JUST
+                .split_once(declaration)
+                .expect("both workspace selection resolvers are registered in impact.just");
+            assert!(body.starts_with("\n    Set-StrictMode -Version 3.0\n"), "{declaration}");
+        }
     }
 
     #[test]
@@ -418,9 +534,13 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
     fn impact_scoped_checks_propagate_scope_resolution_failures() {
-        const CALL: &str = "$include = (& \"{{ just_executable() }}\" _anvil-impact-include";
+        const CALL: &str = "$include = (& \"{{ just_executable() }}\" _anvil-impact-";
         let mut scoped = 0;
         for (path, body) in CHECK_FILES {
             let lines: Vec<&str> = body.lines().collect();
@@ -491,7 +611,13 @@ mod tests {
     #[test]
     fn impact_recipe_is_defined_and_reuses_shared_helpers() {
         // The single impact building block: snapshot + compute + resolve.
-        for needle in ["anvil-impact:", "_anvil-impact-snapshot:", "_anvil-impact-include tier:"] {
+        for needle in [
+            "anvil-impact:",
+            "_anvil-impact-snapshot:",
+            "_anvil-impact-include tier:",
+            "_anvil-impact-exclude tier:",
+            "_anvil-workspace-exclude +specs:",
+        ] {
             assert!(IMPACT_JUST.contains(needle), "impact.just missing recipe '{needle}'");
         }
         // It orchestrates around the shared helpers rather than duplicating
@@ -506,6 +632,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
     fn every_check_matches_its_declared_impact_policy() {
         // Single source of truth for each check's impact policy. The catalog
@@ -542,7 +672,11 @@ mod tests {
             // word. A recipe must resolve exactly one category, never two.
             let calls: Vec<&str> = ["modified", "affected", "required"]
                 .into_iter()
-                .filter(|cat| execution_body.contains(&format!("_anvil-impact-include {cat}")))
+                .filter(|cat| {
+                    ["include", "exclude"]
+                        .iter()
+                        .any(|resolver| execution_body.contains(&format!("_anvil-impact-{resolver} {cat}")))
+                })
                 .collect();
             assert!(
                 calls.len() <= 1,
@@ -558,7 +692,7 @@ mod tests {
                 None => {
                     // Unscoped: no cache dependency, no include call.
                     assert!(
-                        !execution_body.contains("_anvil-impact-include"),
+                        !execution_body.contains("_anvil-impact-include") && !execution_body.contains("_anvil-impact-exclude"),
                         "{path} is declared Unscoped but calls _anvil-impact-include"
                     );
                     assert!(!depends_on_impact, "{path} is declared Unscoped but depends on anvil-impact");
@@ -577,8 +711,8 @@ mod tests {
                         "{path} reads the impact cache but does not depend on anvil-impact"
                     );
                     assert!(
-                        execution_body.contains("$include = (& \"{{ just_executable() }}\" _anvil-impact-include"),
-                        "{path} must capture _anvil-impact-include into a local $include variable"
+                        execution_body.contains("$include = (& \"{{ just_executable() }}\" _anvil-impact-"),
+                        "{path} must capture its impact resolver into a local $include variable"
                     );
                 }
             }
@@ -822,6 +956,10 @@ mod tests {
         assert!(!TOOLS_JUST.contains("rustup target add --toolchain"));
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
     fn setup_graph_owns_stable_toolchain_provisioning() {
         assert!(
@@ -833,12 +971,20 @@ mod tests {
             "every shared Cargo-tool installation must provision stable first"
         );
         assert!(
-            TOOLS_JUST.contains("& just _install-tool-core cargo-bolero"),
-            "platform-gated installers must use the already-provisioned core helper"
+            TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _install-tool-core cargo-bolero {{cargo_bolero_version}} {{installer}}"#),
+            "the bolero installer must invoke the generated just executable for its core helper"
         );
         assert!(
-            TOOLS_JUST.contains("& just _install-tool-core cargo-mutants"),
-            "platform-gated installers must use the already-provisioned core helper"
+            TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _install-tool-core cargo-mutants {{cargo_mutants_version}} {{installer}}"#),
+            "the mutants installer must invoke the generated just executable for its core helper"
+        );
+        assert!(
+            TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _check-tool cargo-bolero {{cargo_bolero_version}}"#),
+            "the bolero prerequisite check must invoke the generated just executable"
+        );
+        assert!(
+            TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _check-tool cargo-mutants {{cargo_mutants_version}}"#),
+            "the mutants prerequisite check must invoke the generated just executable"
         );
         for component in ["clippy", "rustfmt"] {
             let expected = format!("anvil-component-default-{component}-install: anvil-toolchain-stable-install");
@@ -879,6 +1025,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
     fn checks_do_not_invoke_an_implicit_default_cargo() {
         for (path, body) in CHECK_FILES {
@@ -944,6 +1094,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain exhaustive generated-recipe contract scans; focused recipe tests preserve Miri coverage"
+    )]
     #[test]
     fn checks_just_has_no_floating_nightly_invocations() {
         let checks = all_check_bodies();

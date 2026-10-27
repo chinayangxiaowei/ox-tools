@@ -166,6 +166,7 @@ fn tokenize(pattern: &str) -> Vec<Token> {
             '?' => {
                 tokens.push(Token::One);
                 // #[gamma::skip(assign.add_to_sub, reason = "moving the tokenizer backwards after `?` makes this loop allocate tokens until memory exhaustion instead of producing a result")]
+                // #[gamma::skip(stmt.delete_assign, tag = "outofmemory", reason = "not consuming the question mark allocates tokens forever")]
                 index += 1;
             }
             '*' => {
@@ -203,5 +204,58 @@ mod tests {
         assert_eq!(row_width(0), 1);
         assert_eq!(row_width(7), 8);
         assert!(matches_glob("src/*.rs", "src/lib.rs"));
+    }
+
+    #[test]
+    fn survivor_glob_scratch_reuse_cannot_carry_matches_between_paths_or_tokens() {
+        let mut scratch = Scratch::default();
+        for _ in 0..2 {
+            for (pattern, text, expected) in [
+                ("**", "a/b/c", true),
+                ("**", "", true),
+                ("**a", "", false),
+                ("*", "", true),
+                ("?", "", false),
+                ("a", "a", true),
+                ("a", "ab", false),
+                ("a", "b", false),
+                ("ab", "b", false),
+                ("ab", "ab", true),
+                ("**/a", "a", true),
+                ("**/a", "", false),
+                ("**/a", "x/y/a", true),
+                ("a*", "a/b", false),
+                ("*a", "aa", true),
+                ("", "", true),
+                ("", "a", false),
+            ] {
+                assert_eq!(
+                    glob_match(&tokenize(pattern), text, &mut scratch),
+                    expected,
+                    "{pattern:?} / {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn question_marks_and_recursive_prefixes_obey_path_boundaries() {
+        for (pattern, path, expected) in [
+            ("src/?b.rs", "src/ab.rs", true),
+            ("src/?b.rs", "src//b.rs", false),
+            ("src/?b.rs", "src/xb.rs", true),
+            ("src/?b.rs", "src/\0b.rs", true),
+            ("src/?b.rs", "src/界b.rs", true),
+            ("**/lib.rs", "lib.rs", true),
+            ("**/lib.rs", "src/lib.rs", true),
+            ("**/lib.rs", "a/b/lib.rs", true),
+            ("**/lib.rs", "src/notlib.rs", false),
+            ("**/lib.rs", "xlib.rs", false),
+            ("src/**/lib.rs", "src/lib.rs", true),
+            ("src/**/lib.rs", "src/a/b/lib.rs", true),
+            ("src/**/lib.rs", "src/a/b/notlib.rs", false),
+        ] {
+            assert_eq!(matches_glob(pattern, path), expected, "{pattern:?} against {path:?}");
+        }
     }
 }

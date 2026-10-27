@@ -9,6 +9,8 @@ Every subcommand and every option `cargo-gamma` accepts.
 * [The option categories](#the-option-categories)
 * [Where settings come from](#where-settings-come-from)
 * [Passing arguments through](#passing-arguments-through)
+* [Resuming interrupted testing](#resuming-interrupted-testing)
+* [Exact-first adaptive scheduling](#exact-first-adaptive-scheduling)
 * [Understanding uncovered mutants](#understanding-uncovered-mutants)
 * [Exit status](#exit-status)
 * [Full option reference](#full-option-reference)
@@ -72,6 +74,113 @@ is a run over the whole workspace; `cargo gamma list` is the `list` subcommand a
 | `mutators` | List registered mutators and their selection state. |
 | `presets` | List named mutator presets. |
 
+## Exact-first adaptive scheduling
+
+Every campaign uses exact-first adaptive scheduling:
+
+```bash
+cargo gamma run --diag
+```
+
+Exact hinted tests drain across the population first. Each worker then takes
+one unresolved mutant through the remaining stages before claiming another:
+
+1. Run exact hinted killing tests.
+2. Run at most six eligible distinct inferred cases individually in ranked order,
+   under either libtest or nextest, without grouping cases by binary.
+3. Run all inferred full binaries, best-first.
+4. Run remaining reachable full binaries, reusing full-binary results from phase 3.
+
+Fallback tries own-package binaries first, then other eligible binaries. Within
+each tier, binaries with more distinct mutant kills run first; baseline runtime
+and stable identity break ties. Counts include known exact hints and confirmed
+kills discovered during this campaign, without counting reconfirmations twice.
+The ordering is refreshed when each mutant enters fallback and does not change
+final non-killing outcome precedence.
+
+Full-binary discoveries immediately supply hints for queued mutants. Assignment
+preserves package fairness, exploits fresh effective same-function killers, and
+spreads discovery across independent functions according to sibling benefit per
+estimated cost. Repeated transfer misses reduce the function's priority boost
+without retiring its candidates. Same-function siblings remain runnable when
+there is no independent work.
+
+Every confirmed kill settles immediately, without waiting for earlier binaries.
+Each mutant runs one selection at a time; parallelism is across mutants, up to
+the configured job count in every phase. Gamma imposes no additional CPU-count cap
+or aggregate memory reservation. Reduce `--jobs` if concurrent runs exhaust system
+memory. Per-process memory limits and declared named-resource capacities remain
+enforced. Nextest retains
+process-per-test isolation and executes one test process at a time per mutant.
+Control confirmations and configured nextest retries are separate from phase-2
+candidate limits. Passing selected cases never establishes survival.
+
+Baseline harness-thread settings, memory ceilings, named-resource limits, and
+failure confirmation remain in force. Diagnostic accounting records execution-tier
+costs. Snapshots from earlier scheduler policies require a new campaign rather
+than resuming under a different verdict policy.
+
+## Resuming interrupted testing
+
+After CTRL+C during the mutant-testing phase, continue that same campaign with:
+
+```bash
+cargo gamma run --resume-testing
+```
+
+The prepared workspace and test binaries are reused as-is. Discovery, copying,
+instrumentation, builds, and baseline measurement do not
+run again. All completed verdicts are retained; unfinished mutants are retried.
+Selection and test settings are frozen, so live source changes, execution settings
+in `gamma.toml`, new hints, and suppression edits do not alter the resumed
+campaign. Reporting options remain live; `min-score` and `max-flaky` gates are
+read from current configuration unless overridden on the command line. Unrelated
+execution values are not validated on resume, but unknown top-level configuration
+keys are rejected. Use `--dir` and, if necessary,
+`--cache-dir` to identify the existing campaign.
+
+Prepared snapshot schema version 2 rejects older reachability-policy snapshots;
+their settled no-coverage verdicts cannot be safely reused. Start a fresh
+campaign instead of resuming those snapshots.
+
+Resume reports an error if the campaign did not reach testing, already published
+its completed ledger, or has incompatible or corrupt state. When tests remain
+pending, prepared artifacts and the inherited environment must remain unchanged,
+and the host must still support the campaign's execution requirements. If testing finished
+but completed-ledger publication was interrupted, resume publishes the result
+without rerunning mutants, requiring prepared files or binaries, or requiring host
+execution capabilities or the current inherited environment to match. The saved
+snapshot, verdict checksums, campaign identity, and captured source generation
+are still validated; reports use the captured source, not the live checkout.
+It never falls back to starting a new campaign. Only
+campaigns started by a version supporting this option have resumable state;
+older diagnostic progress logs cannot be resumed.
+
+Before starting a new campaign, cargo-gamma checks whether its previous completed
+ledger can be updated. An unsupported record format is refused before discovery
+or execution. Move the named `last-gamma-run.json` to a separate archive path to
+preserve its evidence, then retry. If an older ledger blocked publication after
+testing finished, archive that ledger and use `--resume-testing` to publish the
+new results without rerunning tests. Do not remove the testing snapshot or journal.
+
+`cargo gamma hints`, `cargo gamma suppress`, and `cargo gamma unsuppress` can
+also be used after interruption. Hints and suppressions use the current partial
+campaign's recorded evidence rather than an older completed campaign. Pending
+mutants supply no verdict. Suppression and unsuppression preview edits unless
+`--apply` is passed, and their source-validation safeguards still apply.
+`hints --replace` is the exception: whole-artifact replacement requires a valid
+completed campaign ledger and never uses the interrupted checkpoint.
+
+Sweep measurements are also available without changing the live display.
+Completed diagnostics contain optional `phases.sweep.accounting`, and the private
+campaign base contains `gamma-sweep-live.json` with current accounting and
+`sweepWallMs`. Measurements distinguish initial exact-hint coverage, observed
+confirmation of original killers, runner attempts and time by execution tier,
+confirmation work, and duplicate attempts avoided. Runner attempts are not a
+physical process count; summed concurrent execution time is not wall-clock time.
+Resume retains cumulative measurements without counting replayed snapshots twice.
+Unknown legacy coverage remains unknown.
+
 ## The option categories
 
 The same categories appear in `--help` and in the reference below. Knowing which category a setting
@@ -127,11 +236,32 @@ nothing can follow it:
 cargo gamma run --cargo-arg --offline -- --test-threads=1
 ```
 
+## Compiler exclusions
+
+Before generating mutation guards, campaigns filter exact mutant IDs in
+`compiler-exclusions.json` under the campaign cache. These mutants count as
+unviable without being applied or recompiled. The inventory accumulates
+individually established compiler failures across campaigns, including interrupted
+preparation, and is initialized from earlier completed/incomplete records and
+`gamma-hints.yaml`. Compiler-interaction removals do not enter it.
+
+This is an explicit exclusion policy, not an incremental-cache optimization:
+`--incremental no`, feature changes, and toolchain changes do not disable it.
+To retry a repaired mutant, remove its entry and use `--incremental no` to avoid
+ordinary cached compiler outcomes. An existing inventory is authoritative;
+removing the entire file permits old evidence to be imported again. `--dry-run`
+applies the policy without modifying the inventory; raw candidate listings do not.
+
+The Excluding display shows confirmed counts as they are discovered, including
+historical exclusions, without check or proof counters. Compilation keeps the
+initial pristine validation's package roots and target scope throughout; isolation
+does not repeatedly compile pristine source or widen the feature graph.
+
 ## Understanding uncovered mutants
 
 `uncovered` means cargo-gamma obtained complete, deterministic evidence that no selected runtime
-test activated the mutation site's guard. That evidence can come from an opted-in reachability
-census or from sealed whole-binary observations learned while testing another replacement at the
+test activated the mutation site's guard. That evidence comes from sealed, passing whole-binary
+observations learned while testing another replacement at the
 same stable site. It does not mean that every external coverage report must show the source line as
 missed. `--whole-test-binaries` disables deterministic reach narrowing, so this case-level
 classification is unavailable.
@@ -207,6 +337,22 @@ Run mutation testing
 cargo gamma run [OPTIONS] [-- <TEST_ARGS>...]
 ```
 
+**Run control**
+
+| Option | Value | What it does |
+| --- | --- | --- |
+| `--resume-testing` |  | Continue the interrupted campaign's testing phase using its existing prepared tree. |
+| `--progress` | `<WHEN>` | When to show the progress display. Defaults to `auto`. |
+| `--dashboard` |  | Show a live testing dashboard instead of the progress bar. |
+| `--min-score` | `<PERCENT>` | Fail the run if the assertion-killed mutation score is below this percentage. |
+| `--max-flaky` | `<COUNT>` | Fail if more than this many mutants have an unresolved flaky outcome. |
+| `--incremental` | `<INCREMENTAL>` | How an incremental run reuses the last run: `no` starts cold; `build` reuses compiler unviability and checked execution hints. |
+| `--leak-dirs` |  | Keep an incomplete scratch workspace after errors so it can be inspected. |
+| `--no-baseline` |  | Skip the baseline run. |
+| `--no-confirm` |  | Believe a failing test without re-running it with no mutant active. |
+| `--dry-run` |  | Find and report mutants without building or running anything. |
+| `--no-stall-detection` |  | Wait out the whole budget for every mutant instead of cutting off one that has stopped making progress. |
+
 **Selecting what to mutate**
 
 | Option | Value | What it does |
@@ -239,21 +385,6 @@ cargo gamma run [OPTIONS] [-- <TEST_ARGS>...]
 | `--config` | `<PATH>` | Read configuration from this file instead of `gamma.toml`. |
 | `--no-config` |  | Ignore the configuration file entirely. |
 
-**Run control**
-
-| Option | Value | What it does |
-| --- | --- | --- |
-| `--progress` | `<WHEN>` | When to show the progress display. Defaults to `auto`. |
-| `--dashboard` |  | Show a live testing dashboard instead of the progress bar. |
-| `--min-score` | `<PERCENT>` | Fail the run if the assertion-killed mutation score is below this percentage. |
-| `--max-flaky` | `<COUNT>` | Fail if more than this many mutants have an unresolved flaky outcome. |
-| `--incremental` | `<INCREMENTAL>` | How an incremental run reuses the last run: `no` starts cold; `build` reuses compiler unviability and checked execution hints. |
-| `--leak-dirs` |  | Keep an incomplete scratch workspace after errors so it can be inspected. |
-| `--no-baseline` |  | Skip the baseline run. |
-| `--no-confirm` |  | Believe a failing test without re-running it with no mutant active. |
-| `--dry-run` |  | Find and report mutants without building or running anything. |
-| `--no-stall-detection` |  | Wait out the whole budget for every mutant instead of cutting off one that has stopped making progress. |
-
 **Running tests**
 
 | Option | Value | What it does |
@@ -270,7 +401,6 @@ cargo gamma run [OPTIONS] [-- <TEST_ARGS>...]
 | `--exclude-test` | `<GLOB>` | Do not let these test targets decide a verdict. |
 | `--nextest` |  | Run test binaries through `cargo nextest` for per-test process isolation. |
 | `--test-workspace` |  | Let every workspace package's tests decide a verdict. |
-| `--optimize-test-execution` |  | Measure which individual tests reach each mutation site before testing mutants. |
 | `--whole-test-binaries` |  | Run every selected test in each reachable test binary. |
 
 **Memory**
@@ -526,7 +656,7 @@ cargo gamma suppress [OPTIONS]
 
 | Option | Value | What it does |
 | --- | --- | --- |
-| `-d`, `--dir` | `<PATH>` | Path to the workspace or package whose completed campaign should be used. Defaults to `.`. |
+| `-d`, `--dir` | `<PATH>` | Path to the workspace or package whose latest campaign should be used. Defaults to `.`. |
 | `--apply` |  | Write and verify the generated directives instead of printing the proposed diff. |
 | `--eligible` | `<LIST>` | Which verdicts may be suppressed. Defaults to `timeout,outofmem`. |
 | `--allow-dirty` |  | Edit source files that have uncommitted changes. |
@@ -535,7 +665,7 @@ cargo gamma suppress [OPTIONS]
 
 | Option | Value | What it does |
 | --- | --- | --- |
-| `--cache-dir` | `<PATH>` | Read the completed campaign from this cache directory instead of cargo-gamma's default. |
+| `--cache-dir` | `<PATH>` | Read completed or interrupted testing evidence from this cache directory. |
 
 ### `gamma unsuppress`
 
@@ -628,7 +758,7 @@ cargo gamma hints [OPTIONS]
 
 | Option | Value | What it does |
 | --- | --- | --- |
-| `-d`, `--dir` | `<PATH>` | Path to the workspace or package whose latest completed campaign should be promoted. Defaults to `.`. |
+| `-d`, `--dir` | `<PATH>` | Path to the workspace or package whose latest campaign knowledge should be promoted. Defaults to `.`. |
 
 **Cache**
 
@@ -641,7 +771,7 @@ cargo gamma hints [OPTIONS]
 | Option | Value | What it does |
 | --- | --- | --- |
 | `--dry-run` |  | Report what would be promoted without writing anything. |
-| `--replace` |  | Replace the complete hints artifact instead of merging the completed campaign into it. |
+| `--replace` |  | Replace the complete hints artifact instead of merging the recorded campaign into it. |
 
 ### `gamma clean`
 

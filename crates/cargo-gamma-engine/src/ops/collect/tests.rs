@@ -495,7 +495,11 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: i32, b: i32) -> i32 { a % b }",
         "arith",
-        &[("arith.rem_to_div", "(a) / (b)"), ("arith.rem_to_mul", "(a) * (b)")],
+        &[
+            ("arith.rem_to_div", "(a) / (b)"),
+            ("arith.rem_to_mul", "(a) * (b)"),
+            ("arith.rem_to_add", "(a) + (b)"),
+        ],
     ),
     (
         "fn f(a: i32, b: i32) -> i32 { a & b }",
@@ -543,7 +547,7 @@ const OPERATOR_ORACLE: &[OperatorCase] = &[
     (
         "fn f(a: &mut i32, b: i32) { *a += b; }",
         "assign",
-        &[("assign.add_to_sub", "*a -= (b)")],
+        &[("assign.add_to_sub", "*a -= (b)"), ("assign.add_to_mul", "*a *= (b)")],
     ),
     (
         "fn f(a: &mut i32, b: i32) { *a -= b; }",
@@ -627,7 +631,7 @@ fn the_operator_oracle_covers_every_replacement_the_tables_offer() {
     let pairs: usize = OPERATOR_ORACLE.iter().map(|(_, _, expected)| expected.len()).sum();
 
     assert_eq!(OPERATOR_ORACLE.len(), 28, "one row per binary and compound-assignment operator");
-    assert_eq!(pairs, 42, "one assertion per binary operator mutation");
+    assert_eq!(pairs, 44, "one assertion per operator substitution");
 }
 
 #[test]
@@ -1698,6 +1702,29 @@ fn signed_aliases_prove_zero_decrements() {
 }
 
 #[test]
+fn inherited_primitive_aliases_ignore_later_type_shadows() {
+    for target in ["Signed", "Chained", "Nested"] {
+        let source = format!(
+            "type Signed = i32; type Chained = Signed;
+             fn f() {{ type i32 = u32; type Nested = Chained; let value: {target} = 0; consume(value); }}"
+        );
+        let found = candidates(&source, "@default");
+        let decrements = found
+            .iter()
+            .filter(|candidate| candidate.mutator == "literal.int_decrement" && candidate.replacement == "-1")
+            .collect::<Vec<_>>();
+        assert_eq!(decrements.len(), 1, "{target}: {found:?}");
+        assert_eq!(decrements[0].confidence, Confidence::Proven);
+    }
+    let found = candidates("type Generic<i32> = Option<i32>; fn f() -> Generic<bool> { None }", "fn_value.some");
+    assert_eq!(
+        found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>(),
+        ["Some(true)", "Some(false)"],
+        "an alias's type parameter named like a primitive remains substitutable"
+    );
+}
+
+#[test]
 fn wildcard_imports_do_not_prove_primitive_signedness() {
     let source = "mod aliases; use aliases::*; fn f() -> i32 { 0 }";
 
@@ -2739,6 +2766,42 @@ fn compound_assignment_is_mutated() {
 }
 
 #[test]
+fn unit_increments_keep_subtraction_but_skip_multiplication() {
+    for right in ["1", "1u32", "1_u32", "01", "0b1", "0o1", "0x1u32", "((1))"] {
+        let source = format!("fn f(a: &mut u32) {{ *a += {right}; }}");
+        for selection in ["assign", "@default", "assign.add_to_mul,assign.add_to_sub"] {
+            let found = candidates(&source, selection)
+                .into_iter()
+                .filter(|candidate| candidate.mutator.starts_with("assign."))
+                .map(|candidate| (candidate.mutator, candidate.replacement.to_string()))
+                .collect::<Vec<_>>();
+
+            assert_eq!(found, [("assign.add_to_sub", format!("*a -= ({right})"))], "{source}: {selection}");
+        }
+    }
+}
+
+#[test]
+fn other_increment_operands_keep_multiplication_candidates() {
+    for right in ["0", "2", "-1", "amount", "STEP", "step()", "1 + 0", "{ 1 }", "1 as i32"] {
+        let source = format!(
+            "const STEP: i32 = 1; fn step() -> i32 {{ 1 }}
+             fn f(a: &mut i32, amount: i32) {{ *a += {right}; }}"
+        );
+        let found = candidates(&source, "assign.add_to_mul")
+            .into_iter()
+            .map(|candidate| candidate.replacement.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(found, [format!("*a *= ({right})")], "{source}");
+    }
+
+    let found = candidates("fn f(a: &mut f64) { *a += 1.0; }", "assign.add_to_mul");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].replacement, "*a *= (1.0)");
+}
+
+#[test]
 fn unary_operators_can_be_removed() {
     let found = mutators("fn f(a: i32) -> i32 { -a }", "unary");
 
@@ -3166,6 +3229,27 @@ fn a_match_guard_is_mutated_the_way_a_branch_condition_is() {
     assert!(found.contains(&"match_guard.negate"), "{found:?}");
     assert!(found.contains(&"match_guard.always_true"), "{found:?}");
     assert!(found.contains(&"match_guard.always_false"), "{found:?}");
+}
+
+#[test]
+fn a_comparison_inside_a_match_guard_receives_relational_mutants() {
+    let source = "fn f(v: i32) -> i32 { match v { n if n > 0 => n, _ => 0 } }";
+    let found = candidates(source, "relational");
+
+    assert_eq!(
+        found
+            .iter()
+            .map(|candidate| (candidate.mutator, candidate.replacement.as_str()))
+            .collect::<Vec<_>>(),
+        [("relational.gt_to_ge", "(n) >= (0)"), ("relational.gt_to_lt", "(n) < (0)"),]
+    );
+}
+
+#[test]
+fn a_pattern_literal_before_a_match_guard_is_not_mutated() {
+    let source = "fn f(v: i32, enabled: bool) -> i32 { match v { 1 if enabled => v, _ => v } }";
+
+    assert!(candidates(source, "literal").is_empty());
 }
 
 #[test]
@@ -3988,6 +4072,52 @@ fn removing_not_preserves_the_value_type_of_borrowed_bools() {
     let replacements = found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>();
 
     assert_eq!(replacements, ["*(flag)", "owned"]);
+    assert_eq!(
+        found.iter().map(|candidate| candidate.replacement_index).collect::<Vec<_>>(),
+        [1, 0]
+    );
+}
+
+#[test]
+fn removing_not_emits_one_candidate_per_site_without_speculative_dereferences() {
+    let source = r"
+        fn flags(values: &[(u8, bool)], owned: bool, bits: u32) {
+            values.iter().any(|(_, flag)| !flag);
+            !owned;
+            !bits;
+            !values.is_empty();
+            !unknown();
+        }
+    ";
+    let found = candidates(source, "unary.remove_not");
+    assert_eq!(found.len(), 5, "{found:?}");
+    assert_eq!(
+        found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>(),
+        ["*(flag)", "owned", "bits", "values.is_empty()", "unknown()"]
+    );
+}
+
+#[test]
+fn iterator_boolean_evidence_is_scoped_and_does_not_assume_custom_iterators() {
+    let source = r"
+        struct Custom;
+        impl Custom {
+            fn iter(&self) -> Custom { todo!() }
+            fn any(&self, callback: impl Fn(bool) -> bool) -> bool { todo!() }
+        }
+        fn flags(slice: &[(u8, bool)], vector: Vec<bool>, array: [bool; 2], custom: Custom, flag: bool) {
+            slice.iter().all(|(_, flag)| !flag);
+            vector.iter().any(|flag| !flag);
+            array.iter().any(|flag| !flag);
+            custom.iter().any(|flag| !flag);
+            !flag;
+        }
+    ";
+    let found = candidates(source, "unary.remove_not");
+    assert_eq!(
+        found.iter().map(|candidate| candidate.replacement.as_str()).collect::<Vec<_>>(),
+        ["*(flag)", "*(flag)", "*(flag)", "flag", "flag"]
+    );
 }
 
 #[test]
@@ -4442,21 +4572,72 @@ fn qualified_aliases_do_not_borrow_root_type_default_evidence() {
 fn cross_file_qualified_aliases_do_not_borrow_root_type_default_evidence() {
     let defaults_file = syn::parse_file("struct Value;").expect("the defaults fixture parses");
     let defaults = Defaults::of_in(&defaults_file, &CfgSet::unconditional());
-    let file = SourceFile::parse(
-        "model.rs",
-        "mod model { pub type Value = bool; } fn f() -> model::Value { original() }".to_owned(),
-    )
-    .expect("the candidate fixture parses");
-    let found = collect_with(
-        &file,
-        &Selection::parse("fn_value.default").expect("the selector resolves"),
-        &CfgSet::unconditional(),
-        &defaults,
-    );
+    for source in [
+        "mod model { pub type Value = bool; } fn f() -> model::Value { original() }",
+        "mod model { pub type Value = bool; } use model::Value; fn f() -> Value { original() }",
+    ] {
+        let file = SourceFile::parse("model.rs", source.to_owned()).expect("the candidate fixture parses");
+        let found = collect_with(
+            &file,
+            &Selection::parse("fn_value.default").expect("the selector resolves"),
+            &CfgSet::unconditional(),
+            &defaults,
+        );
 
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].replacement, "Default::default()");
-    assert_eq!(found[0].confidence, Confidence::Optimistic);
+        assert_eq!(found.len(), 1, "{source}: {found:?}");
+        assert_eq!(found[0].replacement, "Default::default()");
+        assert_eq!(found[0].confidence, Confidence::Optimistic);
+    }
+}
+
+#[test]
+fn local_aliases_keep_their_file_module_and_inline_module_identity() {
+    for (inline, defaulted) in [(false, false), (false, true), (true, false), (true, true)] {
+        let derive = if defaulted { "" } else { "#[derive(Default)]" };
+        let root = SourceFile::parse("lib.rs", format!("{derive} struct Value; mod model;")).unwrap();
+        let derive = if defaulted { "#[derive(Default)]" } else { "" };
+        let declarations = format!("{derive} pub struct Value; type Alias = Value; fn f() -> Alias {{ original() }}");
+        let source = if inline {
+            format!("mod nested {{ {declarations} }}")
+        } else {
+            declarations
+        };
+        let file = SourceFile::parse("model.rs", source).unwrap();
+        let cfg = CfgSet::unconditional();
+        let mut defaults = Defaults::of_source_in(&root.ast, &cfg, "lib.rs");
+        defaults.absorb(Defaults::of_source_in(&file.ast, &cfg, "model.rs"));
+        defaults.bind_sources(&[
+            ("lib.rs".into(), "lib.rs".into(), Vec::new()),
+            ("model.rs".into(), "lib.rs".into(), vec!["model".into()]),
+        ]);
+        let found = collect_with(&file, &Selection::parse("fn_value.default").unwrap(), &cfg, &defaults);
+        assert_eq!(
+            found.len(),
+            usize::from(defaulted),
+            "inline={inline}, defaulted={defaulted}: {found:?}"
+        );
+        if defaulted {
+            assert_eq!(found[0].confidence, Confidence::Proven);
+            assert_eq!(found[0].replacement, "Default::default()");
+        }
+    }
+}
+
+#[test]
+fn conditional_let_temporary_borrows_keep_the_binding_and_body_in_one_guard() {
+    for construct in [
+        "if let Some(value) = Some(make().as_str()) { consume(value); }",
+        "while let Some(value) = Some(make().as_str()) { consume(value); break; }",
+        "if true && let Some(value) = Some(make().as_str()) { consume(value); }",
+        "while true && let Some(value) = Some(make().as_str()) { consume(value); break; }",
+    ] {
+        let source = format!("fn f() {{ {construct} }}");
+        let found = candidates(&source, "option.some_to_none");
+        assert_eq!(found.len(), 1, "{source}: {found:?}");
+        assert_eq!(&source[found[0].span.clone()], construct);
+        assert_eq!(found[0].shape, Shape::Expr);
+        assert_eq!(found[0].replacement, construct.replace("Some(make().as_str())", "None"));
+    }
 }
 
 #[test]
@@ -6004,5 +6185,39 @@ fn the_positions_a_stated_value_is_refused_on_emit_no_candidate() {
         let file = SourceFile::parse("fixture.rs", source.to_owned()).unwrap();
 
         let _rejected = check_stated(&file).expect_err("an inert position must be reported rather than silently ignored");
+    }
+}
+
+#[test]
+fn assignment_candidates_do_not_depend_on_unrelated_type_names() {
+    for source in [
+        "struct State { value: std::time::Instant }
+         struct Counter;
+         impl std::ops::AddAssign<i32> for Counter { fn add_assign(&mut self, _: i32) {} }
+         impl std::ops::MulAssign<i32> for Counter { fn mul_assign(&mut self, _: i32) {} }
+         fn target() { let mut value = Counter; value += 2; }",
+        "use std::time::Instant as Clock;
+         fn target(raw: &mut i32) {
+             type Clock = i32;
+             let value: &mut Clock = raw;
+             *value += 2;
+         }",
+        "type Clock = std::time::Instant;
+         fn target(raw: &mut i32) {
+             type Clock = i32;
+             let value: &mut Clock = raw;
+             *value += 2;
+         }",
+        "struct Clock;
+         type Ref<'a, T> = &'a mut T;
+         fn target(mut raw: &mut i32) {
+             use core::primitive::i32 as Clock;
+             let value: &mut Ref<'_, Clock> = &mut raw;
+             **value += 2;
+         }",
+    ] {
+        let found = candidates(source, "assign.add_to_mul");
+        let replacements = found.iter().map(|candidate| candidate.mutator).collect::<Vec<_>>();
+        assert_eq!(replacements, ["assign.add_to_mul"], "{source}: {found:?}");
     }
 }

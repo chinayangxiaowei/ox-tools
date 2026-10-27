@@ -521,6 +521,30 @@ fn combine(answers: &mut dyn Iterator<Item = Verdict>, settles: Verdict, otherwi
 mod tests {
     use super::*;
 
+    #[test]
+    fn ordinary_build_test_predicates_use_declared_cfg_not_hypothetical_unit_target() {
+        let predicate: Meta = syn::parse_quote!(test);
+        let ordinary = CfgSet::parse("unix");
+        assert_eq!(ordinary.decide(&predicate, true), Verdict::No);
+        assert_eq!(ordinary.decide(&predicate, false), Verdict::No);
+        let testing = ordinary.with_test();
+        assert_eq!(testing.decide(&predicate, true), Verdict::Yes);
+        assert_eq!(testing.decide(&predicate, false), Verdict::No);
+        assert_eq!(testing.decide(&syn::parse_quote!(unix), false), Verdict::Yes);
+    }
+
+    #[test]
+    fn malformed_cfg_attrs_and_printed_pairs_are_not_invented() {
+        let set = CfgSet::parse("=\"value\"\nvalid=\"\"\nnonsense=\n");
+        assert_eq!(set.pairs.len(), 1);
+        assert!(set.pairs.contains(&("valid".to_owned(), String::new())));
+        assert!(CfgSet::parse("test").holds_str("test"));
+        assert!(!CfgSet::parse("").holds_str("test"));
+        for meta in [syn::parse_quote!(cfg_attr()), syn::parse_quote!(cfg_attr(unix, =))] {
+            assert!(cfg_attr(&meta).is_none(), "{meta:?}");
+        }
+    }
+
     fn set() -> CfgSet {
         CfgSet::parse("unix\ntarget_arch=\"x86_64\"\ntarget_os=\"linux\"\npanic=\"unwind\"\n")
             .with_features(["std".to_owned(), "serde".to_owned()])
