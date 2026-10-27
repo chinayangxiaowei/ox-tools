@@ -3,6 +3,7 @@
 
 //! The union that turns per-shard reports into one score.
 
+use core::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ptr::from_ref;
@@ -104,13 +105,20 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
                     Entry::Vacant(slot) => {
                         let _ = slot.insert(sighting);
                     }
-                    Entry::Occupied(mut slot)
-                        if rank(sighting.origin, sighting.started_at, &sighting.lineage)
-                            > rank(slot.get().origin, slot.get().started_at, &slot.get().lineage) =>
-                    {
-                        let _ = slot.insert(sighting);
+                    Entry::Occupied(mut slot) => {
+                        let held = slot.get_mut();
+                        match rank(sighting.origin, sighting.started_at, &sighting.lineage).cmp(&rank(
+                            held.origin,
+                            held.started_at,
+                            &held.lineage,
+                        )) {
+                            Ordering::Greater => *held = sighting,
+                            // Equal-rank twins can differ only in their filter flag; keep either
+                            // one's protection so the outcome does not depend on input order.
+                            Ordering::Equal => held.name_filtered |= sighting.name_filtered,
+                            Ordering::Less => {}
+                        }
                     }
-                    Entry::Occupied(_slot) => {}
                 }
 
                 let (tested_at, origin, lineage, name_filtered) =
@@ -263,8 +271,13 @@ fn retain<'report>(latest: &mut HashMap<&'report str, Verdict<'report>>, candida
         // earned verdict, but it can supply its presentation when it fits the selected source.
         Entry::Occupied(mut slot) => {
             let held = slot.get();
-            let winner = verdict_rank(&mutant.status, origin, tested_at, &lineage)
-                > verdict_rank(&held.mutant.status, held.origin, held.tested_at, &held.lineage);
+            let order = verdict_rank(&mutant.status, origin, tested_at, &lineage).cmp(&verdict_rank(
+                &held.mutant.status,
+                held.origin,
+                held.tested_at,
+                &held.lineage,
+            ));
+            let winner = order.is_gt();
             let newer_presentation = compatible
                 && held
                     .presentation_rank
@@ -288,11 +301,15 @@ fn retain<'report>(latest: &mut HashMap<&'report str, Verdict<'report>>, candida
                     presentation,
                     presentation_rank,
                 });
-            } else if newer_presentation {
+            } else {
                 let held = slot.get_mut();
-                held.file = path;
-                held.presentation = Some(mutant);
-                held.presentation_rank = Some(source_rank);
+                // As with sightings, an equal-rank twin keeps either input's filter protection.
+                held.name_filtered |= order.is_eq() && name_filtered;
+                if newer_presentation {
+                    held.file = path;
+                    held.presentation = Some(mutant);
+                    held.presentation_rank = Some(source_rank);
+                }
             }
         }
     }
@@ -2248,6 +2265,39 @@ mod tests {
             "a staged filtered verdict must prevent staging without a compatible presentation; emitted report: {:?}",
             second.report,
         );
+    }
+
+    #[test]
+    fn equal_rank_stages_keep_filter_protection_in_either_order() {
+        let source_b = "fn aaa() {}\nfn bbb() {}\n// B\n";
+        let source_c = "fn aaa() {}\nfn bbb() {}\n// C\n";
+        let mut filtered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        let unfiltered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        let filtered = merge(&[("inner.json".to_owned(), filtered)], 150, None)
+            .report
+            .expect("a filtered input can be staged");
+        let unfiltered = merge(&[("inner.json".to_owned(), unfiltered)], 150, None)
+            .report
+            .expect("an unfiltered input can be staged");
+        let run = report_with_source(Some((1, 2)), 300, source_c, vec![mutant("bbb", 2, "Survived")]);
+
+        for stages in [[&filtered, &unfiltered], [&unfiltered, &filtered]] {
+            let merged = merge(
+                &[
+                    ("first".to_owned(), stages[0].clone()),
+                    ("second".to_owned(), stages[1].clone()),
+                    ("run".to_owned(), run.clone()),
+                ],
+                400,
+                None,
+            );
+            assert_eq!(
+                (merged.unpresentable_filtered, merged.report.is_none()),
+                (1, true),
+                "an equal-rank filtered stage must prevent staging regardless of input order",
+            );
+        }
     }
 
     #[test]
