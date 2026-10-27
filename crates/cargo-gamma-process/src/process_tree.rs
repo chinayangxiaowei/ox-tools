@@ -80,11 +80,12 @@ pub const fn capacity() -> usize {
     usize::MAX
 }
 
-/// Reports whether this host can hold a test subtree in a boundary it cannot leave, or why not.
+/// Reports whether this host contains descendants across process-group/session changes, or why not.
 ///
 /// A process group is not such a boundary: a descendant that calls `setsid` or `setpgid` leaves it,
-/// and every later signal to the group misses it. A Linux cgroup leaf and a Windows job object both
-/// are, because membership is inherited and cannot be renounced by the member.
+/// and every later signal to the group misses it. Linux cgroup and Windows job membership is
+/// inherited and unaffected by those calls. Linux containment is not a hostile-code sandbox:
+/// same-credential code with writable cgroup interfaces can deliberately migrate out of the leaf.
 ///
 /// Settled once and cached, since on Linux the answer involves creating a cgroup and possibly
 /// moving this process. A run is expected to ask once, before it copies, builds or executes
@@ -124,7 +125,7 @@ pub fn containment() -> Result<(), PlatformError> {
     {
         Err(PlatformError::new_static(
             Situation::Unsupported,
-            "this platform offers no unprivileged boundary a test subtree cannot leave, so \
+            "this platform offers no unprivileged boundary retaining descendants across session changes, so \
              containment reduces to a process group: a descendant that calls `setsid` escapes it \
              and survives timeout, cancellation and interrupt cleanup",
         ))
@@ -165,7 +166,7 @@ pub(crate) struct SpawnGuard {
     /// The cgroup leaf the child will place itself in, on the platform that has them.
     ///
     /// Present for every launch the host can seal, whether or not accounting was asked for: the
-    /// process group beside it is escapable and the cgroup is not. Absent only where
+    /// process group beside it can be left by `setsid`/`setpgid`, which do not change cgroup membership. Absent only where
     /// [`containment`] already reported that this host cannot seal a subtree at all.
     #[cfg(target_os = "linux")]
     cgroup: Option<Cgroup>,
@@ -190,7 +191,7 @@ pub(crate) struct SpawnGuard {
 }
 
 impl SpawnGuard {
-    /// Whether the child this guard covers will enter a boundary its descendants cannot leave.
+    /// Whether this launch contains descendants across process-group/session changes.
     ///
     /// False means containment reduces to a Unix process group, which a descendant leaves with
     /// `setsid`. [`containment`] reports this per run, before anything the repository controls has
@@ -340,7 +341,7 @@ impl PreparedCommand {
         }
     }
 
-    /// Whether the child this launch produces will enter a boundary its descendants cannot leave.
+    /// Whether this launch contains descendants across process-group/session changes.
     ///
     /// False means containment reduces to a Unix process group, which a descendant leaves with
     /// `setsid`. [`containment`] says so once per run, before anything the repository controls has
@@ -380,7 +381,7 @@ impl PreparedCommand {
 /// containment prepared for that exact launch, so safe code cannot reuse the preparation or pair
 /// the child with another boundary. [`ProcessTree::adopt`] consumes the bundle; dropping it before
 /// adoption terminates the contained subtree and reaps its leader. Do not independently reap the
-/// child's numeric PID concurrently with adoption or drop.
+/// child's numeric PID while this value owns the child.
 #[must_use = "a spawned child must be adopted so its process tree remains contained"]
 #[derive(Debug)]
 pub struct SpawnedCommand {
@@ -668,9 +669,9 @@ pub fn prepare(command: Command, request: MemoryRequest) -> Result<PreparedComma
             ));
         }
 
-        // Attempted for every launch, not only for a metered one. Test listing and census asked
-        // for no accounting and still run repository-controlled code, and a process group is not a
-        // boundary that code cannot leave.
+        // Attempted for every launch, not only for a metered one. Test listing asks
+        // for no accounting and still runs repository-controlled code, and a process group is not a
+        // boundary that retains descendants across process-group/session changes.
         let cgroup = if request.wanted() {
             Some(Cgroup::create(request.limit)?)
         } else {
@@ -801,8 +802,8 @@ fn interrupted() -> PlatformError {
 ///
 /// Created from an already-spawned child, and used once when the run decides the mutant has hung.
 /// This handle owns the child's wait right. Callers must not independently reap its numeric PID
-/// concurrently with observation or termination: that could free the group ID between observation
-/// and cleanup. A completed external reap is detected by the next observation.
+/// concurrently with observation or termination. A completed external reap is detected by the next
+/// observation.
 #[derive(Debug)]
 pub struct ProcessTree {
     /// Stopped and joined before releasing or reaping the numeric group identity.
@@ -829,7 +830,8 @@ pub struct ProcessTree {
     /// The cgroup leaf holding and, when asked, accounting for this subtree.
     ///
     /// Present for every launch on a host that can seal one, whether or not accounting was
-    /// requested: it is the only Linux boundary a descendant cannot leave.
+    /// requested: it retains descendants across `setsid`/`setpgid`, not deliberate migration through
+    /// writable cgroup interfaces.
     #[cfg(target_os = "linux")]
     cgroup: Option<Cgroup>,
 
@@ -918,6 +920,16 @@ impl ProcessTree {
             let watched = guard.spawning.watch_cgroup(group, guard.cgroup.as_mut());
             #[cfg(not(target_os = "linux"))]
             let watched = guard.spawning.watch(group);
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            let watched = if faults::fired(faults::Fault::Watch) {
+                if let Some(slot) = watched {
+                    interrupt::forget(slot, group);
+                }
+                None
+            } else {
+                watched
+            };
 
             let Some(slot) = watched else {
                 return Err(abandoning(
@@ -1073,7 +1085,7 @@ impl ProcessTree {
         })
     }
 
-    /// Whether this subtree is held in a boundary its descendants cannot leave.
+    /// Whether this subtree is contained across process-group/session changes.
     ///
     /// False means containment reduced to the Unix process group for this launch, which a
     /// descendant leaves with `setsid`. [`containment`] reports the same fact for the host once,
@@ -1382,16 +1394,10 @@ impl ProcessTree {
             )
         }
 
+        // The group or job may not have covered the child — the id could not be converted, the job
+        // could not be created — and in any case this is what makes `wait` return.
         #[cfg(not(target_os = "macos"))]
-        {
-            let swept = self.sweep(false);
-
-            // The group or job may not have covered the child — the id could not be converted, the
-            // job could not be created — and in any case this is what makes `wait` return.
-            let killed = kill_if_running(child);
-
-            killed.and(swept)
-        }
+        kill_with(child, || self.sweep(false), kill_if_running)
     }
 
     /// Ends the subtree and reaps its leader without exposing its group id to reuse.
@@ -1436,11 +1442,6 @@ impl ProcessTree {
         #[cfg(not(target_os = "macos"))]
         let reaped = self.finish_termination(killed, || child.wait())?;
 
-        #[cfg(any(test, feature = "fault-injection"))]
-        if faults::fired(faults::Fault::Terminate) {
-            return Err(io::Error::other("subtree termination failed as requested by a test"));
-        }
-
         Ok(Some(reaped))
     }
 
@@ -1459,13 +1460,24 @@ impl ProcessTree {
 
     /// Releases the watch before reaping and records whether termination proved cleanup.
     fn finish_termination<T>(&mut self, killed: io::Result<()>, reap: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-        // #[gamma::skip(stmt.delete_call, reason = "release has no effect on non-Unix mutation hosts; Unix tests assert termination frees the watched slot before reaping")]
-        self.release();
-        let reaped = reap();
-        if killed.is_err() || reaped.is_err() {
+        let mut proven = killed.is_ok();
+        let reaped = terminate_leader_with(
+            self,
+            |subtree| {
+                // #[gamma::skip(stmt.delete_call, reason = "release has no effect on non-Unix mutation hosts; Unix tests assert termination frees the watched slot before reaping")]
+                subtree.release();
+                killed
+            },
+            |_subtree| {
+                let reaped = reap();
+                proven &= reaped.is_ok();
+                reaped
+            },
+        );
+        if !proven {
             self.output_cleanup_unproven = true;
         }
-        reaped_after_cleanup(reaped, killed)
+        reaped
     }
 
     /// Ends descendants while their leader's process-group id is still reserved.
@@ -1491,7 +1503,7 @@ impl ProcessTree {
         }
 
         // The cgroup reaches further than the process group does: a descendant that called
-        // `setsid` has left the group but cannot leave the cgroup, so this goes first where it
+        // `setsid` has left the group without changing its cgroup membership, so this goes first where it
         // exists.
         #[cfg(target_os = "linux")]
         let boundary_killed = self.cgroup.as_ref().map_or(Ok(()), Cgroup::kill);
@@ -1834,6 +1846,29 @@ fn kill_if_running(child: &mut Child) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(kill_error) => resolve_kill_failure(kill_error, &child.try_wait()),
     }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn kill_with<C>(child: &mut C, sweep: impl FnOnce() -> io::Result<()>, kill: impl FnOnce(&mut C) -> io::Result<()>) -> io::Result<()> {
+    let swept = sweep();
+    let killed = kill(child);
+    killed.and(swept)
+}
+
+fn terminate_leader_with<C, T>(
+    child: &mut C,
+    cleanup: impl FnOnce(&mut C) -> io::Result<()>,
+    wait: impl FnOnce(&mut C) -> io::Result<T>,
+) -> io::Result<T> {
+    let killed = cleanup(child);
+    let reaped = reaped_after_cleanup(wait(child), killed)?;
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    if faults::fired(faults::Fault::Terminate) {
+        return Err(io::Error::other("subtree termination failed as requested by a test"));
+    }
+
+    Ok(reaped)
 }
 
 /// Names the memory sampler as the source of an accounting failure, preserving its error kind.
@@ -2516,7 +2551,7 @@ mod tests {
 
     /// Why the containment tests below are ignored by default, and how to run them.
     ///
-    /// A boundary a member cannot leave is not something every host has to offer. On Linux it needs
+    /// Containment across process-group/session changes is not something every host offers. On Linux it needs
     /// a delegated cgroup v2 subtree with the memory controller handed down, which containers, CI
     /// runners and ordinary unprivileged systemd sessions all answer differently; on every other
     /// Unix there is none at all. What the tests that need one must not do is *skip* invisibly.
@@ -2577,6 +2612,12 @@ mod tests {
     #[cfg(not(windows))]
     fn no_op_command() -> Command {
         Command::new("true")
+    }
+
+    #[cfg(unix)]
+    fn owned_group() -> ProcessTree {
+        let prepared = prepare(no_op_command(), MemoryRequest::default()).expect("containment");
+        ProcessTree::adopt(prepared.spawn().expect("owned group leader")).expect("watched group")
     }
 
     #[test]
@@ -2890,12 +2931,15 @@ mod tests {
         let spawned = prepared.spawn().expect("spawn");
         let mut subtree = ProcessTree::adopt(spawned).expect("adoption");
 
-        let _status = wait_for(&mut subtree);
+        let status = wait_for(&mut subtree);
         let usage = subtree.usage();
 
-        // The measurement is what every derived ceiling is built from, so a boundary that
-        // installed itself and then measured nothing would be worse than none at all.
-        assert!(usage.peak.is_some(), "{usage:?}");
+        assert!(status.success(), "the allocation helper did not complete: {status}");
+        assert!(
+            usage.peak.is_some_and(|peak| peak >= 32 * 1024 * 1024),
+            "the helper holds 32 MiB of page-touched allocations, not a zero or missing peak: {usage:?}"
+        );
+        assert!(!usage.exhausted, "an unlimited measured workload reported exhaustion: {usage:?}");
     }
 
     /// A subtree that never got a process group still kills the child directly, rather than
@@ -2908,8 +2952,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_subtree_with_no_group_still_kills_the_child_directly() {
-        let mut command = Command::new("sh");
-        let _ = command.args(["-c", "sleep 30"]);
+        let mut command = Command::new("sleep");
+        let _ = command.arg("30");
         let mut child = command.spawn().expect("spawn");
 
         let subtree = ProcessTree {
@@ -2927,7 +2971,7 @@ mod tests {
 
         subtree
             .kill(&mut child)
-            .expect("the live shell fixture must be killable without a process group");
+            .expect("the live child fixture must be killable without a process group");
 
         let status = child.wait().expect("wait");
 
@@ -3071,6 +3115,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_subtree_with_no_watched_slot_drops_without_touching_the_registry() {
+        let owner = owned_group();
+        let slot = owner.slot.expect("the owned group has a watch slot");
+        let group = owner.group.expect("the unreaped leader pins its group");
         let subtree = ProcessTree {
             #[cfg(target_os = "macos")]
             sampler: None,
@@ -3085,12 +3132,18 @@ mod tests {
         };
 
         drop(subtree);
+        assert_eq!(
+            interrupt::watched(slot),
+            group,
+            "an unregistered drop changed an owned registration"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn dropping_an_empty_subtree_releases_its_watched_slot() {
-        let group = 0x0060_0d2e;
+        let owner = owned_group();
+        let group = owner.group.expect("the unreaped leader pins its group");
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
         let subtree = ProcessTree {
@@ -3119,7 +3172,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn releasing_a_subtree_frees_its_slot_immediately_rather_than_at_drop() {
-        let group = 0x0060_0d1e;
+        let owner = owned_group();
+        let group = owner.group.expect("the unreaped leader pins its group");
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
 
@@ -3150,20 +3204,23 @@ mod tests {
 
         // Whatever claims the slot next belongs to a different child, so neither a second release
         // nor the drop that follows may take it away from them.
-        let taken = spawning.watch(0x0060_0d1f).expect("a free slot");
+        let replacement = owned_group();
+        let replacement_group = replacement.group.expect("the replacement leader pins its group");
+        let taken = spawning.watch(replacement_group).expect("a free slot");
 
         subtree.release();
         drop(subtree);
 
-        assert_eq!(interrupt::watched(taken), 0x0060_0d1f, "a later child's slot must survive");
+        assert_eq!(interrupt::watched(taken), replacement_group, "a later child's slot must survive");
 
-        interrupt::forget(taken, 0x0060_0d1f);
+        interrupt::forget(taken, replacement_group);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_subtree_reaped_elsewhere_revokes_its_numeric_group_capabilities() {
-        let group = 0x0060_0d1e;
+        let owner = owned_group();
+        let group = owner.group.expect("the unreaped leader pins its group");
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
         let mut subtree = ProcessTree {
@@ -3209,7 +3266,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn forgetting_an_out_of_range_slot_does_nothing() {
+        let owner = owned_group();
+        let slot = owner.slot.expect("the owned group has a watch slot");
+        let group = owner.group.expect("the unreaped leader pins its group");
         interrupt::forget(usize::MAX, 1);
+        assert_eq!(
+            interrupt::watched(slot),
+            group,
+            "out-of-range release changed an owned registration"
+        );
     }
 
     #[cfg(unix)]
@@ -3289,7 +3354,7 @@ mod tests {
     /// pipe the run is still reading. Build scripts, test harnesses and daemons started by tests do
     /// this deliberately.
     ///
-    /// A cgroup leaf and a job object are boundaries a member cannot renounce, which is why one is
+    /// A cgroup leaf and a job object retain members across group/session changes, which is why one is
     /// created for every launch rather than only for a launch that asked to be measured. The
     /// request here asks for neither measurement nor a ceiling, so a containment tied to accounting
     /// would leave this grandchild running.
@@ -3492,6 +3557,8 @@ mod tests {
     /// killing whoever is running it.
     #[cfg(unix)]
     fn interrupted_run(inner: &str) -> i32 {
+        use std::os::unix::process::ExitStatusExt as _;
+
         let program = env::args().next().expect("this test binary");
         let mut child = Command::new(&program)
             .args(["--exact", "--nocapture", &format!("process_tree::tests::{inner}")])
@@ -3523,9 +3590,11 @@ mod tests {
                 .expect("the inner test reports the pid it spawned")
         };
 
-        // The inner process dies of the signal it raised, one way or another; this is only here so
-        // it is reaped rather than left as a zombie for the rest of the suite.
-        let _status = child.wait();
+        let status = child.wait().expect("the interrupted test process is reaped");
+        assert!(
+            status.signal().is_some(),
+            "the self-interrupting helper returned instead of dying of a signal"
+        );
 
         reported
     }
@@ -4104,6 +4173,69 @@ mod tests {
         assert!(reason.to_string().contains("would not take the child"), "{reason}");
     }
 
+    #[test]
+    fn public_output_does_not_discard_an_explicit_memory_ceiling() {
+        let request = MemoryRequest {
+            calibrating: false,
+            meter: true,
+            limit: Some(1),
+        };
+        let bounded = output_with(Command::new("scripted-child"), request, |command, forwarded| {
+            assert_eq!(command.get_program(), "scripted-child");
+            assert_eq!(forwarded.meter, request.meter);
+            assert_eq!(forwarded.limit, Some(1));
+            Err(PlatformError::new_static(Situation::Refused, "one-byte memory ceiling refused"))
+        })
+        .expect_err("the scripted preparation failure must be returned");
+        let OutputError::Containment(reason) = bounded else {
+            panic!("preparation failures must retain their containment classification");
+        };
+        assert_eq!(reason.situation(), Situation::Refused);
+        assert_eq!(reason.to_string(), "one-byte memory ceiling refused");
+    }
+
+    #[test]
+    fn terminate_returns_a_sweep_error_after_reaping_the_leader() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut reaped = false;
+        let error = terminate_leader_with(
+            &mut reaped,
+            |reaped| {
+                let killed = kill_with(
+                    reaped,
+                    || {
+                        calls.borrow_mut().push("sweep");
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "scripted sweep failure"))
+                    },
+                    |reaped| {
+                        assert!(!*reaped, "the leader must reserve its id through cleanup");
+                        calls.borrow_mut().push("kill");
+                        Ok(())
+                    },
+                );
+                calls.borrow_mut().push("release");
+                killed
+            },
+            |reaped| {
+                calls.borrow_mut().push("wait");
+                assert!(!*reaped, "the leader must only be reaped once");
+                *reaped = true;
+                Ok(ExitStatus::from_raw(0))
+            },
+        )
+        .expect_err("a failed boundary sweep is returned after reaping");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "scripted sweep failure");
+        assert_eq!(calls.into_inner(), ["sweep", "kill", "release", "wait"]);
+        assert!(reaped, "a sweep failure must not leave the leader unreaped");
+    }
+
     #[cfg(unix)]
     #[test]
     fn prepared_backoff_propagates_interrupt_window_reopening_failure() {
@@ -4393,6 +4525,9 @@ mod tests {
         drop(armed);
     }
 
+    /// The childless fixture stands for the state after the leader is reaped. The scripted callbacks
+    /// drive the production failed-cleanup transition, and the repeated `terminate` call checks that
+    /// unproven cleanup is not later reported as success.
     #[cfg(target_os = "macos")]
     #[test]
     fn termination_marks_a_failed_sweep_as_unproven_after_reaping() {
@@ -4438,64 +4573,23 @@ mod tests {
         );
     }
 
-    /// Once every watch slot is taken, adoption is refused rather than left unwatched.
-    ///
-    /// Run in a subprocess of its own, because the registry it has to exhaust is process-wide and
-    /// there is exactly one of it: while the slots are held, every other test in the binary that
-    /// prepares or adopts anything would be refused, and every test that had already taken a slot
-    /// would leave this one unable to fill the registry it is here to fill. Both directions of that
-    /// interference depend on what the harness happens to be running alongside it.
+    /// Registration refusal must clean up the real child, not leave it unwatched.
     #[cfg(unix)]
     #[test]
-    fn adoption_refuses_a_child_once_every_slot_is_taken() {
-        testing::within(testing::WATCHDOG, "adoption refused with every slot taken", || {
-            isolated_run("a_saturated_registry_refuses_an_adoption", "the adoption was refused");
+    fn adoption_refuses_a_child_when_the_registry_refuses_registration() {
+        testing::within(testing::WATCHDOG, "registration refusal cleans up the child", || {
+            let mut command = Command::new(testing::helper_binary_path().as_std_path());
+            let _ = command.args([testing::directive("sleep:30000"), testing::directive("exit:0")]);
+            let prepared = prepare(command, MemoryRequest::default()).expect("containment");
+            let spawned = prepared.spawn().expect("spawn");
+            let pid = i32::try_from(spawned.id()).expect("pid fits");
+            let _refuse = faults::arm(faults::Fault::Watch);
+
+            let reason = ProcessTree::adopt(spawned).expect_err("the registration fault emulates exhaustion");
+
+            assert!(reason.to_string().contains("could not be watched"), "{reason}");
+            assert!(gone_soon(pid), "a refused adoption must still kill the child");
         });
-    }
-
-    /// The inner half of the test above: fills every watch slot, then tries to adopt a child.
-    ///
-    /// Inert unless the outer test asked for it, since it takes the whole registry away from
-    /// whatever else is running. Filled with fake group ids on the guard's own interrupt registry,
-    /// so that the real spawn below finds every slot already claimed without needing anywhere near
-    /// a thousand real processes.
-    #[cfg(unix)]
-    #[test]
-    fn a_saturated_registry_refuses_an_adoption() {
-        if env::var_os(ISOLATED_CHILD).is_none() {
-            return;
-        }
-
-        let command = no_op_command();
-
-        // Prepared before the registry is filled, since preparing opens a window of its own and
-        // there would be no slot left for it afterward. The refusal under test is adoption's, not
-        // preparation's.
-        let prepared = prepare(command, MemoryRequest::default()).expect("containment");
-        let window = interrupt::spawning();
-        let mut watched = Vec::new();
-
-        for offset in 0..interrupt::capacity() {
-            let group = i32::try_from(offset + 1).expect("small positive group id");
-
-            if let Some(slot) = window.watch(group) {
-                watched.push((slot, group));
-            }
-        }
-
-        let spawned = prepared.spawn().expect("spawn");
-        let pid = i32::try_from(spawned.id()).expect("pid fits");
-
-        let reason = ProcessTree::adopt(spawned).expect_err("every slot is already taken");
-
-        assert!(reason.to_string().contains("could not be watched"), "{reason}");
-        assert!(gone_soon(pid), "a refused adoption must still kill the child");
-
-        for (slot, group) in watched {
-            interrupt::forget(slot, group);
-        }
-
-        println!("the adoption was refused");
     }
 
     /// This process's own registry is still usable, which is what the isolation above is worth.
@@ -4508,7 +4602,8 @@ mod tests {
     #[test]
     fn the_shared_registry_is_left_usable_by_the_isolated_tests() {
         let holding = window().expect("no test may leave this process's registry interrupted");
-        let group = 0x0060_0d7e;
+        let owner = owned_group();
+        let group = owner.group.expect("the unreaped leader pins its group");
         let slot = holding.watch(group).expect("no test may leave this process's registry full");
 
         interrupt::forget(slot, group);
@@ -4738,10 +4833,12 @@ mod tests {
         let cgroup = guard.cgroup;
         #[cfg(not(target_os = "linux"))]
         drop(guard);
-        let group = i32::try_from(child.id()).expect("pid fits");
-
         let _status = child.wait().expect("the child exits almost immediately");
 
+        // The child handle deliberately names a reaped child, but no reusable identity is ever
+        // placed in the real effect registry: a separate unreaped leader pins this test capability.
+        let owner = owned_group();
+        let group = owner.group.expect("the unreaped leader pins its group");
         let spawning = interrupt::spawning();
         let slot = spawning.watch(group).expect("a free slot");
         let mut subtree = ProcessTree {
@@ -4770,7 +4867,8 @@ mod tests {
 
         // Immediate reuse, made deterministic: a different group takes the registration the
         // revocation just handed back. Neither the interrupt path nor the drop below may reach it.
-        let replacement = 0x0060_0d3e;
+        let replacement_owner = owned_group();
+        let replacement = replacement_owner.group.expect("the replacement leader pins its group");
         let taken = spawning.watch(replacement).expect("a free slot");
 
         // The leader is gone, so every later lifecycle call has to say so rather than reach the

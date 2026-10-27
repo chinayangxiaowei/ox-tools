@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 
 use camino::Utf8PathBuf;
 
+use crate::discover::Plan;
 use crate::elements::{FileResult, Framework, Location, MutantResult, Position, Report, RunInfo, ShardInfo, Thresholds};
 use crate::model::{Mutant, Outcome};
 use crate::ops::collect::Shape;
@@ -35,6 +36,23 @@ pub(crate) const UNRESOLVED_LINK_SOURCE: &str = "unsafe extern \"C\" {\n\
     \x20\x20\x20\x20assert!(less(1, 2));\n\
     \x20\x20\x20\x20assert_eq!(touch(), 0);\n\
     }\n";
+
+/// A synthetic discovery plan whose only selected inputs are the supplied mutants.
+pub(crate) fn plan(mutants: Vec<Mutant>) -> Plan {
+    Plan {
+        root: "workspace".into(),
+        files: Vec::new(),
+        mutants,
+        suppressed: 0,
+        idle: Vec::new(),
+        sharded_out: 0,
+        settled_out: 0,
+        digests: crate::HashMap::default(),
+        skipped: Vec::new(),
+        reach: crate::HashMap::default(),
+        specs: crate::HashMap::default(),
+    }
+}
 
 /// A killed `relational.lt_to_le` mutant of `a` to `b`, at line 1 of `src/lib.rs` in `subject`.
 pub(crate) fn mutant() -> Mutant {
@@ -140,6 +158,7 @@ pub(crate) fn report_with(shard: Option<(u32, u32)>, started_at: u64, mutants: V
             started_at,
             mutant_id_version: Some(crate::model::MUTANT_ID_VERSION),
             merged: false,
+            population_complete: shard.is_none(),
             shard: shard.map(|(index, count)| ShardInfo { index, count }),
             tests: None,
             not_built: None,
@@ -151,7 +170,14 @@ pub(crate) fn report_with(shard: Option<(u32, u32)>, started_at: u64, mutants: V
 }
 
 pub(crate) fn crate_dir(name: &str, source: &str) -> (tempfile::TempDir, Utf8PathBuf) {
-    let dir = crate::testing::workdir(name);
+    crate_dir_in(crate::testing::workdir(name), source)
+}
+
+pub(crate) fn private_crate_dir(name: &str, source: &str) -> (tempfile::TempDir, Utf8PathBuf) {
+    crate_dir_in(crate::testing::private_system_tempdir(name), source)
+}
+
+fn crate_dir_in(dir: tempfile::TempDir, source: &str) -> (tempfile::TempDir, Utf8PathBuf) {
     let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8");
 
     crate::testing::write_project(

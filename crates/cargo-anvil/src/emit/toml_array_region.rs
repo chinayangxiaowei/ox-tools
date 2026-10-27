@@ -513,7 +513,7 @@ mod tests {
     use toml_edit::Value;
 
     use super::*;
-    use crate::catalog::{Artifact, Catalog, HostSelector, RegionId, RegionSpec};
+    use crate::catalog::{Artifact, Catalog, CliMeta, HostSelector, RegionId, RegionSpec};
     use crate::checksum::checksum_str;
     use crate::decision::Decision;
     use crate::plan::{Plan, Target};
@@ -522,6 +522,12 @@ mod tests {
     const REGION: &str = "  # >>> anvil-managed: entries\n  # Guidance.\n  \"managed\",\n  # <<< anvil-managed: entries\n";
     const FRESH: &str =
         "[plugins]\ndefault = [\n  # >>> anvil-managed: entries\n  # Guidance.\n  \"managed\",\n  # <<< anvil-managed: entries\n]\n";
+
+    /// Minimal identity for tests that exercise catalog mechanics rather than
+    /// the built-in catalog's full embedded artifact set.
+    fn test_cli() -> CliMeta {
+        CliMeta::new("anvil")
+    }
 
     fn spec() -> TomlArrayRegionSpec {
         TomlArrayRegionSpec {
@@ -533,6 +539,90 @@ mod tests {
             },
             path: vec!["plugins".to_owned(), "default".to_owned()],
         }
+    }
+
+    #[test]
+    fn array_entry_templates_cannot_escape_into_other_top_level_keys() {
+        for body in [
+            "\"managed\",\n]\nforeign = [\n\"unmanaged\",",
+            "\"managed\",\n]\n[foreign]\nvalues = [\n\"unmanaged\",",
+        ] {
+            let source = format!("entries = [\n{body}\n]");
+            let parsed = source.parse::<DocumentMut>().unwrap();
+            assert_eq!(parsed.as_table().len(), 2);
+            assert_eq!(parsed["entries"].as_array().unwrap().get(0).unwrap().as_str(), Some("managed"));
+            let refusal = body_array(body).unwrap_err();
+            assert_eq!(refusal.reason.to_string(), "the region must contain only array entries");
+            assert_eq!(refusal.remedy, RefusalRemedy::InvalidGeneratedToml);
+            let mut template = spec();
+            template.region.body = body.to_owned();
+            assert!(validate_spec(&template).is_err());
+        }
+    }
+
+    #[test]
+    fn mixed_string_and_nonstring_entries_are_rejected_in_any_position() {
+        for body in ["\"managed\", 1,", "false, \"managed\",", "\"first\", [], \"last\","] {
+            let refusal = body_array(body).unwrap_err();
+            assert_eq!(refusal.reason.to_string(), "generated array entries must be strings");
+            assert_eq!(refusal.remedy, RefusalRemedy::InvalidGeneratedToml);
+        }
+        assert_eq!(body_array("\"first\", \"last\",").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn existing_array_selectors_find_unpaired_markers_without_leaking_sibling_paths() {
+        let source = concat!(
+            "[first]\nitems = [\n# >>> anvil-managed: unfinished\n\"managed\",\n]\n",
+            "[second]\nplain = [\"# >>> anvil-managed: string-data\"]\n",
+            "items = [\n# <<< anvil-managed: missing\n\"other\",\n]\n",
+            "[third]\nplain = [\"unmanaged\"]\n",
+        );
+        assert_eq!(
+            existing_array_paths(source).unwrap(),
+            [
+                vec!["first".to_owned(), "items".to_owned()],
+                vec!["second".to_owned(), "items".to_owned()]
+            ]
+        );
+        assert!(
+            existing_array_paths("items = [\"# >>> anvil-managed: not-a-comment\"]\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            existing_array_paths("items = [\n# an ordinary comment\n\"user\",\n]\n")
+                .unwrap()
+                .is_empty()
+        );
+        let refusal = existing_array_paths("items = [").unwrap_err();
+        assert_eq!(refusal.remedy, RefusalRemedy::HostAlreadyUnparsable);
+    }
+
+    #[test]
+    fn array_adoption_removes_only_the_requested_repetitions_and_preserves_comment_commas() {
+        let text = "items = [\"managed\" # preserve, this comma\n, \"managed\", \"managed\", \"user\"]\n";
+        let document = Document::parse(text).unwrap();
+        let array = document["items"].as_array().unwrap();
+        let adopted = adopt_entries(text, array, "\"managed\", \"managed\",").unwrap();
+        assert_eq!(adopted, "items = [ # preserve, this comma\n  \"managed\", \"user\"]\n");
+        let document = Document::parse(adopted).unwrap();
+        let entries = document["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["managed", "user"]);
+    }
+
+    #[test]
+    fn array_offsets_distinguish_lone_carriage_returns_from_crlf_normalization() {
+        let source = "a\r\nb\rc\r\n";
+        assert_eq!(
+            (0..=6).map(|offset| source_offset(source, offset)).collect::<Vec<_>>(),
+            [0, 1, 3, 4, 5, 6, 8]
+        );
     }
 
     #[test]
@@ -551,10 +641,7 @@ mod tests {
         for host in ["config", "config.conf", "config.toml.backup"] {
             let mut array = spec();
             array.region.host = HostSelector::Path(host.to_owned());
-            let error = Catalog::builder(Catalog::anvil().cli().clone())
-                .with_toml_array_region(array)
-                .build()
-                .unwrap_err();
+            let error = Catalog::builder(test_cli()).with_toml_array_region(array).build().unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "invalid catalog for 'anvil':\n  - TOML array region 'entries': TOML array hosts must have a .toml suffix"
@@ -563,10 +650,7 @@ mod tests {
         for host in ["config.toml", "config.ToML"] {
             let mut array = spec();
             array.region.host = HostSelector::Path(host.to_owned());
-            Catalog::builder(Catalog::anvil().cli().clone())
-                .with_toml_array_region(array)
-                .build()
-                .unwrap();
+            Catalog::builder(test_cli()).with_toml_array_region(array).build().unwrap();
         }
     }
     fn plan(text: Option<&str>) -> PlanItem {
@@ -585,6 +669,108 @@ mod tests {
                 ..spec().region
             },
         }
+    }
+
+    #[test]
+    fn campaign_regression_array_helpers_propagate_invalid_input_instead_of_panicking() {
+        let invalid = "items = [";
+        let expected = invalid.parse::<DocumentMut>().unwrap_err().to_string();
+        let error = scaffold(invalid, &["items".to_owned()]).unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::HostAlreadyUnparsable);
+        assert_eq!(error.reason.to_string(), expected);
+        let error = validate_neighbor_splice(invalid, "", &[]).unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::HostAlreadyUnparsable);
+        assert_eq!(error.reason.to_string(), expected);
+
+        let body = "\"unterminated";
+        let expected = Document::parse(format!("entries = [\n{body}\n]")).unwrap_err().to_string();
+        let error = render_body(body, "\n").unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::InvalidGeneratedToml);
+        assert_eq!(error.reason.to_string(), expected);
+
+        let document = Document::parse("items = []").unwrap();
+        let array = document["items"].as_array().unwrap();
+        let error = adopt_entries("items = []", array, "1,").unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::InvalidGeneratedToml);
+        assert_eq!(error.reason.to_string(), "generated array entries must be strings");
+        let error = adopt_entries("# <<< anvil-managed: missing\nitems = []", array, "\"managed\",").unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::MalformedMarkers);
+        assert_eq!(error.reason.to_string(), "closing sentinel without its matching opener");
+    }
+
+    #[test]
+    fn campaign_regression_missing_neighbor_selectors_do_not_disable_later_live_array_checks() {
+        let paths = [vec!["absent".to_owned()], vec!["items".to_owned()]];
+        let error = validate_neighbor_splice("items = []\n", "", &paths).unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::ArrayDependency);
+        assert_eq!(
+            error.reason.to_string(),
+            "this change would remove or rebind the live TOML array selector [\"items\"]"
+        );
+        validate_neighbor_splice("items = []\n", "# retained\nitems = []\n", &paths).unwrap();
+    }
+
+    #[test]
+    fn campaign_regression_own_region_does_not_hide_a_later_enclosing_owner() {
+        let host = concat!(
+            "# >>> anvil-managed: entries\n# <<< anvil-managed: entries\n",
+            "# >>> anvil-managed: owner\nitems = []\n# <<< anvil-managed: owner\n",
+        );
+        let error = plan_toml_array_region(&Manifest::default(), Some(host), "config.toml", &mutation_spec(&["items"])).unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::EnclosingOwnership);
+        assert_eq!(
+            error.reason.to_string(),
+            "the selected array belongs to managed region 'owner'; retire its enclosing ownership before managing array entries"
+        );
+    }
+
+    #[test]
+    fn campaign_regression_an_opener_before_the_array_cannot_claim_an_inside_closer() {
+        let host = "# >>> anvil-managed: entries\nitems = [\n# <<< anvil-managed: entries\n]\n";
+        let error = plan_toml_array_region(&Manifest::default(), Some(host), "config.toml", &mutation_spec(&["items"])).unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::MisplacedArrayMarkers);
+        assert_eq!(error.reason.to_string(), "the managed region is outside its selected TOML array");
+    }
+
+    #[test]
+    fn campaign_regression_scaffolding_an_owned_table_reports_why_relocation_is_unsafe() {
+        let host = "# >>> anvil-managed: owner\n[plugins]\nmode = true\n# <<< anvil-managed: owner\n";
+        let error = scaffold(host, &["plugins".to_owned(), "default".to_owned()]).unwrap_err();
+        assert_eq!(error.remedy, RefusalRemedy::EnclosingOwnership);
+        assert_eq!(
+            error.reason.to_string(),
+            "creating the missing array would overlap another managed region; scaffold relocation is not supported"
+        );
+    }
+
+    #[test]
+    fn campaign_regression_adopting_the_final_entry_without_a_trailing_newline_preserves_the_closer() {
+        for (source, expected) in [
+            ("items = [\"managed\"]", "items = []"),
+            ("items = [\"user\", \"managed\"]", "items = [\"user\", ]"),
+        ] {
+            let document = Document::parse(source).unwrap();
+            let array = document["items"].as_array().unwrap();
+            assert_eq!(adopt_entries(source, array, "\"managed\",").unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn campaign_regression_retiring_a_nested_array_region_preserves_neighboring_blank_lines() {
+        let host = concat!(
+            "title = \"user\"\n[plugins]\ndefault = [\n\n",
+            "# >>> anvil-managed: entries\n\"managed\",\n# <<< anvil-managed: entries\n",
+            "\n\"user\"]\n",
+        );
+        assert_eq!(
+            remove_region(host, "entries", CommentSyntax::Hash).unwrap(),
+            "title = \"user\"\n[plugins]\ndefault = [\n\n\n\"user\"]\n"
+        );
+        let error = remove_region("# >>> anvil-managed: entries\n", "entries", CommentSyntax::Hash).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "region 'entries' has an opening sentinel but no closing sentinel"
+        );
     }
 
     fn assert_mutation_write(host: &str, expected: &str, spec: &TomlArrayRegionSpec, manifest: &Manifest, newline: &str) {
@@ -775,6 +961,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain the exhaustive TOML mutation matrix; focused array mutation tests preserve Miri coverage"
+    )]
     #[test]
     fn mutation_adoption_respects_post_closer_entries_separators_and_enclosing_commas() {
         for newline in ["\n", "\r\n"] {
@@ -855,6 +1045,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain the exhaustive generated-marker matrix; focused marker tests preserve Miri coverage"
+    )]
     #[test]
     fn review_catalog_rejects_generated_ownership_comments() {
         for (host, region_id, path) in [
@@ -865,7 +1059,7 @@ mod tests {
             original.region.host = HostSelector::Path(host.to_owned());
             original.region.id = RegionId::new(region_id);
             original.path = path;
-            let catalog = Catalog::builder(Catalog::anvil().cli().clone())
+            let catalog = Catalog::builder(test_cli())
                 .with_toml_array_region(original.clone())
                 .build()
                 .unwrap();
@@ -885,7 +1079,7 @@ mod tests {
                             "invalid catalog for 'anvil':\n  - TOML array region '{region_id}': \
                              TOML array-entry bodies must not contain managed-region sentinel comments"
                         );
-                        let error = Catalog::builder(Catalog::anvil().cli().clone())
+                        let error = Catalog::builder(test_cli())
                             .with_toml_array_region(invalid.clone())
                             .build()
                             .unwrap_err();
@@ -909,6 +1103,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain the exhaustive generated-marker matrix; focused marker tests preserve Miri coverage"
+    )]
     #[test]
     fn review_catalog_accepts_marker_data_and_non_boundary_comments() {
         for quote in ["\"\"\"", "'''"] {
@@ -919,10 +1117,7 @@ mod tests {
                 );
                 let mut valid = spec();
                 valid.region.body = body.replace('\n', newline);
-                let catalog = Catalog::builder(Catalog::anvil().cli().clone())
-                    .with_toml_array_region(valid.clone())
-                    .build()
-                    .unwrap();
+                let catalog = Catalog::builder(test_cli()).with_toml_array_region(valid.clone()).build().unwrap();
                 assert_eq!(catalog.toml_array_path(&valid.region), Some(valid.path.as_slice()));
                 let expected = format!(
                     "[plugins]\ndefault = [\n  # >>> anvil-managed: entries\n  # Guidance.\n  {quote}\n\
@@ -939,6 +1134,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain the exhaustive TOML scaffold matrix; focused scaffold tests preserve Miri coverage"
+    )]
     #[test]
     fn review_scaffold_never_replaces_repository_or_retirement_bytes() {
         for newline in ["\n", "\r\n"] {
@@ -1376,7 +1575,7 @@ mod tests {
             let mut empty = spec();
             empty.region.body = body.to_owned();
             for replace in [false, true] {
-                let builder = Catalog::builder(Catalog::anvil().cli().clone());
+                let builder = Catalog::builder(test_cli());
                 let result = if replace {
                     builder
                         .with_toml_array_region(spec())
@@ -1394,10 +1593,7 @@ mod tests {
         for body in ["\"\",\n", "\"required\",\n"] {
             let mut valid = spec();
             valid.region.body = body.to_owned();
-            Catalog::builder(Catalog::anvil().cli().clone())
-                .with_toml_array_region(valid.clone())
-                .build()
-                .unwrap();
+            Catalog::builder(test_cli()).with_toml_array_region(valid.clone()).build().unwrap();
             let output = plan_toml_array_region(&Manifest::default(), None, "config.toml", &valid)
                 .unwrap()
                 .spliced_host
@@ -1637,21 +1833,15 @@ mod tests {
         let mut different = spec();
         different.path[1] = "other".to_owned();
         assert_eq!(artifact.key(), Artifact::region(different.region.clone()).key());
-        let first = Catalog::builder(Catalog::anvil().cli().clone())
-            .with_toml_array_region(spec())
-            .build()
-            .unwrap();
-        let second = Catalog::builder(Catalog::anvil().cli().clone())
-            .with_toml_array_region(different)
-            .build()
-            .unwrap();
+        let first = Catalog::builder(test_cli()).with_toml_array_region(spec()).build().unwrap();
+        let second = Catalog::builder(test_cli()).with_toml_array_region(different).build().unwrap();
         assert_ne!(first.checksum(), second.checksum());
         let replaced = artifact.with_body("\"new\",\n");
         let Artifact::Region(replaced) = replaced else {
             panic!("expected ordinary region")
         };
         assert_eq!(replaced.body, "\"new\",\n");
-        let error = Catalog::builder(Catalog::anvil().cli().clone())
+        let error = Catalog::builder(test_cli())
             .with_toml_array_region(spec())
             .with_artifact(Artifact::region(spec().region))
             .build()
@@ -1664,10 +1854,7 @@ mod tests {
 
     #[test]
     fn selector_survives_builder_round_trip_and_body_replacement_but_not_removal() {
-        let catalog = Catalog::builder(Catalog::anvil().cli().clone())
-            .with_toml_array_region(spec())
-            .build()
-            .unwrap();
+        let catalog = Catalog::builder(test_cli()).with_toml_array_region(spec()).build().unwrap();
         let Artifact::Region(region) = &catalog.artifacts()[0] else {
             panic!("expected ordinary region")
         };
@@ -1690,10 +1877,7 @@ mod tests {
             .unwrap();
         assert_eq!(removed.toml_array_path(&spec().region), None);
         assert_eq!(removed.artifacts(), []);
-        assert_eq!(
-            removed.checksum(),
-            Catalog::builder(Catalog::anvil().cli().clone()).build().unwrap().checksum()
-        );
+        assert_eq!(removed.checksum(), Catalog::builder(test_cli()).build().unwrap().checksum());
         let ordinary = removed
             .into_builder()
             .with_artifact(Artifact::region(spec().region))
@@ -1705,8 +1889,8 @@ mod tests {
     #[test]
     fn array_registration_rejects_both_ordinary_and_array_identity_conflicts() {
         for builder in [
-            Catalog::builder(Catalog::anvil().cli().clone()).with_artifact(Artifact::region(spec().region)),
-            Catalog::builder(Catalog::anvil().cli().clone()).with_toml_array_region(spec()),
+            Catalog::builder(test_cli()).with_artifact(Artifact::region(spec().region)),
+            Catalog::builder(test_cli()).with_toml_array_region(spec()),
         ] {
             assert_eq!(
                 builder.with_toml_array_region(spec()).build().unwrap_err().to_string(),
@@ -1720,7 +1904,7 @@ mod tests {
         let mut invalid = spec();
         invalid.path.clear();
         assert_eq!(
-            Catalog::builder(Catalog::anvil().cli().clone())
+            Catalog::builder(test_cli())
                 .with_toml_array_region(invalid)
                 .build()
                 .unwrap_err()
@@ -1728,7 +1912,7 @@ mod tests {
             "invalid catalog for 'anvil':\n  - TOML array region 'entries': a TOML array region requires a nonempty key path and hash comment syntax"
         );
         assert_eq!(
-            Catalog::builder(Catalog::anvil().cli().clone())
+            Catalog::builder(test_cli())
                 .with_toml_array_region(spec())
                 .replace_artifact(Artifact::region(spec().region).with_body("\"new\"\n"))
                 .build()
@@ -1743,12 +1927,12 @@ mod tests {
         let mut other = spec();
         other.region.host = HostSelector::Path("other.toml".to_owned());
         other.path = vec!["other".to_owned()];
-        let first = Catalog::builder(Catalog::anvil().cli().clone())
+        let first = Catalog::builder(test_cli())
             .with_toml_array_region(spec())
             .with_toml_array_region(other.clone())
             .build()
             .unwrap();
-        let second = Catalog::builder(Catalog::anvil().cli().clone())
+        let second = Catalog::builder(test_cli())
             .with_toml_array_region(other.clone())
             .with_toml_array_region(spec())
             .build()
@@ -1756,7 +1940,7 @@ mod tests {
         assert_eq!(first.checksum(), second.checksum());
         assert_eq!(first.toml_array_path(&spec().region), Some(spec().path.as_slice()));
         assert_eq!(first.toml_array_path(&other.region), Some(other.path.as_slice()));
-        let ordinary = Catalog::builder(Catalog::anvil().cli().clone())
+        let ordinary = Catalog::builder(test_cli())
             .with_artifact(Artifact::region(spec().region))
             .with_artifact(Artifact::region(other.region))
             .build()

@@ -129,11 +129,7 @@ pub(crate) fn surviving_mutants(report: &Report) -> Result<HashSet<MutantId>, St
         ));
     }
 
-    let identity_version = report
-        .config
-        .as_ref()
-        .and_then(|config| config.mutant_id_version)
-        .unwrap_or(MUTANT_ID_VERSION);
+    let identity_version = report.identity_version();
 
     if identity_version != MUTANT_ID_VERSION {
         return Err(format!(
@@ -163,5 +159,22 @@ pub(super) fn settled_verdict(status: &str, reason: Option<&str>) -> Option<Outc
         "CompileError" => Some(Outcome::CompileError),
         "Ignored" => Some(Outcome::Ignored),
         _other => None,
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod survivor_tests {
+    use super::*;
+
+    #[test]
+    fn survivor_compile_errors_are_settled_but_unknown_outcomes_are_not() {
+        for reason in [None, Some("compiler rejected the mutant")] {
+            assert_eq!(settled_verdict("CompileError", reason), Some(Outcome::CompileError));
+            assert_eq!(settled_verdict("Killed", reason), Some(Outcome::Killed));
+        }
+        for status in ["Pending", "NotRun", "xyzzy", ""] {
+            assert_eq!(settled_verdict(status, None), None);
+        }
     }
 }

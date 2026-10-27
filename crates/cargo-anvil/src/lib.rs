@@ -107,7 +107,7 @@
 //! just anvil-build
 //! just anvil-build --package my-crate
 //! just anvil-doc-build --open
-//! just anvil-examples --run
+//! just anvil-examples
 //! just anvil-fmt --fix
 //! just anvil-miri --package my-crate --example basic
 //! just anvil-readme --fix
@@ -129,7 +129,7 @@
 //! - **fast checks** cover formatting, Clippy, documentation, dependency
 //!   policy, spelling, README drift, API compatibility, and metadata;
 //! - **tests and coverage** run tests, documentation tests, coverage gates,
-//!   and example compilation;
+//!   example compilation, and execution of selected examples;
 //! - **MSRV tests** execute affected tests with the repository's declared
 //!   minimum supported Rust version;
 //! - **runtime analysis** runs Miri, cargo-careful, Loom, and a short Bolero
@@ -197,7 +197,7 @@
 //! - **Tests and coverage:** tests under the declared MSRV, coverage with
 //!   [`cargo-llvm-cov`](https://crates.io/crates/cargo-llvm-cov) and
 //!   [`cargo-coverage-gate`](https://crates.io/crates/cargo-coverage-gate),
-//!   documentation tests, and example compilation or optional execution.
+//!   documentation tests, example compilation, and execution of selected examples.
 //! - **Runtime analysis:** [`Miri`](https://github.com/rust-lang/miri),
 //!   [`cargo-careful`](https://crates.io/crates/cargo-careful),
 //!   [`Loom`](https://crates.io/crates/loom), and
@@ -253,9 +253,31 @@
 //!
 //! [`cargo-coverage-gate`](https://crates.io/crates/cargo-coverage-gate)
 //! metadata controls workspace and package thresholds, target-specific policy,
-//! and intentional exclusions. Coverage enforcement is local to the generated
-//! check; a hosted coverage service is optional reporting rather than the
-//! source of the verdict.
+//! and intentional exclusions. The generated check delegates both supported
+//! feature configurations to `cargo coverage-gate run`, which filters coverage
+//! to released Cargo library and binary surfaces before atomically publishing
+//! `target/coverage/lcov-all-features.info` and
+//! `target/coverage/lcov-no-default.info`. The local gate and hosted reporting
+//! consume those exact files, so provably test-only regions such as
+//! `#[cfg(test)]` modules and their assertion guards or helpers need no
+//! `coverage(off)` annotations merely to stay out of production coverage.
+//! Feature-exposed helpers such as `cfg(feature = "test-util")` remain part of
+//! the released surface and are still counted. Hosted coverage remains
+//! reporting rather than the source of the verdict.
+//!
+//! Impact selection controls which packages are tested and gated, while the
+//! released-surface source index validates every target in the workspace.
+//! Unsupported or ambiguous module layouts anywhere in the workspace therefore
+//! fail closed. Adoption may require semantics-preserving changes to test
+//! fixtures so their source remains available to parser or discovery tests
+//! without mounting an unsupported layout as a Cargo target.
+//!
+//! The generated recipe intentionally uses the invoking rustc host target.
+//! `cargo coverage-gate run` passes that target explicitly, overriding
+//! `CARGO_BUILD_TARGET` and Cargo `build.target`; each Anvil matrix leg measures
+//! its native target. Repositories that require non-host coverage need a native
+//! runner for that target or a documented repository-specific check until the
+//! catalog supports explicit coverage-target configuration.
 //!
 //! ### Miri
 //!
@@ -319,15 +341,18 @@
 //!
 //! ### Examples
 //!
-//! `anvil-examples` always compiles selected examples. An unfiltered
-//! `--run` skips interactive, credentialed, or otherwise unsuitable examples
-//! declared by their package:
+//! `anvil-examples` always builds and runs selected examples, whether invoked
+//! directly or through PR and scheduled tests. Runs use `ANVIL_EXAMPLE=1`, no
+//! application arguments, and a 30-second per-example timeout. Nonzero exits
+//! and timeouts fail the check. Unfiltered runs skip interactive, credentialed,
+//! service-dependent, or otherwise unsuitable examples declared by their package:
 //!
 //! ```toml
 //! [package.metadata.anvil.examples]
 //! no-run = ["interactive-demo", "needs-production-credentials"]
 //! ```
 //!
+//! Excluded examples still compile.
 //! Explicit `--package` and `--example` selection overrides the default
 //! exclusion because the caller has deliberately chosen that example.
 //!
@@ -348,6 +373,13 @@
 //! just anvil-container just anvil-clippy
 //! just anvil-container cargo build
 //! ```
+//!
+//! `GITHUB_TOKEN` is not forwarded by default, and the launcher never acquires
+//! host GitHub CLI credentials. To use an explicitly supplied token, run
+//! `just anvil-container --github-token just anvil-aprz` (or omit the command
+//! for an authenticated shell). A missing token fails before engine resolution.
+//! Only use credentials with reviewed, trusted code: recipes and hooks run on
+//! the host, and opt-in prevents accidental exposure, not malicious code.
 //!
 //! The image contains the same tool versions used by the generated checks.
 //! Its tag is derived from the Dockerfile and its ignore file, the generated
@@ -418,6 +450,7 @@ pub(crate) mod workspace;
 /// must not depend on it — use the crate-root surface (`Catalog`, `Artifact`,
 /// `artifacts`, `run_app`, …) instead.
 #[doc(hidden)]
+#[cfg(any(test, feature = "internals"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub mod test_support {
     pub use crate::checksum::checksum_str;
@@ -450,7 +483,9 @@ use std::process::ExitCode;
 // is deliberately not surfaced at the crate root.
 pub use anvil::artifacts;
 pub use backend::Backend;
-pub use catalog::{Artifact, Catalog, CatalogBuilder, CliMeta, HostSelector, OwnedFileSpec, RegionId, RegionSpec, TomlArrayRegionSpec};
+pub use catalog::{
+    Artifact, Catalog, CatalogBuilder, CliMeta, HostSelector, JsonArrayRegionSpec, OwnedFileSpec, RegionId, RegionSpec, TomlArrayRegionSpec,
+};
 pub use region::CommentSyntax;
 
 /// One-call entry point for a tool built on the anvil engine.

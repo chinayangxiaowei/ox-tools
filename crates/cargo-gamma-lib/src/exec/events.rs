@@ -19,10 +19,7 @@ pub(crate) enum SelectionTier {
     Item,
     Reach,
     File,
-    Census,
-    Selected,
     Whole,
-    HintedFallback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -118,6 +115,9 @@ pub trait Events {
     /// The number of mutants the compiler has proved unviable so far.
     fn convergence_progress(&mut self, _unviable: usize) {}
 
+    /// Current check, confirmed unviable count, and completed-or-starting isolation proof.
+    fn convergence_activity(&mut self, _round: u32, _unviable: usize, _proof: usize) {}
+
     /// Whether convergence work evidence has a consumer.
     ///
     /// The evidence requires another pass over Cargo's JSON transcript. Reporters that do not
@@ -173,7 +173,7 @@ pub trait Events {
     /// Baseline measurement is complete and the sweep is being prepared.
     ///
     /// This boundary is deliberately earlier than [`Self::sweep_planned`]: reachability,
-    /// optional census work, hint loading, scheduling-cost construction, and queue construction
+    /// hint loading, scheduling-cost construction, and queue construction
     /// can take long enough that leaving the terminal unchanged makes a healthy run look stalled.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn sweep_planning(&mut self, _plan: &Plan, _binaries: usize, _jobs: usize) {}
@@ -189,12 +189,36 @@ pub trait Events {
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn mutant_started(&mut self) {}
 
+    /// A previously started mutant resumed work or was deferred to another stage.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn mutant_activity(&mut self, _active: bool) {}
+
     /// The sweep is still waiting for workers, allowing time-dependent displays to refresh.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn heartbeat(&mut self) {}
 
     /// The fixed cost is paid, the tree compiles, and the first mutant is about to be tested.
     fn measured(&mut self, _plan: &Plan, _session: &Session) {}
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod final_survivor_tests {
+    use super::*;
+
+    struct Minimal;
+
+    impl Events for Minimal {
+        fn phase(&mut self, _verb: &str, _detail: &str) {}
+        fn mutant(&mut self, _mutant: &Mutant) {}
+    }
+
+    #[test]
+    fn a_minimal_reporter_does_not_request_any_expensive_build_evidence() {
+        assert!(!Minimal.wants_build_output());
+        assert!(!Minimal.wants_convergence_evidence());
+        assert!(!Minimal.wants_isolation_evidence());
+    }
 }
 
 #[cfg(test)]

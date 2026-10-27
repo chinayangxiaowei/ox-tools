@@ -50,6 +50,7 @@ enum Previous {
     Other,
     Expression,
     Operator,
+    Prefix,
 }
 
 impl Previous {
@@ -127,7 +128,9 @@ pub(super) fn beyond(text: &str, comments: &[Comment], limit: usize) -> Option<u
                 ladders[depth] += 1;
                 set_bool(&mut awaiting_else, depth, false);
 
-                if ladders[depth] > path_limit || link(&mut path, &mut peak, depth, path_limit) {
+                if base.get(depth).copied().unwrap_or_default().saturating_add(ladders[depth]) > path_limit
+                    || link(&mut path, &mut peak, depth, path_limit)
+                {
                     return Some(at);
                 }
                 previous = Previous::Other;
@@ -167,7 +170,7 @@ pub(super) fn beyond(text: &str, comments: &[Comment], limit: usize) -> Option<u
             previous = if matches!(byte, b'?' | b'>') {
                 Previous::Operator
             } else {
-                Previous::Other
+                Previous::Prefix
             };
             at += 1;
             continue;
@@ -197,7 +200,8 @@ pub(super) fn beyond(text: &str, comments: &[Comment], limit: usize) -> Option<u
             }
 
             b'{' => {
-                let inherited = base.get(depth).copied().unwrap_or_default().saturating_add(CHAIN_FACTOR);
+                let enclosing = if previous == Previous::Prefix { &path } else { &base };
+                let inherited = enclosing.get(depth).copied().unwrap_or_default().saturating_add(CHAIN_FACTOR);
                 depth += 1;
 
                 if inherited > path_limit {
@@ -353,6 +357,7 @@ fn identifier_end(text: &str, at: usize) -> Option<usize> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use core::num::NonZeroUsize;
     use std::{env, fs};
 
     use camino::Utf8Path;
@@ -362,10 +367,133 @@ mod tests {
     use super::super::source_file::line_starts;
     use super::*;
 
+    #[test]
+    fn public_shape_guard_accumulates_unary_cost_across_mixed_groups() {
+        // Each level adds its unary run plus CHAIN_FACTOR for the delimiter. The chosen total
+        // equals NESTING_LIMIT * CHAIN_FACTOR while group depth remains below NESTING_LIMIT;
+        // one extra prefix exceeds the cumulative allowance, including with mixed delimiters.
+        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+            let boundary = format!("{}true{}", format!("{}{open}", "!".repeat(12)).repeat(16), close.repeat(16));
+            assert!(!crate::parse::exceeds_nesting_limit(&boundary), "{open}");
+            assert!(crate::parse::exceeds_nesting_limit(&format!("!{boundary}")), "{open}");
+        }
+        let mixed = format!("{}true{}", "!!!!!!!!!!!!(!!!!!!!!!!!!{".repeat(8), "})".repeat(8));
+        assert!(!crate::parse::exceeds_nesting_limit(&mixed));
+        assert!(crate::parse::exceeds_nesting_limit(&format!("!{mixed}")));
+    }
+
+    #[test]
+    fn macro_token_else_markers_only_count_after_a_current_closing_block() {
+        for (text, limit) in [
+            ("m!((---else))", 3),
+            ("m!({} else (--1))", 4),
+            ("m!({} item-------else)", 3),
+            ("m!(({}) (else--1))", 5),
+            ("m!({{}} {else-------1})", 4),
+            ("m!({},-------else)", 3),
+        ] {
+            assert_eq!(beyond_limit(text, limit), None, "{text}");
+        }
+        let text = "m!({} else (---1))";
+        assert_eq!(beyond_limit(text, 4), text.rfind('-'));
+    }
+
+    #[test]
+    fn unmatched_closers_do_not_erase_the_root_else_ladder_budget() {
+        let prefix = format!("if ready {{}}{}", " else if ready {}".repeat(8));
+        assert_eq!(beyond_limit(&prefix, 2), None);
+        for closer in [')', ']'] {
+            let text = format!("{prefix}{closer} else {{}}");
+            assert_eq!(beyond_limit(&text, 2), Some(prefix.len() + 2), "{text}");
+        }
+    }
+
+    #[test]
+    fn exact_else_ladder_budget_resets_in_sibling_expressions_and_reused_delimiter_depths() {
+        fn ladder(links: NonZeroUsize) -> String {
+            format!("if a {{}} {}else {{}}", "else if a {} ".repeat(links.get() - 1))
+        }
+        let at_limit = ladder(NonZeroUsize::new(8).unwrap());
+        assert_eq!(beyond(&at_limit, &[], 2), None);
+        let excessive = ladder(NonZeroUsize::new(9).unwrap());
+        assert_eq!(beyond(&excessive, &[], 2), excessive.match_indices("else").nth(8).map(|(at, _)| at));
+        for separator in ["; ", ", ", " "] {
+            let siblings = format!("{at_limit}{separator}{at_limit}");
+            assert_eq!(beyond(&siblings, &[], 2), None, "{separator:?}");
+        }
+        let nested = ladder(NonZeroUsize::new(8).unwrap());
+        for text in [
+            format!("({nested}); ({nested})"),
+            format!("{{{nested}}} {{{nested}}}"),
+            format!("[{nested}], [{nested}]"),
+        ] {
+            assert_eq!(beyond(&text, &[], 3), None, "{text}");
+        }
+        let retained_outer_base = "{{----1}; 2---------1}";
+        assert_eq!(beyond(retained_outer_base, &[], 3), retained_outer_base.rfind('-'));
+    }
+
     fn beyond_limit(text: &str, limit: usize) -> Option<usize> {
         let comments = scan_comments(text, &line_starts(text));
 
         beyond(text, &comments, limit)
+    }
+
+    #[test]
+    fn nested_chain_diagnostics_keep_inherited_cost_after_comments_literals_and_closers() {
+        for (open, close) in [("(", ")"), ("[", "]"), ("{", "}")] {
+            let at_limit = format!("{open}{open}----1{close}{close}");
+            assert_eq!(beyond_limit(&at_limit, 3), None, "{at_limit}");
+            let overflow = format!("{open}{open}-----1{close}{close}");
+            assert_eq!(beyond_limit(&overflow, 3), Some(6), "{overflow}");
+            let after_close = format!("{open}{open}----1{close}+{close}");
+            assert_eq!(beyond_limit(&after_close, 3), Some(8), "{after_close}");
+            let after_both = format!("{open}{open}----1{close}{close}+");
+            assert_eq!(beyond_limit(&after_both, 3), Some(9), "{after_both}");
+            for ignored in ["/* [ ((( +++++ */", "// ] } +++++\n"] {
+                let text = format!("{open}{open}----{ignored}+1{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), Some(6 + ignored.len()), "{text}");
+            }
+            for literal in ["\"++++(]\"", "r##\"+++({\"##", "'+'"] {
+                let text = format!("{open}{open}----{literal}+{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), Some(6 + literal.len()), "{text}");
+            }
+            let byte_literal = format!("{open}{open}b'('----1{close}{close}");
+            assert_eq!(beyond_limit(&byte_literal, 3), None, "{byte_literal}");
+            let byte_literal = format!("{open}{open}b'('-----1{close}{close}");
+            assert_eq!(beyond_limit(&byte_literal, 3), Some(10), "{byte_literal}");
+            for separator in [";", ","] {
+                let text = format!("{open}{open}----1{separator}----2{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), None, "{text}");
+                let text = format!("{open}{open}----1{separator}-----2{close}{close}");
+                assert_eq!(beyond_limit(&text, 3), Some(12), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_tokens_reset_paths_without_erasing_postfix_or_ladder_cost() {
+        for boundary in [" value ", " \"text\" ", " 7 "] {
+            let text = format!("++++1{boundary}+");
+            assert_eq!(beyond_limit(&text, 1), None, "{text}");
+        }
+        for operator in ["?", ">"] {
+            let text = format!("{operator}()");
+            assert_eq!(beyond_limit(&text, 1), Some(1), "{text}");
+        }
+        for punctuation in [":", "#", "@", "$", "'"] {
+            let text = format!("value{punctuation}()");
+            assert_eq!(beyond_limit(&text, 1), None, "{text}");
+        }
+        for text in ["++++1🦀+", "++++1 /* comment */ +", "++++1 // comment\n+"] {
+            assert_eq!(beyond_limit(text, 1), Some(text.len() - 1), "{text}");
+        }
+        assert_eq!(beyond_limit("else", 0), None);
+        assert_eq!(beyond_limit("if a {} else", 1), Some(8));
+        assert_eq!(beyond_limit("if a {} unrelated else", 1), None);
+        assert_eq!(beyond_limit("if a {} as T; else", 1), Some(8));
+        assert_eq!(beyond_limit("if a {}; else", 1), None);
+        assert_eq!(beyond_limit("if a {}, else", 1), None);
     }
 
     #[test]
@@ -412,8 +540,8 @@ mod tests {
             ("[]", None),
             ("[][]", Some(2)),
             ("{{", Some(1)),
-            ("++++ {}", None),
-            ("++++ {}+", Some(7)),
+            ("++++ {}", Some(5)),
+            ("++++ {}+", Some(5)),
             ("++++ 1 \"x\" +", None),
             ("++++ 1 value +", None),
             ("++++ 1 2 +", None),
@@ -442,10 +570,11 @@ mod tests {
             let over = format!("{ladder} else if ready {{}}");
             assert_eq!(beyond_limit(&over, limit), Some(ladder.len() + 1), "{over}");
             if limit >= 3 {
-                let nested = format!("{{{ladder}}}");
+                let inner = format!("if ready {{}}{}", " else if ready {}".repeat(links - CHAIN_FACTOR));
+                let nested = format!("{{{inner}}}");
                 assert_eq!(beyond_limit(&nested, limit), None, "{nested}");
-                let nested_over = format!("{{{ladder} else if ready {{}}}}");
-                assert_eq!(beyond_limit(&nested_over, limit), Some(ladder.len() + 2), "{nested_over}");
+                let nested_over = format!("{{{inner} else if ready {{}}}}");
+                assert_eq!(beyond_limit(&nested_over, limit), Some(inner.len() + 2), "{nested_over}");
             }
             for separator in [";", ",", " unrelated ", " as T;"] {
                 let siblings = format!("{ladder}{separator}{ladder}");

@@ -620,107 +620,8 @@ pub(super) fn retain_linked_to_population(binaries: &mut Vec<TestBinary>, plan: 
     });
 }
 
-/// Cargo target selectors for test artifacts that may link a pending mutated source.
-///
-/// The identities come from Cargo's own successful preflight artifact messages. Any missing
-/// capture, ambiguous association, or unsupported target kind abandons narrowing entirely.
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub(super) fn linked_target_args(stdout: &str, root: &Utf8Path, capture_dir: Option<&Utf8Path>, plan: &Plan) -> Option<Vec<String>> {
-    let captures = read_captures(capture_dir?)?;
-    let origins = artifact_origins(stdout, root);
-    let pending: crate::HashSet<&Utf8Path> = plan
-        .mutants
-        .iter()
-        .filter(|mutant| pending_mutant(mutant))
-        .map(|mutant| mutant.file.as_ref())
-        .collect();
-    let mut selectors = Vec::new();
-    let mut saw_test_target = false;
-
-    'messages: for line in stdout.lines() {
-        let Ok(message) = serde_json::from_str::<Value>(line) else {
-            continue 'messages;
-        };
-
-        if !is_compiler_artifact(&message)
-            || message
-                .get("profile")
-                .and_then(|profile| profile.get("test"))
-                .and_then(Value::as_bool)
-                != Some(true)
-        {
-            continue 'messages;
-        }
-
-        saw_test_target = true;
-        let target = message.get("target")?;
-        let name = target.get("name").and_then(Value::as_str)?;
-        let source = target.get("src_path").and_then(Value::as_str).map(Utf8Path::new)?;
-        let artifacts: Vec<&str> = message
-            .get("filenames")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        // Cargo's `filenames` are outputs of this compilation unit. Even a PDB or metadata output
-        // carries the same crate stem and is matched by `output_matches`; silently discarding one
-        // would let a partially captured unit look exact, so every listed output must agree.
-        let associations: Vec<crate::HashSet<Utf8PathBuf>> = artifacts
-            .iter()
-            .map(|artifact| linked_sources(artifact, source, &captures, &origins, root))
-            .collect::<Option<_>>()?;
-        // #[gamma::skip(iter.first_to_last, reason = "the next check requires every association to equal this slice, so choosing the first or last equal slice returns the same sources")]
-        let sources = associations.first()?;
-
-        if !all_associations_equal(&associations, sources) {
-            return no_target_selection();
-        }
-
-        let linked = populations_intersect(&pending, sources);
-
-        if !linked {
-            continue 'messages;
-        }
-
-        let is_integration_test = target
-            .get("kind")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|kind| kind == "test");
-        let selector = if is_integration_test {
-            ["--test".to_owned(), name.to_owned()]
-        } else {
-            // `cargo build --lib`, `--bin`, and `--example` build ordinary targets, not their
-            // unit-test harnesses. Cargo cannot select those harnesses exactly under `build`, so
-            // retain the package-scoped `--tests` fallback instead.
-            return no_target_selection();
-        };
-
-        selectors.push(selector);
-    }
-
-    if target_selection_failed(saw_test_target, &selectors) {
-        return None;
-    }
-
-    selectors.sort();
-    // #[gamma::skip(iter.remove_dedup, reason = "duplicate Cargo target selectors select the same target population and Cargo accepts repeated identical selector flags")]
-    selectors.dedup();
-
-    Some(selectors.into_iter().flatten().filter(|value| !value.is_empty()).collect())
-}
-
 fn populations_intersect(pending: &crate::HashSet<&Utf8Path>, sources: &crate::HashSet<Utf8PathBuf>) -> bool {
     pending.iter().any(|source| sources.contains(*source))
-}
-
-fn all_associations_equal(associations: &[crate::HashSet<Utf8PathBuf>], sources: &crate::HashSet<Utf8PathBuf>) -> bool {
-    associations.iter().all(|candidate| candidate == sources)
-}
-
-fn target_selection_failed(saw_test_target: bool, selectors: &[[String; 2]]) -> bool {
-    !saw_test_target || selectors.is_empty()
 }
 
 const fn no_target_selection<T>() -> Option<T> {
@@ -840,16 +741,15 @@ fn reaches_mutant(binary: &TestBinary, mutant: &Mutant, plan: &Plan, scope: &Tes
             .is_none_or(|sources| sources.contains(mutant.file.as_ref()))
 }
 
-/// Orders an unhinted mutant's reachable binaries without changing which binaries are reachable.
+/// Builds the baseline reference order without changing which binaries are reachable.
 ///
 /// Tests from the package that owns the mutant are normally the closest oracle. Within the own
 /// package and remaining-package tiers, measured baseline cost comes first, followed by stable
 /// identity fields so Cargo's artifact order cannot make two equivalent runs diverge.
 ///
-/// Exact per-mutant and learned file-local killers are applied later by the verdict path and
-/// therefore still take precedence over this cold-run order; so does
-/// [`Census`](crate::exec::census::Census)'s own
-/// current-cost order, which further reorders this tier's tail once a census is available.
+/// The verdict path applies exact and inferred hints first, then reorders fallback execution by
+/// live kill counts within these package tiers. This reference order breaks kill-count ties and
+/// determines non-killing outcome precedence independently of execution order.
 pub(super) fn order_reachable(binaries: &mut [&TestBinary], mutant_package: &str) {
     binaries.sort_by(|left, right| {
         let tier = |binary: &TestBinary| u8::from(binary.package != mutant_package);
@@ -865,14 +765,11 @@ pub(super) fn order_reachable(binaries: &mut [&TestBinary], mutant_package: &str
 
 /// Which binaries can reach each package holding a pending mutant, indexed once.
 ///
-/// Census economics and sweep scheduling share this index, which is built once after the binaries
-/// and baseline are known.
+/// Sweep scheduling and execution share this index, built once after the baseline.
 ///
-/// Package reachability is a coarser fact than a census: it says a binary is *permitted* to be
+/// Package reachability says a binary is *permitted* to be
 /// consulted for a mutant's package, never that a specific test or a specific mutation site is
-/// covered. Nothing here may ever be read as evidence that a site or a test is uncovered — only
-/// [`Census`](crate::exec::census::Census), and only when its own census for that binary completed,
-/// settles that.
+/// covered. Site-level evidence comes from ordinary active-mutant reach observations.
 #[derive(Debug, Default)]
 pub(super) struct Reachability<'binaries> {
     by_source: crate::HashMap<(Arc<str>, Arc<Utf8Path>), Vec<&'binaries TestBinary>>,
@@ -1093,6 +990,241 @@ fn is_version(fragment: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn survivor_capture(source: &str, output: &str, test: bool) -> RustcInvocation {
+        RustcInvocation {
+            crate_name: "subject".into(),
+            crate_types: vec!["bin".into()],
+            test,
+            source: source.into(),
+            out_dir: output.into(),
+            extra_filename: "-123".into(),
+            externs: Vec::new(),
+            opaque_extern: false,
+        }
+    }
+
+    #[test]
+    fn harness_capture_requires_both_the_source_and_output_and_an_unambiguous_match() {
+        let root = Utf8Path::new("workspace");
+        let target = Utf8Path::new("src/lib.rs");
+        let matching = survivor_capture("src/lib.rs", "build", true);
+        let wrong_source = survivor_capture("src/other.rs", "build", false);
+        let wrong_output = survivor_capture("src/lib.rs", "elsewhere", false);
+        let executable = format!("build/subject-123{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(libtest_harness(&executable, target, &[], root), None);
+        assert_eq!(
+            libtest_harness(&executable, target, &[wrong_source, wrong_output, matching.clone()], root),
+            Some(true)
+        );
+        assert_eq!(libtest_harness(&executable, target, &[matching.clone(), matching], root), None);
+        let custom = survivor_capture("src/lib.rs", "build", false);
+        assert_eq!(libtest_harness(&executable, target, &[custom], root), Some(false));
+    }
+
+    #[test]
+    fn executable_capture_requires_test_source_and_output_independently_and_rejects_nameless_artifacts() {
+        let root = Utf8Path::new("workspace");
+        let source = root.join("src/lib.rs");
+        let executable = Utf8Path::new("build/subject-123");
+        for (test, input, output, expected) in [
+            (true, "src/lib.rs", "build", true),
+            (false, "src/lib.rs", "build", false),
+            (true, "src/other.rs", "build", false),
+            (true, "src/lib.rs", "elsewhere", false),
+            (false, "src/other.rs", "elsewhere", false),
+        ] {
+            let capture = survivor_capture(input, output, test);
+            assert_eq!(capture_starts_executable(&capture, executable, &source, root), expected);
+        }
+        let capture = survivor_capture("src/lib.rs", "", true);
+        for artifact in [".", ".."] {
+            assert_eq!(Utf8Path::new(artifact).parent(), Some(Utf8Path::new("")));
+            assert!(!output_matches(&capture, Utf8Path::new(artifact)));
+        }
+    }
+
+    #[test]
+    fn binary_discovery_keeps_and_sorts_linked_and_unlinked_test_targets() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8PathBuf::from_path_buf(fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let output = root.join("out");
+        let captures = root.join("captures");
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&captures).unwrap();
+        let mut messages = vec!["not JSON".to_owned(), serde_json::json!({"reason":"compiler-message"}).to_string()];
+        for name in ["unlinked", "zulu", "alpha"] {
+            let mut capture = survivor_capture(root.join(format!("tests/{name}.rs")).as_str(), output.as_str(), true);
+            capture.crate_name = name.into();
+            let mut sources = vec![capture.source.clone()];
+            if name != "unlinked" {
+                sources.push(root.join("src/lib.rs"));
+            }
+            write_dep(&capture, &sources);
+            write_capture(&captures, name, &capture);
+            let executable = output.join(format!("{name}-123{}", std::env::consts::EXE_SUFFIX));
+            let mut message: Value = serde_json::from_str(&artifact_stream(&[(name, &capture.source, &executable)])).unwrap();
+            message["target"]["kind"] = serde_json::json!(["test", "bin"]);
+            messages.push(message.to_string());
+        }
+        let stream = messages.join("\n");
+        let binaries = test_binaries_with_linkage(&stream, &root, Some(&captures));
+        assert_eq!(binaries.len(), 3);
+        assert!(
+            binaries
+                .iter()
+                .all(|binary| binary.target_kind == "test" && binary.libtest == Some(true))
+        );
+        assert_eq!(
+            binaries.iter().map(|binary| binary.target.as_str()).collect::<Vec<_>>(),
+            ["alpha", "unlinked", "zulu"]
+        );
+        for binary in &binaries {
+            assert_eq!(
+                binary.linked_sources.as_ref().unwrap().contains(Utf8Path::new("src/lib.rs")),
+                binary.target != "unlinked"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_linkage_uses_only_its_matching_complete_output_capture() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8PathBuf::from_path_buf(fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let output = root.join("out");
+        let captures = root.join("captures");
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&captures).unwrap();
+        let source = root.join("tests/subject.rs");
+        let mut executables = Vec::new();
+        for suffix in ["first", "second"] {
+            let mut capture = survivor_capture(source.as_str(), output.as_str(), true);
+            capture.extra_filename = format!("-{suffix}");
+            write_dep(&capture, &[source.clone(), root.join(format!("src/{suffix}.rs"))]);
+            write_capture(&captures, suffix, &capture);
+            executables.push(output.join(format!("subject-{suffix}{}", std::env::consts::EXE_SUFFIX)));
+        }
+        let stream = artifact_stream(&[("subject", &source, &executables[0])]);
+        let first_binary = test_binaries_with_linkage(&stream, &root, Some(&captures));
+        let first_sources = first_binary[0].linked_sources.as_ref().unwrap();
+        assert!(first_sources.contains(Utf8Path::new("src/first.rs")));
+        assert!(!first_sources.contains(Utf8Path::new("src/second.rs")));
+        let second = artifact_stream(&[("subject", &source, &executables[1])]);
+        let second_binary = test_binaries_with_linkage(&second, &root, Some(&captures));
+        let second_sources = second_binary[0].linked_sources.as_ref().unwrap();
+        assert!(second_sources.contains(Utf8Path::new("src/second.rs")));
+        assert!(!second_sources.contains(Utf8Path::new("src/first.rs")));
+    }
+
+    #[test]
+    fn linkage_keeps_work_after_a_registry_skip_and_after_a_previously_visited_cycle() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8PathBuf::from_path_buf(fs::canonicalize(directory.path()).unwrap()).unwrap();
+        let output = root.join("out");
+        fs::create_dir(&output).unwrap();
+        let mut primary = survivor_capture(root.join("tests/subject.rs").as_str(), output.as_str(), true);
+        let mut later = survivor_capture(root.join("src/later.rs").as_str(), output.as_str(), false);
+        later.crate_name = "later".into();
+        write_dep(&primary, core::slice::from_ref(&primary.source));
+        write_dep(&later, core::slice::from_ref(&later.source));
+        let executable = output.join(format!("subject-123{}", std::env::consts::EXE_SUFFIX));
+        let dependency = output.join("liblater-123.rlib");
+        let registry = output.join("libregistry.rlib");
+        let origins = crate::HashMap::from_iter([(registry.clone(), ArtifactOrigin::Registry)]);
+        let expected = crate::HashSet::from_iter([Utf8PathBuf::from("tests/subject.rs"), Utf8PathBuf::from("src/later.rs")]);
+        for cycle in [false, true] {
+            primary.externs = if cycle {
+                vec![dependency.clone(), executable.clone()]
+            } else {
+                vec![registry.clone(), dependency.clone()]
+            };
+            assert_eq!(
+                linked_sources(
+                    executable.as_str(),
+                    &primary.source,
+                    &[primary.clone(), later.clone()],
+                    &origins,
+                    &root
+                ),
+                Some(expected.clone()),
+                "cycle={cycle}"
+            );
+        }
+        fs::remove_file(output.join("later-123.d")).unwrap();
+        assert_eq!(
+            linked_sources(executable.as_str(), &primary.source, &[primary.clone(), later], &origins, &root),
+            None
+        );
+        assert_eq!(dep_sources(&survivor_capture("../outside.rs", output.as_str(), true), &root), None);
+    }
+
+    #[test]
+    fn artifact_origins_skip_malformed_prefixes_and_retain_workspace_manifest_identity() {
+        let root = Utf8Path::new(if cfg!(windows) { "C:/artifact-policy" } else { "/artifact-policy" });
+        let artifact = root.join("out/subject");
+        let stream = format!(
+            "not JSON\n{}\n{}",
+            serde_json::json!({"reason":"compiler-message"}),
+            serde_json::json!({
+                "reason":"compiler-artifact",
+                "package_id":"path+file:///workspace#subject@0.0.0",
+                "manifest_path":root.join("Cargo.toml"),
+                "filenames":[artifact]
+            })
+        );
+        assert_eq!(
+            artifact_origins(&stream, root),
+            crate::HashMap::from_iter([(artifact, ArtifactOrigin::Workspace)])
+        );
+    }
+
+    #[test]
+    fn legacy_target_identity_rejects_a_bare_colon_and_unknown_binary_packages_stay_conservative() {
+        let mut legacy = binary("subject");
+        legacy.target = "subject".into();
+        legacy.target_kind.clear();
+        assert!(legacy.matches_target("subject", "subject"));
+        assert!(!legacy.matches_target("subject", ":subject"));
+        let plan = plan_mutating(&[("subject", &["subject"])], &["subject"]);
+        legacy.package.clear();
+        legacy.tests = Some(1);
+        let local = TestScope {
+            package_local: true,
+            ..ANY
+        };
+        assert!(reaches(&legacy, "subject", &plan, &local));
+        legacy.tests = Some(0);
+        assert!(!reaches(&legacy, "subject", &plan, &local));
+    }
+
+    #[test]
+    fn capture_reader_sorts_deduplicates_and_fails_closed_on_corrupt_json() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8Path::from_path(directory.path()).unwrap();
+        let first = survivor_capture("a.rs", "out", true);
+        let last = survivor_capture("z.rs", "out", true);
+        fs::write(root.join("c.json"), serde_json::to_vec(&first).unwrap()).unwrap();
+        fs::write(root.join("b.json"), serde_json::to_vec(&last).unwrap()).unwrap();
+        fs::write(root.join("a.json"), serde_json::to_vec(&first).unwrap()).unwrap();
+        fs::write(root.join("incomplete.tmp"), "invalid JSON is not a capture").unwrap();
+        assert_eq!(read_captures(root), Some(vec![first, last]));
+        fs::write(root.join("bad.json"), "invalid JSON").unwrap();
+        assert_eq!(read_captures(root), None);
+        assert_eq!(read_captures(&root.join("absent")), None);
+        fs::remove_file(root.join("bad.json")).unwrap();
+        fs::create_dir(root.join("unreadable.json")).unwrap();
+        assert_eq!(read_captures(root), None);
+    }
+
+    #[test]
+    fn version_fragments_require_a_leading_digit_and_all_release_characters_to_be_valid() {
+        for valid in ["0", "1.2.3", "1.2.3-alpha+metadata", "1+metadata"] {
+            assert!(is_version(valid), "{valid}");
+        }
+        for invalid in ["", "-alpha", "+metadata", "a1", ".1", "1a", "1.2x", " 1"] {
+            assert!(!is_version(invalid), "{invalid}");
+        }
+    }
+
     /// A scope that admits every binary, which is what most of these tests are not about.
     const ANY: TestScope<'static> = TestScope {
         packages: &[],
@@ -1206,45 +1338,15 @@ mod tests {
         let binaries = test_binaries_with_linkage(&stdout, &root, Some(&captures));
         let mut plan = plan_mutating(&[("subject", &["subject"])], &["subject"]);
         plan.mutants[0].file = Utf8PathBuf::from("src/lib.rs").into();
-        let target_args = linked_target_args(&stdout, &root, Some(&captures), &plan).expect("exact target selection");
         let mut admitted = binaries.clone();
         retain_linked_to_population(&mut admitted, &plan);
         let reach = Reachability::build(&plan, &binaries, &ANY);
         let reachable = reach.reachable(&plan.mutants[0]).expect("pending mutant");
 
-        assert_eq!(
-            target_args,
-            ["--test", "linked"],
-            "one of two compiler targets is selected for mutant builds"
-        );
         assert_eq!(admitted.len(), 1, "only the linked target reaches baseline");
         assert_eq!(admitted[0].target, "linked");
         assert_eq!(reachable.len(), 1);
         assert_eq!(reachable[0].target, "linked");
-
-        crate::testing::write_project(
-            root.as_std_path(),
-            &[
-                (
-                    "Cargo.toml",
-                    "[package]\nname = \"subject\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
-                ),
-                ("tests/linked.rs", "#[test]\nfn linked() {}\n"),
-                ("tests/independent.rs", "#[test]\nfn independent() {}\n"),
-            ],
-        );
-        let cargo_target = root.join("cargo-target");
-        let initial = built_test_targets(&root, &cargo_target, &["build", "--tests"]);
-        let mut narrowed = vec!["build"];
-        narrowed.extend(target_args.iter().map(String::as_str));
-        let subsequent = built_test_targets(&root, &cargo_target, &narrowed);
-
-        assert_eq!(initial, ["independent", "linked"], "initial discovery builds both compiler targets");
-        assert_eq!(
-            subsequent,
-            ["linked"],
-            "the subsequent mutant build invokes only the linked compiler target"
-        );
     }
 
     #[test]
@@ -1267,65 +1369,6 @@ mod tests {
     }
 
     #[test]
-    fn unit_test_target_kinds_disable_exact_cargo_build_selection() {
-        let directory = tempfile::tempdir().expect("capture directory");
-        let root = Utf8PathBuf::from_path_buf(directory.path().join("workspace")).expect("utf-8 root");
-        let out = Utf8PathBuf::from_path_buf(directory.path().join("target").join("deps")).expect("utf-8 target");
-        let captures = Utf8PathBuf::from_path_buf(directory.path().join("captures")).expect("utf-8 captures");
-        fs::create_dir_all(root.join("src").as_std_path()).expect("source directory");
-        fs::create_dir_all(out.as_std_path()).expect("output directory");
-        fs::create_dir_all(captures.as_std_path()).expect("capture directory");
-
-        let mut messages = vec!["not cargo JSON".to_owned()];
-        for (name, kind) in [("library", "lib"), ("binary", "bin"), ("example", "example")] {
-            let invocation = RustcInvocation {
-                crate_name: name.to_owned(),
-                crate_types: vec!["bin".to_owned()],
-                test: true,
-                source: root.join(format!("src/{name}.rs")),
-                out_dir: out.clone(),
-                extra_filename: format!("-{name}hash"),
-                externs: Vec::new(),
-                opaque_extern: false,
-            };
-            write_capture(&captures, name, &invocation);
-            write_dep(&invocation, &[root.join("src/lib.rs"), invocation.source.clone()]);
-            let artifact = out.join(format!("{name}-{name}hash{}", std::env::consts::EXE_SUFFIX));
-            assert!(
-                output_matches(&invocation, &artifact),
-                "{name} did not match {} in {} with suffix {:?}",
-                artifact,
-                invocation.out_dir,
-                invocation.extra_filename
-            );
-            assert!(
-                dep_sources(&invocation, &root).is_some_and(|sources| sources.contains(&Utf8PathBuf::from("src/lib.rs"))),
-                "{name} did not read its linked source"
-            );
-            messages.push(
-                serde_json::json!({
-                    "reason": "compiler-artifact",
-                    "profile": {"test": true},
-                    "target": {
-                        "name": name,
-                        "src_path": invocation.source,
-                        "kind": [kind],
-                    },
-                    "filenames": [artifact],
-                })
-                .to_string(),
-            );
-        }
-        let mut plan = plan_mutating(&[("subject", &["subject"])], &["subject"]);
-        plan.mutants[0].file = Utf8PathBuf::from("src/lib.rs").into();
-
-        assert!(
-            linked_target_args(&messages.join("\n"), &root, Some(&captures), &plan).is_none(),
-            "cargo build cannot name lib, bin, or example unit-test harnesses exactly"
-        );
-    }
-
-    #[test]
     fn missing_ambiguous_and_opaque_capture_all_fail_open() {
         let directory = tempfile::tempdir().expect("capture directory");
         let root = Utf8PathBuf::from_path_buf(directory.path().join("workspace")).expect("utf-8 root");
@@ -1337,10 +1380,8 @@ mod tests {
 
         let executable = out.join(format!("opaque-hash{}", std::env::consts::EXE_SUFFIX));
         let stdout = artifact_stream(&[("opaque", &root.join("tests/opaque.rs"), &executable)]);
-        let plan = plan_mutating(&[("subject", &["subject"])], &["subject"]);
         assert!(test_binaries_with_linkage(&stdout, &root, None)[0].linked_sources.is_none());
         assert_eq!(test_binaries_with_linkage(&stdout, &root, None)[0].libtest, None);
-        assert!(linked_target_args(&stdout, &root, None, &plan).is_none());
 
         let mut opaque = RustcInvocation {
             crate_name: "opaque".to_owned(),
@@ -1365,7 +1406,6 @@ mod tests {
                 .linked_sources
                 .is_none()
         );
-        assert!(linked_target_args(&stdout, &root, Some(&captures), &plan).is_none());
 
         opaque.opaque_extern = false;
         opaque.crate_types.push("rlib".to_owned());
@@ -1374,53 +1414,6 @@ mod tests {
             test_binaries_with_linkage(&stdout, &root, Some(&captures))[0]
                 .linked_sources
                 .is_none()
-        );
-        assert!(linked_target_args(&stdout, &root, Some(&captures), &plan).is_none());
-    }
-
-    #[test]
-    fn one_unmatched_filename_among_multiple_artifacts_disables_target_narrowing() {
-        let directory = tempfile::tempdir().expect("capture directory");
-        let root = Utf8PathBuf::from_path_buf(directory.path().join("workspace")).expect("utf-8 root");
-        let out = Utf8PathBuf::from_path_buf(directory.path().join("target").join("deps")).expect("utf-8 target");
-        let captures = Utf8PathBuf::from_path_buf(directory.path().join("captures")).expect("utf-8 captures");
-        fs::create_dir_all(root.join("tests").as_std_path()).expect("source directory");
-        fs::create_dir_all(out.as_std_path()).expect("output directory");
-        fs::create_dir_all(captures.as_std_path()).expect("capture directory");
-
-        let invocation = RustcInvocation {
-            crate_name: "linked".to_owned(),
-            crate_types: vec!["bin".to_owned()],
-            test: true,
-            source: root.join("tests/linked.rs"),
-            out_dir: out.clone(),
-            extra_filename: "-hash".to_owned(),
-            externs: Vec::new(),
-            opaque_extern: false,
-        };
-        write_capture(&captures, "linked", &invocation);
-        write_dep(&invocation, &[root.join("tests/linked.rs"), root.join("src/lib.rs")]);
-
-        let matched = out.join(format!("linked-hash{}", std::env::consts::EXE_SUFFIX));
-        let unmatched = out.join("linked-unmatched.rmeta");
-        let stdout = serde_json::json!({
-            "reason": "compiler-artifact",
-            "profile": {"test": true},
-            "package_id": "path+file:///workspace#subject@0.0.0",
-            "target": {
-                "name": "linked",
-                "src_path": root.join("tests/linked.rs"),
-                "kind": ["test"],
-            },
-            "filenames": [matched, unmatched],
-        })
-        .to_string();
-        let mut plan = plan_mutating(&[("subject", &["subject"])], &["subject"]);
-        plan.mutants[0].file = Utf8PathBuf::from("src/lib.rs").into();
-
-        assert!(
-            linked_target_args(&stdout, &root, Some(&captures), &plan).is_none(),
-            "an unresolved relevant artifact must fail open to the package-level build"
         );
     }
 
@@ -1546,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_dep_info_and_unsupported_targets_disable_narrowing() {
+    fn dep_info_ignores_malformed_lines_and_outside_sources() {
         let directory = tempfile::tempdir().expect("workspace parent");
         let root = Utf8PathBuf::from_path_buf(directory.path().join("workspace")).expect("utf-8 root");
         let out = root.join("target/deps");
@@ -1571,25 +1564,6 @@ mod tests {
         .expect("dep-info");
         assert_eq!(dep_sources(&invocation, &root), Some(vec![Utf8PathBuf::from("tests/subject.rs")]));
         assert!(!output_matches(&invocation, Utf8Path::new("/")));
-
-        write_capture(&captures, "subject", &invocation);
-        let artifact = out.join(format!("subject-hash{}", std::env::consts::EXE_SUFFIX));
-        let message = serde_json::json!({
-            "reason": "compiler-artifact",
-            "profile": {"test": true},
-            "target": {
-                "name": "subject",
-                "src_path": invocation.source,
-                "kind": ["bench"],
-            },
-            "filenames": [artifact],
-        })
-        .to_string();
-        let mut plan = plan_mutating(&[("subject", &["subject"])], &["subject"]);
-        plan.mutants[0].file = Utf8PathBuf::from("tests/subject.rs").into();
-
-        assert!(linked_target_args(&message, &root, Some(&captures), &plan).is_none());
-        assert!(linked_target_args("not json", &root, Some(&captures), &plan).is_none());
     }
 
     fn write_capture(directory: &Utf8Path, name: &str, capture: &RustcInvocation) {
@@ -1644,44 +1618,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn built_test_targets(root: &Utf8Path, target: &Utf8Path, args: &[&str]) -> Vec<String> {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = std::process::Command::new(cargo)
-            .current_dir(root.as_std_path())
-            .env("CARGO_TARGET_DIR", target.as_std_path())
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .args(args)
-            .arg("--message-format=json")
-            .output()
-            .expect("fixture cargo runs");
-
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-
-        let mut targets: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|message| {
-                message.get("reason").and_then(Value::as_str) == Some("compiler-artifact")
-                    && message
-                        .get("target")
-                        .and_then(|target| target.get("kind"))
-                        .and_then(Value::as_array)
-                        .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("test")))
-            })
-            .filter_map(|message| {
-                message
-                    .get("target")
-                    .and_then(|target| target.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect();
-        targets.sort();
-        targets.dedup();
-        targets
     }
 
     /// Nothing to apportion is not an error.
@@ -2491,11 +2427,6 @@ mod tests {
         let different = crate::HashSet::from_iter([Utf8PathBuf::from("src/other.rs")]);
         assert!(populations_intersect(&pending, &matching));
         assert!(!populations_intersect(&pending, &different));
-        assert!(all_associations_equal(&[matching.clone(), matching.clone()], &matching));
-        assert!(!all_associations_equal(&[matching.clone(), different], &matching));
-        assert!(!target_selection_failed(true, &[["--lib".to_owned(), String::new()]]));
-        assert!(target_selection_failed(false, &[["--lib".to_owned(), String::new()]]));
-        assert!(target_selection_failed(true, &[]));
         assert!(no_reachability(&crate::HashMap::default()));
         let mut visited = crate::HashSet::default();
         assert!(visit_capture(&mut visited, 3));

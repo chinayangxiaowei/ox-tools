@@ -94,8 +94,7 @@ pub fn kill(group: i32) -> io::Result<()> {
 
 /// Kills a group after its leader has been observed exiting without being reaped.
 ///
-/// macOS can return `EPERM` when the group contains only a zombie leader: its `killpg` path
-/// excludes zombies and reports no live members as a permission error. The same error can
+/// macOS can return `EPERM` when the group contains only a zombie leader. The same error can
 /// mean an inaccessible live member. Only a group listing containing exactly the observed,
 /// unreaped leader proves the former case; every other result preserves the permission error.
 /// The unreaped leader keeps the numeric group id tied to this subtree while it is inspected.
@@ -133,7 +132,8 @@ fn kill_after_exit_with(
 
 /// Whether a macOS process group lists exactly its own leader as its sole member.
 ///
-/// A two-entry snapshot suffices: a second member, or a sole member with another pid, is rejected.
+/// The snapshot only needs room to detect an additional member: a second member, or a sole member
+/// with another pid, is rejected.
 /// A failed or incomplete query also returns `false`. This says nothing about whether the leader
 /// has exited; callers accepting `EPERM` must first observe that exit without reaping the leader.
 #[cfg(target_os = "macos")]
@@ -141,9 +141,9 @@ fn kill_after_exit_with(
 fn only_group_leader_is_listed(group: i32) -> bool {
     only_group_leader_is_listed_with(group, |group, members| {
         let bytes = libc::c_int::try_from(core::mem::size_of_val(members))
-            .expect("two pid_t values always fit in the proc_listpgrppids byte count");
+            .expect("the fixed member buffer is far smaller than the proc_listpgrppids byte-count limit");
 
-        // SAFETY: `members` is writable storage for two pid_t values, and `bytes` is its exact
+        // SAFETY: `members` is writable pid_t storage, and `bytes` is derived from its exact
         // byte length. The kernel writes no more than this length and returns the number of pids
         // written.
         let listed = unsafe { libc::proc_listpgrppids(group, members.as_mut_ptr().cast(), bytes) };
@@ -307,6 +307,28 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 
+    /// A process id that is not this process's child cannot be observed for its exit, so the kernel
+    /// reports `ECHILD` even though no competing waiter reaped it.
+    #[test]
+    fn observing_a_pid_that_is_not_this_process_own_child_fails() {
+        // Pid 1 (init, or the container's own init process) is never this test's child.
+        let error = exited(1).expect_err("pid 1 is not this process's child");
+
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(is_no_child_to_wait_for(&error));
+        assert!(!is_no_child_to_wait_for(&io::Error::from_raw_os_error(libc::EPERM)));
+    }
+}
+
+/// Decision tests whose operating-system results are scripted, so they also run under Miri.
+///
+/// The process identifiers are arbitrary positive values: only whether a listed member equals the
+/// leader matters.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod scripted_tests {
+    use super::*;
+
     #[test]
     fn a_pending_waitid_result_is_not_an_exit() {
         let exited = exited_with_waitid(42, |pid| {
@@ -407,17 +429,5 @@ mod tests {
         .expect_err("another group member means EPERM cannot be dismissed");
 
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-    }
-
-    /// A process id that is not this process's child cannot be observed for its exit, so the kernel
-    /// reports `ECHILD` even though no competing waiter reaped it.
-    #[test]
-    fn observing_a_pid_that_is_not_this_process_own_child_fails() {
-        // Pid 1 (init, or the container's own init process) is never this test's child.
-        let error = exited(1).expect_err("pid 1 is not this process's child");
-
-        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
-        assert!(is_no_child_to_wait_for(&error));
-        assert!(!is_no_child_to_wait_for(&io::Error::from_raw_os_error(libc::EPERM)));
     }
 }

@@ -12,6 +12,8 @@
 //! …content owned by anvil…
 //! # <<< anvil-managed: <id>
 //! ```
+//! XML hosts use complete XML comment lines instead:
+//! `<!-- >>> anvil-managed: <id> -->`.
 //!
 //! The user's content outside the sentinels is preserved byte-for-byte, with
 //! a single exception: introducing a region into a TOML host removes a
@@ -28,17 +30,23 @@ use std::fmt::Write as _;
 
 use ohno::{AppError, app_err, bail};
 use toml_edit::{Item, Key, RawString, Table};
+use xmlparser::{ElementEnd, Token, Tokenizer};
 
 /// Comment syntax used by the host file.
 ///
-/// Both supported flavors today use `#`-prefixed comments (Justfiles,
-/// TOML, YAML). `//` is reserved for future hosts (e.g. JSON5).
+/// Markers always occupy a complete comment line in the host syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentSyntax {
     /// `#`-prefixed line comments — Justfile, TOML, YAML.
     Hash,
     /// `//`-prefixed line comments — JSON5 and friends.
     SlashSlash,
+    /// `<!-- ... -->` comments — XML and `MSBuild` project files.
+    ///
+    /// The region ID must not contain `--`, CR, LF, or characters forbidden
+    /// by XML 1.0. [`crate::catalog::CatalogBuilder::build`] validates this
+    /// syntax-specific requirement.
+    Xml,
 }
 
 /// Lexical ownership boundaries shared by every region in a host.
@@ -46,6 +54,8 @@ pub enum CommentSyntax {
 pub(crate) enum HostScanner {
     /// Only actual TOML comment tokens can carry sentinels.
     Toml,
+    /// Only actual JSONC line-comment tokens can carry sentinels.
+    Json,
     /// Full lines are interpreted using the region's comment syntax.
     Lines,
 }
@@ -62,13 +72,25 @@ impl HostScanner {
     pub(crate) fn find<'a>(self, text: &'a str, id: &str, syntax: CommentSyntax) -> Result<Option<Region<'a>>, AppError> {
         match self {
             Self::Toml => find_toml_region(text, id, syntax),
+            Self::Json => {
+                validate_json_comment_scan(text)?;
+                find_region_in_lines(text, id, syntax, json_comment_lines(text))
+            }
             Self::Lines => find_region(text, id, syntax),
+        }
+    }
+
+    pub(crate) fn validate_marker_scan(self, text: &str) -> Result<(), AppError> {
+        match self {
+            Self::Json => validate_json_comment_scan(text),
+            Self::Toml | Self::Lines => Ok(()),
         }
     }
 
     pub(crate) fn repair(self, text: &str, id: &str, syntax: CommentSyntax) -> MarkerRepair {
         match self {
             Self::Toml => repair_toml_markers(text, id, syntax),
+            Self::Json => repair_markers_in_lines(text, id, syntax, json_comment_lines(text)),
             Self::Lines => repair_markers(text, id, syntax),
         }
     }
@@ -76,6 +98,10 @@ impl HostScanner {
     pub(crate) fn remove(self, text: &str, id: &str, syntax: CommentSyntax) -> Result<String, AppError> {
         match self {
             Self::Toml => remove_toml_region(text, id, syntax),
+            Self::Json => {
+                validate_json_comment_scan(text)?;
+                crate::emit::json_array_region::remove_json_region(text, id, syntax)
+            }
             Self::Lines => remove_region(text, id, syntax),
         }
     }
@@ -83,6 +109,7 @@ impl HostScanner {
     pub(crate) fn insert_after(self, text: &str, id: &str, extra: &str, syntax: CommentSyntax) -> Result<String, AppError> {
         match self {
             Self::Toml => insert_after_located_region(text, id, extra, || self.find(text, id, syntax)),
+            Self::Json => insert_after_located_region(text, id, extra, || self.find(text, id, syntax)),
             Self::Lines => insert_after_region(text, id, extra, syntax),
         }
     }
@@ -90,6 +117,7 @@ impl HostScanner {
     pub(crate) fn ids(self, text: &str, syntax: CommentSyntax) -> Vec<String> {
         match self {
             Self::Toml => toml_region_ids(text, syntax),
+            Self::Json => json_region_ids(text, syntax),
             Self::Lines => managed_region_ids(text, syntax),
         }
     }
@@ -114,10 +142,47 @@ pub enum RegionPlacement {
 }
 
 impl CommentSyntax {
-    fn prefix(self) -> &'static str {
+    fn marker(self, id: &str, opens: bool) -> String {
+        let direction = if opens { ">>>" } else { "<<<" };
         match self {
-            Self::Hash => "#",
-            Self::SlashSlash => "//",
+            Self::Hash => format!("# {direction} anvil-managed: {id}"),
+            Self::SlashSlash => format!("// {direction} anvil-managed: {id}"),
+            Self::Xml => format!("<!-- {direction} anvil-managed: {id} -->"),
+        }
+    }
+
+    fn marker_id(self, line: &str, opens: bool) -> Option<&str> {
+        match self {
+            Self::Hash if opens => line.strip_prefix("# >>> anvil-managed:").map(str::trim),
+            Self::Hash => line.strip_prefix("# <<< anvil-managed:").map(str::trim),
+            Self::SlashSlash if opens => line.strip_prefix("// >>> anvil-managed:").map(str::trim),
+            Self::SlashSlash => line.strip_prefix("// <<< anvil-managed:").map(str::trim),
+            Self::Xml if opens => line
+                .strip_prefix("<!-- >>> anvil-managed:")
+                .and_then(|rest| rest.strip_suffix("-->"))
+                .map(str::trim),
+            Self::Xml => line
+                .strip_prefix("<!-- <<< anvil-managed:")
+                .and_then(|rest| rest.strip_suffix("-->"))
+                .map(str::trim),
+        }
+    }
+
+    fn is_header_comment(self, line: &str) -> bool {
+        match self {
+            Self::Hash => line
+                .strip_prefix('#')
+                .map(str::trim_start)
+                .is_some_and(|comment| !comment.starts_with(">>> anvil-managed:") && !comment.starts_with("<<< anvil-managed:")),
+            Self::SlashSlash => line
+                .strip_prefix("//")
+                .map(str::trim_start)
+                .is_some_and(|comment| !comment.starts_with(">>> anvil-managed:") && !comment.starts_with("<<< anvil-managed:")),
+            Self::Xml => line
+                .strip_prefix("<!--")
+                .and_then(|comment| comment.strip_suffix("-->"))
+                .map(str::trim)
+                .is_some_and(|comment| !comment.starts_with(">>> anvil-managed:") && !comment.starts_with("<<< anvil-managed:")),
         }
     }
 }
@@ -200,7 +265,11 @@ fn is_horizontal_whitespace(character: char) -> bool {
 /// The host is left exactly as found and the caller refuses the region.
 #[must_use]
 pub fn repair_markers(text: &str, id: &str, syntax: CommentSyntax) -> MarkerRepair {
-    repair_markers_in_lines(text, id, syntax, iterate_lines(text))
+    if syntax == CommentSyntax::Xml {
+        repair_markers_in_lines(text, id, syntax, xml_comment_lines(text).into_iter())
+    } else {
+        repair_markers_in_lines(text, id, syntax, iterate_lines(text))
+    }
 }
 
 pub(crate) fn repair_toml_markers(text: &str, id: &str, syntax: CommentSyntax) -> MarkerRepair {
@@ -208,8 +277,8 @@ pub(crate) fn repair_toml_markers(text: &str, id: &str, syntax: CommentSyntax) -
 }
 
 fn repair_markers_in_lines(text: &str, id: &str, syntax: CommentSyntax, lines: impl Iterator<Item = ByteRange>) -> MarkerRepair {
-    let opener = format!("{} >>> anvil-managed: {id}", syntax.prefix());
-    let closer = format!("{} <<< anvil-managed: {id}", syntax.prefix());
+    let opener = syntax.marker(id, true);
+    let closer = syntax.marker(id, false);
     let markers: Vec<(ByteRange, bool)> = lines
         .filter_map(|line| {
             let value = text[line.start..line.end].trim();
@@ -227,7 +296,6 @@ fn repair_markers_in_lines(text: &str, id: &str, syntax: CommentSyntax, lines: i
     }
     let start = markers.iter().position(|(_, opens)| *opens);
     let end = start.and_then(|start| {
-        // #[gamma::skip(expr.increment, reason = "markers[start] is an opener and the search accepts only closers, so starting at start + 1 finds the same closer")]
         let mut candidates = markers.iter().enumerate().skip(start);
         candidates.find(|(_, (_, opens))| !opens).map(|(index, _)| index)
     });
@@ -255,7 +323,191 @@ fn repair_markers_in_lines(text: &str, id: &str, syntax: CommentSyntax, lines: i
 /// sentinels for the same id, an opening sentinel with no matching close,
 /// or a close before its open.
 pub fn find_region<'a>(text: &'a str, id: &str, syntax: CommentSyntax) -> Result<Option<Region<'a>>, AppError> {
-    find_region_in_lines(text, id, syntax, iterate_lines(text))
+    if syntax == CommentSyntax::Xml {
+        find_region_in_lines(text, id, syntax, xml_comment_lines(text).into_iter())
+    } else {
+        find_region_in_lines(text, id, syntax, iterate_lines(text))
+    }
+}
+
+/// Complete physical lines occupied by actual XML comment tokens.
+///
+/// This is marker evidence only. Tokenizer failures end discovery early, so an
+/// empty result does not prove that a malformed document contains no later
+/// marker-shaped text; callers that need proof of absence must separately
+/// validate the complete XML document.
+fn xml_comment_lines(text: &str) -> Vec<ByteRange> {
+    let comments: BTreeSet<_> = xml_comment_ranges(text)
+        .into_iter()
+        .map(|comment| (comment.start, comment.end))
+        .collect();
+    iterate_lines(text)
+        .filter(|line| {
+            let content = &text[line.start..line.end];
+            let without_ending = content.trim_end_matches(is_line_ending);
+            let leading = without_ending.len() - without_ending.trim_start_matches(is_horizontal_whitespace).len();
+            let trimmed = without_ending.trim_end_matches(is_horizontal_whitespace);
+            let end = line.start + trimmed.len();
+            comments.contains(&(line.start + leading, end))
+        })
+        .collect()
+}
+
+/// Byte ranges for XML comment tokens observed before any tokenizer failure.
+///
+/// Errors are intentionally discarded here because marker discovery is also
+/// used on non-XML hosts while inferring legacy syntax. The result is therefore
+/// evidence of comments that were seen, not proof that no later comments
+/// exist. Retirement combines it with [`xml_comment_scan_failed`] and raw
+/// marker-line evidence before concluding that a tracked XML region is absent.
+fn xml_comment_ranges(text: &str) -> Vec<ByteRange> {
+    Tokenizer::from(text)
+        .filter_map(|token| match token {
+            Ok(Token::Comment { span, .. }) => {
+                let range = span.range();
+                Some(ByteRange {
+                    start: range.start,
+                    end: range.end,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn xml_comment_scan_failed(text: &str) -> bool {
+    Tokenizer::from(text).any(|token| token.is_err())
+}
+
+pub(crate) fn raw_marker_line_present(text: &str, id: &str, syntax: CommentSyntax) -> bool {
+    let opener = syntax.marker(id, true);
+    let closer = syntax.marker(id, false);
+    iterate_lines(text).any(|line| {
+        let value = text[line.start..line.end].trim();
+        value == opener || value == closer
+    })
+}
+
+/// Parsed document-root byte bounds used to validate ownership and placement.
+///
+/// `opening_end` and `closing_start` bound content inside the root element.
+/// `closing_line_start` is present only when the closing tag occupies a whole
+/// trimmed physical line and can therefore anchor an absent managed region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct XmlRootBounds {
+    pub opening_end: usize,
+    pub closing_start: usize,
+    pub closing_line_start: Option<usize>,
+}
+
+fn complete_line_start(text: &str, range: std::ops::Range<usize>) -> Option<usize> {
+    let line_start = text[..range.start].rfind('\n').map_or(0, |newline| newline + 1);
+    let line_end = text[range.end..].find('\n').map_or(text.len(), |newline| range.end + newline);
+    let line = text[line_start..line_end].trim_end_matches('\r');
+    (line.trim() == &text[range]).then_some(line_start)
+}
+
+fn qualified_xml_name(prefix: &str, local: &str) -> String {
+    if prefix.is_empty() {
+        local.to_owned()
+    } else {
+        format!("{prefix}:{local}")
+    }
+}
+
+fn close_xml_element(stack: &mut Vec<(&str, &str)>, prefix: &str, local: &str) -> Result<(), String> {
+    let Some(opened) = stack.pop() else {
+        return Err(format!(
+            "the XML host closes `{}` without a matching opening element",
+            qualified_xml_name(prefix, local)
+        ));
+    };
+    if opened.0 != prefix || opened.1 != local {
+        return Err(format!(
+            "the XML host closes `{}` while `{}` is still open",
+            qualified_xml_name(prefix, local),
+            qualified_xml_name(opened.0, opened.1),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_xml_root(
+    root_is_empty: bool,
+    root_opening_end: Option<usize>,
+    root_close: Option<(usize, Option<usize>)>,
+) -> Result<Option<XmlRootBounds>, String> {
+    if root_is_empty {
+        return Ok(None);
+    }
+    match (root_opening_end, root_close) {
+        (Some(opening_end), Some((closing_start, closing_line_start))) => Ok(Some(XmlRootBounds {
+            opening_end,
+            closing_start,
+            closing_line_start,
+        })),
+        (None, None) => Err("the XML host has no document element".to_owned()),
+        _ => Err("the XML host has an incomplete document element".to_owned()),
+    }
+}
+
+/// Validate the complete XML token stream and return document-root bounds.
+///
+/// `Ok(None)` means the document element is self-closing. Missing, malformed,
+/// mismatched, incomplete, or trailing document content returns an error.
+pub(crate) fn xml_document_root(text: &str) -> Result<Option<XmlRootBounds>, String> {
+    let mut pending = None;
+    let mut stack: Vec<(&str, &str)> = Vec::new();
+    let mut root_opening_end = None;
+    let mut root_close = None;
+    let mut root_is_empty = false;
+    for token in Tokenizer::from(text) {
+        match token.map_err(|error| format!("the XML host is malformed: {error}"))? {
+            Token::ElementStart { prefix, local, .. } => {
+                pending = Some((prefix.as_str(), local.as_str()));
+            }
+            Token::ElementEnd {
+                end: ElementEnd::Open,
+                span,
+            } => {
+                if stack.is_empty() {
+                    root_opening_end = Some(span.end());
+                }
+                stack.push(
+                    pending
+                        .take()
+                        .ok_or_else(|| "the XML tokenizer reported an opening delimiter without an element".to_owned())?,
+                );
+            }
+            Token::ElementEnd {
+                end: ElementEnd::Empty, ..
+            } => {
+                let is_root = stack.is_empty();
+                pending = None;
+                if is_root {
+                    root_is_empty = true;
+                }
+            }
+            Token::ElementEnd {
+                end: ElementEnd::Close(prefix, local),
+                span,
+            } => {
+                close_xml_element(&mut stack, prefix.as_str(), local.as_str())?;
+                if stack.is_empty() {
+                    let range = span.range();
+                    root_close = Some((range.start, complete_line_start(text, range)));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((prefix, local)) = stack.last() {
+        return Err(format!(
+            "the XML host has no closing element for `{}`",
+            qualified_xml_name(prefix, local)
+        ));
+    }
+    finish_xml_root(root_is_empty, root_opening_end, root_close)
 }
 
 /// Locate ownership only at TOML comment tokens, including in a duplicate-table intermediate.
@@ -277,14 +529,108 @@ pub(crate) fn toml_comment_lines(text: &str) -> impl Iterator<Item = ByteRange> 
     })
 }
 
+/// Full JSONC line comments retain original byte bounds; string contents and
+/// block comments never qualify as ownership sentinels.
+#[mutants::skip] // Byte-level JSONC lexical state machine; marker/string/block-comment behavior is covered exhaustively by json_array_region tests.
+pub(crate) fn json_comment_lines(text: &str) -> impl Iterator<Item = ByteRange> + '_ {
+    iterate_lines(text)
+        .scan((None, false, false), move |(string, escaped, block_comment), line| {
+            let content = &text[line.start..line.end];
+            let leading = content.len() - content.trim_start_matches(is_horizontal_whitespace).len();
+            let bytes = content.as_bytes();
+            let full_line_comment =
+                string.is_none() && !*block_comment && bytes.get(leading) == Some(&b'/') && bytes.get(leading + 1) == Some(&b'/');
+            let mut index = 0;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                if let Some(quote) = *string {
+                    if *escaped {
+                        *escaped = false;
+                    } else if byte == b'\\' {
+                        *escaped = true;
+                    } else if byte == quote {
+                        *string = None;
+                    }
+                } else if *block_comment {
+                    if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                        *block_comment = false;
+                        index += 1;
+                    }
+                } else if matches!(byte, b'"' | b'\'') {
+                    *string = Some(byte);
+                } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    break;
+                } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    *block_comment = true;
+                    index += 1;
+                }
+                index += 1;
+            }
+            Some(full_line_comment.then_some(line))
+        })
+        .flatten()
+}
+
+#[mutants::skip] // Byte-level JSONC lexical state machine; malformed strings/comments and valid scanner hosts are covered through planner behavior.
+fn validate_json_comment_scan(text: &str) -> Result<(), AppError> {
+    let bytes = text.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut line_comment = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if line_comment {
+            if matches!(byte, b'\r' | b'\n') {
+                line_comment = false;
+            }
+        } else if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                if byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if matches!(byte, b'\r' | b'\n') {
+                bail!("JSON-like host contains an unescaped line ending inside a quoted string; escape it or close the string");
+            } else if byte == active_quote {
+                quote = None;
+            }
+        } else if block_comment {
+            if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_comment = false;
+                index += 1;
+            }
+        } else if matches!(byte, b'"' | b'\'') {
+            quote = Some(byte);
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            line_comment = true;
+            index += 1;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            block_comment = true;
+            index += 1;
+        }
+        index += 1;
+    }
+    if block_comment {
+        bail!("JSON-like host contains an unterminated block comment; close it before managing regions");
+    }
+    if quote.is_some() {
+        bail!("JSON-like host contains an unterminated quoted string; close it before managing regions");
+    }
+    Ok(())
+}
+
 pub(crate) fn find_region_in_lines<'a>(
     text: &'a str,
     id: &str,
     syntax: CommentSyntax,
     lines: impl Iterator<Item = ByteRange>,
 ) -> Result<Option<Region<'a>>, AppError> {
-    let opener = format!("{} >>> anvil-managed: {id}", syntax.prefix());
-    let closer = format!("{} <<< anvil-managed: {id}", syntax.prefix());
+    let opener = syntax.marker(id, true);
+    let closer = syntax.marker(id, false);
 
     let mut start_line: Option<ByteRange> = None;
     let mut end_line: Option<ByteRange> = None;
@@ -406,7 +752,6 @@ pub(crate) fn upsert_located_region_with_newline(
             let without_region = remove_located_region(text, Some(region));
             return prepend_region(&without_region, &rendered, syntax, newline);
         }
-        // #[gamma::skip(literal.int_increment, reason = "changes only spare String capacity; emitted region text is identical")]
         // #[gamma::skip(arith.add_to_mul, reason = "the allocation estimate changes capacity only; all three region slices are still appended")]
         let mut out = String::with_capacity(text.len() + rendered.len());
         out.push_str(&text[..region.start_line.start]);
@@ -473,11 +818,7 @@ pub(crate) fn start_region_offset(text: &str, syntax: CommentSyntax) -> usize {
         .split_inclusive('\n')
         .take_while(|line| {
             let line = line.trim();
-            line.is_empty()
-                || line
-                    .strip_prefix(syntax.prefix())
-                    .map(str::trim_start)
-                    .is_some_and(|comment| !comment.starts_with(">>> anvil-managed:") && !comment.starts_with("<<< anvil-managed:"))
+            line.is_empty() || syntax.is_header_comment(line)
         })
         .map(str::len)
         .sum();
@@ -501,7 +842,7 @@ fn prepend_region(text: &str, rendered: &str, syntax: CommentSyntax, newline: &s
 
 fn separate_region(out: &mut String, newline: &str) {
     if !out.is_empty() {
-        if !out.ends_with('\n') {
+        if !out.ends_with(['\r', '\n']) {
             out.push_str(newline);
         }
         if trailing_blank_line_len(out) == 0 {
@@ -513,38 +854,59 @@ fn separate_region(out: &mut String, newline: &str) {
 fn leading_newline_len(text: &str) -> usize {
     if text.starts_with("\r\n") {
         2
+    } else if text.starts_with('\r') {
+        1
     } else {
         usize::from(text.starts_with('\n'))
     }
 }
 
+#[mutants::skip] // The surviving comparison mutation is equivalent when `last == 0`; newline preservation is covered by byte-exact region tests.
 fn trailing_blank_line_len(text: &str) -> usize {
-    if text.ends_with("\n\r\n") {
+    let last = trailing_newline_len(text);
+    if last > 0 && trailing_newline_len(&text[..text.len() - last]) > 0 {
+        last
+    } else {
+        0
+    }
+}
+
+fn trailing_newline_len(text: &str) -> usize {
+    if text.ends_with("\r\n") {
         2
     } else {
-        usize::from(text.ends_with("\n\n"))
+        usize::from(text.ends_with(['\r', '\n']))
     }
 }
 
 fn render_region(id: &str, body: &str, syntax: CommentSyntax, newline: &str) -> String {
-    let prefix = syntax.prefix();
     // #[gamma::skip(arith.add_to_mul, literal.int_decrement, literal.int_increment, literal.int_to_one, literal.int_to_zero, reason = "these nonnegative allocation estimates change capacity only; the writer still appends both sentinels and every body line")]
     let mut out = String::with_capacity(body.len() + 80);
-    out.push_str(prefix);
-    out.push_str(" >>> anvil-managed: ");
-    out.push_str(id);
+    out.push_str(&syntax.marker(id, true));
     out.push_str(newline);
-    for line in body.split_inclusive('\n') {
-        let content = line
-            .strip_suffix('\n')
-            .map_or(line, |content| content.strip_suffix('\r').unwrap_or(content));
-        out.push_str(content);
+    out.push_str(&render_body_with_newline(body, newline));
+    out.push_str(&syntax.marker(id, false));
+    out.push_str(newline);
+    out
+}
+
+pub(crate) fn render_body_with_newline(body: &str, newline: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.as_bytes().iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+        out.push_str(&rest[..at]);
+        out.push_str(newline);
+        let ending_len = if rest.as_bytes()[at] == b'\r' && rest.as_bytes().get(at + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        rest = &rest[at + ending_len..];
+    }
+    if !rest.is_empty() {
+        out.push_str(rest);
         out.push_str(newline);
     }
-    out.push_str(prefix);
-    out.push_str(" <<< anvil-managed: ");
-    out.push_str(id);
-    out.push_str(newline);
     out
 }
 
@@ -586,7 +948,7 @@ pub(crate) fn remove_toml_region(text: &str, id: &str, syntax: CommentSyntax) ->
     Ok(remove_located_region(text, region))
 }
 
-fn remove_located_region(text: &str, region: Option<Region<'_>>) -> String {
+pub(crate) fn remove_located_region(text: &str, region: Option<Region<'_>>) -> String {
     let Some(region) = region else {
         return text.to_owned();
     };
@@ -964,7 +1326,6 @@ fn adopt_dotted_child_assignments(
         .iter()
         // #[gamma::skip(logical.and_remove_left, tag = "timeout", reason = "accepting array tables as parents drives malformed dotted adoption through a search that exceeds the campaign budget")]
         .find(|table| !table.array_of_tables && table.path == parent_path)?;
-    // #[gamma::skip(expr.increment, reason = "every use clamps this fallback with an entry span ending at or before text.len(); increasing only the fallback cannot change a slice")]
     let fallback_end = text.len();
     let end = boundary_after(boundaries, candidate.header.start, fallback_end);
     let mut deletions = Vec::new();
@@ -1101,8 +1462,9 @@ fn tidy_residue(residue: &str, host_newline: &str) -> String {
 
 /// The first line ending in `text`, or LF when there is no line break.
 pub(crate) fn text_newline(text: &str) -> &'static str {
-    match text.find('\n') {
-        Some(at) if text[..at].ends_with('\r') => "\r\n",
+    match text.as_bytes().iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+        Some(at) if text.as_bytes()[at] == b'\r' && text.as_bytes().get(at + 1) == Some(&b'\n') => "\r\n",
+        Some(at) if text.as_bytes()[at] == b'\r' => "\r",
         _ => "\n",
     }
 }
@@ -1287,7 +1649,6 @@ fn adopt_unmanaged_root_settings(text: &str, body: &str, syntax: CommentSyntax) 
     let mut out = String::new();
     let mut cursor = 0;
     let mut adopted = false;
-    // #[gamma::skip(expr.increment, reason = "table_entries bounds every entry end by text.len(); increasing only the boundary fallback is erased by the surrounding min")]
     let fallback_end = text.len();
     for entry in table_entries(document.as_table(), &masked) {
         let Some(value) = values.get(&entry.path) else { continue };
@@ -1462,6 +1823,13 @@ pub(crate) fn toml_region_ids(text: &str, syntax: CommentSyntax) -> Vec<String> 
     toml_region_ranges_with_ids(text, syntax).into_iter().map(|(id, _)| id).collect()
 }
 
+pub(crate) fn json_region_ids(text: &str, syntax: CommentSyntax) -> Vec<String> {
+    region_ranges_in_lines(text, syntax, json_comment_lines(text))
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
 fn mask_regions(text: &str, ranges: &[ByteRange]) -> String {
     // #[gamma::skip(cond.always_false, reason = "with no ranges the loop does nothing and the final append copies the complete input text")]
     if ranges.is_empty() {
@@ -1496,7 +1864,11 @@ fn toml_region_ranges(text: &str, syntax: CommentSyntax) -> Vec<ByteRange> {
 
 /// Lexical sentinel pairs, independent of the host format.
 fn managed_region_ranges_with_ids(text: &str, syntax: CommentSyntax) -> Vec<(String, ByteRange)> {
-    region_ranges_in_lines(text, syntax, iterate_lines(text))
+    if syntax == CommentSyntax::Xml {
+        region_ranges_in_lines(text, syntax, xml_comment_lines(text).into_iter())
+    } else {
+        region_ranges_in_lines(text, syntax, iterate_lines(text))
+    }
 }
 
 fn toml_region_ranges_with_ids(text: &str, syntax: CommentSyntax) -> Vec<(String, ByteRange)> {
@@ -1504,17 +1876,14 @@ fn toml_region_ranges_with_ids(text: &str, syntax: CommentSyntax) -> Vec<(String
 }
 
 fn region_ranges_in_lines(text: &str, syntax: CommentSyntax, lines: impl Iterator<Item = ByteRange>) -> Vec<(String, ByteRange)> {
-    let open = syntax.prefix().to_owned() + " >>> anvil-managed:";
-    let close = syntax.prefix().to_owned() + " <<< anvil-managed:";
-
     let mut ranges = Vec::new();
     let mut start = None;
     for line in lines {
         let trimmed = text[line.start..line.end].trim();
-        if let Some(id) = trimmed.strip_prefix(&open) {
-            start.get_or_insert_with(|| (id.trim().to_owned(), line.start));
-        } else if let Some(closing_id) = trimmed.strip_prefix(&close)
-            && start.as_ref().is_some_and(|(id, _)| id == closing_id.trim())
+        if let Some(id) = syntax.marker_id(trimmed, true) {
+            start.get_or_insert_with(|| (id.to_owned(), line.start));
+        } else if let Some(closing_id) = syntax.marker_id(trimmed, false)
+            && start.as_ref().is_some_and(|(id, _)| id == closing_id)
             && let Some((id, open_at)) = start.take()
         {
             ranges.push((
@@ -1557,7 +1926,8 @@ impl Iterator for LineIter<'_> {
         }
         let start = self.pos;
         let rest = &self.text[start..];
-        let end = match rest.find('\n') {
+        let end = match rest.as_bytes().iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+            Some(i) if rest.as_bytes()[i] == b'\r' && rest.as_bytes().get(i + 1) == Some(&b'\n') => start + i + 2,
             Some(i) => start + i + 1,
             None => self.text.len(),
         };
@@ -1580,6 +1950,26 @@ mod tests {
     use super::*;
 
     const SYN: CommentSyntax = CommentSyntax::Hash;
+
+    #[test]
+    fn dotted_root_setting_conflicts_report_the_full_key_path() {
+        let adoption = adopt_unmanaged_toml_tables("settings.feature = true\n", "settings.feature = false\n", SYN);
+
+        let TomlAdoption::Conflict {
+            table,
+            key,
+            managed,
+            hand_written,
+        } = adoption
+        else {
+            panic!("a different dotted setting must be reported as a conflict: {adoption:?}");
+        };
+
+        assert_eq!(table, "<root>");
+        assert_eq!(key, "settings.feature");
+        assert_eq!(managed, "false");
+        assert_eq!(hand_written, "true");
+    }
 
     #[test]
     fn nonempty_legacy_bodies_without_the_parent_header_stay_masked() {
@@ -2279,6 +2669,15 @@ mod tests {
     }
 
     #[test]
+    fn bare_cr_region_introduction_and_removal_restore_the_host() {
+        let host = "user\r";
+        let introduced = upsert_region(host, "x", "body\n", SYN).unwrap();
+
+        assert_eq!(introduced, "user\r\r# >>> anvil-managed: x\rbody\r# <<< anvil-managed: x\r");
+        assert_eq!(remove_region(&introduced, "x", SYN).unwrap(), host);
+    }
+
+    #[test]
     fn crlf_residue_insertion_supplies_matching_terminators_and_separator() {
         let region = "# >>> anvil-managed: x\r\n[advisories]\r\n# <<< anvil-managed: x";
         assert_eq!(
@@ -2484,6 +2883,306 @@ mod tests {
         let text = "// >>> anvil-managed: x\nbody\n// <<< anvil-managed: x\n";
         let region = find_region(text, "x", CommentSyntax::SlashSlash).unwrap().unwrap();
         assert_eq!(region.body_str(), "body\n");
+    }
+
+    #[test]
+    fn header_comment_detection_excludes_markers_for_every_syntax() {
+        for (syntax, header, opener, closer) in [
+            (
+                CommentSyntax::Hash,
+                "# copyright",
+                "# >>> anvil-managed: x",
+                "# <<< anvil-managed: x",
+            ),
+            (
+                CommentSyntax::SlashSlash,
+                "// copyright",
+                "// >>> anvil-managed: x",
+                "// <<< anvil-managed: x",
+            ),
+            (
+                CommentSyntax::Xml,
+                "<!-- copyright -->",
+                "<!-- >>> anvil-managed: x -->",
+                "<!-- <<< anvil-managed: x -->",
+            ),
+        ] {
+            assert!(syntax.is_header_comment(header));
+            assert!(!syntax.is_header_comment(opener));
+            assert!(!syntax.is_header_comment(closer));
+            assert!(!syntax.is_header_comment("not a comment"));
+        }
+    }
+
+    #[test]
+    fn marker_id_distinguishes_openers_and_closers_for_every_syntax() {
+        for (syntax, opener, closer) in [
+            (CommentSyntax::Hash, "# >>> anvil-managed: x", "# <<< anvil-managed: x"),
+            (CommentSyntax::SlashSlash, "// >>> anvil-managed: x", "// <<< anvil-managed: x"),
+            (CommentSyntax::Xml, "<!-- >>> anvil-managed: x -->", "<!-- <<< anvil-managed: x -->"),
+        ] {
+            assert_eq!(syntax.marker_id(opener, true), Some("x"));
+            assert_eq!(syntax.marker_id(opener, false), None);
+            assert_eq!(syntax.marker_id(closer, true), None);
+            assert_eq!(syntax.marker_id(closer, false), Some("x"));
+        }
+    }
+
+    #[test]
+    fn xml_syntax_renders_a_complete_comment_line_pair() {
+        let new = upsert_region(
+            "",
+            "anvil-cloudbuild-projects",
+            "<Project Include=\"src/demo\" />\n",
+            CommentSyntax::Xml,
+        )
+        .unwrap();
+        assert_eq!(
+            new,
+            "<!-- >>> anvil-managed: anvil-cloudbuild-projects -->\n\
+             <Project Include=\"src/demo\" />\n\
+             <!-- <<< anvil-managed: anvil-cloudbuild-projects -->\n"
+        );
+    }
+
+    #[test]
+    fn xml_syntax_finds_and_updates_in_place_without_touching_surrounding_xml() {
+        let text = concat!(
+            "<?xml version=\"1.0\"?>\r\n",
+            "<Project>\r\n",
+            "  <ItemGroup Label=\"user-before\" />\r\n",
+            "  <!-- >>> anvil-managed: anvil-cloudbuild-projects -->\r\n",
+            "  <Project Include=\"old.proj\" />\r\n",
+            "  <!-- <<< anvil-managed: anvil-cloudbuild-projects -->\r\n",
+            "  <Target Name=\"UserAfter\" />\r\n",
+            "</Project>\r\n",
+        );
+        let region = find_region(text, "anvil-cloudbuild-projects", CommentSyntax::Xml).unwrap().unwrap();
+        assert_eq!(region.body_str(), "  <Project Include=\"old.proj\" />\r\n");
+
+        let updated = upsert_region(
+            text,
+            "anvil-cloudbuild-projects",
+            "  <Project Include=\"new.proj\" />\n",
+            CommentSyntax::Xml,
+        )
+        .unwrap();
+        assert_eq!(
+            updated,
+            concat!(
+                "<?xml version=\"1.0\"?>\r\n",
+                "<Project>\r\n",
+                "  <ItemGroup Label=\"user-before\" />\r\n",
+                "<!-- >>> anvil-managed: anvil-cloudbuild-projects -->\r\n",
+                "  <Project Include=\"new.proj\" />\r\n",
+                "<!-- <<< anvil-managed: anvil-cloudbuild-projects -->\r\n",
+                "  <Target Name=\"UserAfter\" />\r\n",
+                "</Project>\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn xml_syntax_refuses_unpaired_markers() {
+        let text = "<Project>\n<!-- >>> anvil-managed: x -->\n<ItemGroup />\n</Project>\n";
+        assert_eq!(
+            find_region(text, "x", CommentSyntax::Xml).unwrap_err().to_string(),
+            "region 'x' has an opening sentinel but no closing sentinel"
+        );
+        assert_eq!(repair_markers(text, "x", CommentSyntax::Xml), MarkerRepair::Unpaired);
+    }
+
+    #[test]
+    fn xml_marker_shaped_text_must_be_a_complete_xml_comment_line() {
+        let text = "<Project>\n\
+                    <PropertyGroup><Note>&lt;!-- >>> anvil-managed: x --&gt;</Note></PropertyGroup>\n\
+                    <!-- prefix >>> anvil-managed: x -->\n\
+                    <!-- >>> anvil-managed: x --> suffix\n\
+                    body\n\
+                    <!-- <<< anvil-managed: x --> suffix\n\
+                    </Project>\n";
+        assert_eq!(find_region(text, "x", CommentSyntax::Xml).unwrap(), None);
+        assert_eq!(
+            repair_markers(text, "x", CommentSyntax::Xml),
+            MarkerRepair::Repaired(text.to_owned())
+        );
+    }
+
+    #[test]
+    fn xml_marker_shaped_lines_inside_cdata_are_not_regions() {
+        let text = "<Project>\n<![CDATA[\n<!-- >>> anvil-managed: x -->\nuser text\n<!-- <<< anvil-managed: x -->\n]]>\n</Project>\n";
+
+        assert_eq!(find_region(text, "x", CommentSyntax::Xml).unwrap(), None);
+        assert_eq!(
+            repair_markers(text, "x", CommentSyntax::Xml),
+            MarkerRepair::Repaired(text.to_owned())
+        );
+    }
+
+    #[test]
+    fn xml_comment_lines_require_the_comment_to_fill_the_trimmed_line() {
+        let text = "<root>\nprefix <!-- first -->\n<!-- second --> suffix\n  <!-- third -->  \n</root>\n";
+        let third_start = text.find("  <!-- third").unwrap();
+        let third_end = text[third_start..].find('\n').map_or(text.len(), |offset| third_start + offset + 1);
+        assert_eq!(
+            xml_comment_lines(text),
+            vec![ByteRange {
+                start: third_start,
+                end: third_end,
+            }]
+        );
+    }
+
+    #[test]
+    fn xml_comment_ranges_report_only_actual_comment_tokens() {
+        let text = "<root><!--c--><![CDATA[z]]><?data value?></root>";
+        let comment_start = text.find("<!--").unwrap();
+        let comment_end = comment_start + "<!--c-->".len();
+
+        assert_eq!(
+            xml_comment_ranges(text),
+            vec![ByteRange {
+                start: comment_start,
+                end: comment_end,
+            }]
+        );
+    }
+
+    #[test]
+    fn xml_marker_shaped_lines_inside_dtd_entities_are_not_regions() {
+        let text = "<!DOCTYPE root [\n\
+                    <!ENTITY generated \"\n\
+                    <!-- >>> anvil-managed: x -->\n\
+                    user text\n\
+                    <!-- <<< anvil-managed: x -->\n\
+                    \">\n\
+                    ]>\n\
+                    <root />\n";
+
+        assert_eq!(find_region(text, "x", CommentSyntax::Xml).unwrap(), None);
+        assert_eq!(
+            repair_markers(text, "x", CommentSyntax::Xml),
+            MarkerRepair::Repaired(text.to_owned())
+        );
+    }
+
+    #[test]
+    fn xml_root_close_detection_is_vocabulary_agnostic_and_ignores_non_element_content() {
+        let text = concat!(
+            "<build:graph xmlns:build=\"urn:build\">\n",
+            "<!--\n  </build:graph>\n-->\n",
+            "<![CDATA[\n  </build:graph>\n]]>\n",
+            "<?data\n  </build:graph>\n?>\n",
+            "<child />\n",
+            "  </build:graph>\n",
+        );
+        assert_eq!(
+            xml_document_root(text).unwrap(),
+            Some(XmlRootBounds {
+                opening_end: text.find(">\n").unwrap() + 1,
+                closing_start: text.rfind("</build:graph>").unwrap(),
+                closing_line_start: Some(text.rfind("  </build:graph>").unwrap()),
+            })
+        );
+    }
+
+    #[test]
+    fn xml_root_close_detection_refuses_compact_self_closing_and_malformed_documents() {
+        assert_eq!(
+            xml_document_root("<root></root>\n").unwrap(),
+            Some(XmlRootBounds {
+                opening_end: "<root>".len(),
+                closing_start: "<root>".len(),
+                closing_line_start: None,
+            })
+        );
+        assert_eq!(xml_document_root("<root />\n").unwrap(), None);
+        assert_eq!(
+            xml_document_root("<build:root>\n</other:root>\n").unwrap_err(),
+            "the XML host closes `other:root` while `build:root` is still open"
+        );
+    }
+
+    #[test]
+    fn xml_root_state_helpers_report_prefixed_unmatched_and_incomplete_documents() {
+        let mut empty = Vec::new();
+        assert_eq!(
+            close_xml_element(&mut empty, "build", "graph").unwrap_err(),
+            "the XML host closes `build:graph` without a matching opening element"
+        );
+
+        let mut nested = vec![("build", "graph")];
+        assert_eq!(
+            close_xml_element(&mut nested, "other", "graph").unwrap_err(),
+            "the XML host closes `other:graph` while `build:graph` is still open"
+        );
+
+        assert_eq!(
+            finish_xml_root(false, Some(7), None).unwrap_err(),
+            "the XML host has an incomplete document element"
+        );
+        assert_eq!(
+            finish_xml_root(false, None, Some((7, None))).unwrap_err(),
+            "the XML host has an incomplete document element"
+        );
+    }
+
+    #[test]
+    fn xml_document_root_rejects_trailing_elements_and_text() {
+        assert_eq!(
+            xml_document_root("<root>\n</root>\n</extra>\n").unwrap_err(),
+            "the XML host is malformed: unknown token at 3:1"
+        );
+        assert_eq!(
+            xml_document_root("<root>\n</root>\ntrailing\n").unwrap_err(),
+            "the XML host is malformed: unknown token at 3:1"
+        );
+        assert_eq!(
+            xml_document_root("<root>\n</root>\n<extra />\n").unwrap_err(),
+            "the XML host is malformed: unknown token at 3:1"
+        );
+        assert_eq!(
+            xml_document_root("<!-- only a comment -->\n").unwrap_err(),
+            "the XML host has no document element"
+        );
+        assert_eq!(
+            xml_document_root("<root>\n").unwrap_err(),
+            "the XML host has no closing element for `root`"
+        );
+        assert_eq!(
+            finish_xml_root(false, Some(1), None).unwrap_err(),
+            "the XML host has an incomplete document element"
+        );
+        assert_eq!(
+            close_xml_element(&mut Vec::new(), "", "root").unwrap_err(),
+            "the XML host closes `root` without a matching opening element"
+        );
+    }
+
+    #[test]
+    fn xml_document_root_requires_the_closing_tag_to_fill_its_line() {
+        assert_eq!(
+            xml_document_root("<root>\n</root><!-- trailing -->\n")
+                .unwrap()
+                .unwrap()
+                .closing_line_start,
+            None
+        );
+        assert_eq!(
+            xml_document_root("<root>\n  </root>  \n").unwrap().unwrap().closing_line_start,
+            Some("<root>\n".len())
+        );
+    }
+
+    #[test]
+    fn xml_marker_shaped_lines_inside_processing_instructions_are_not_regions() {
+        let text = "<Project>\n<?data\n<!-- >>> anvil-managed: x -->\nuser text\n<!-- <<< anvil-managed: x -->\n?>\n</Project>\n";
+
+        assert_eq!(find_region(text, "x", CommentSyntax::Xml).unwrap(), None);
+        assert_eq!(
+            repair_markers(text, "x", CommentSyntax::Xml),
+            MarkerRepair::Repaired(text.to_owned())
+        );
     }
 
     #[test]
@@ -2990,6 +3689,12 @@ mod tests {
         assert_eq!(trim_leading_blank_lines("\tvalue"), "\tvalue");
     }
 
+    #[test]
+    fn json_scan_handles_escaped_crlf_and_bare_cr_prefixes() {
+        validate_json_comment_scan("\"escaped\\\r\nvalue\"").unwrap();
+        assert_eq!(leading_newline_len("\rvalue"), 1);
+    }
+
     // Marker parsing, repair, and placement contracts.
 
     #[test]
@@ -3097,6 +3802,28 @@ mod tests {
             ),
             "the following managed region must not become dotted residue: {adoption:?}"
         );
+    }
+
+    #[test]
+    fn legacy_adoption_orders_managed_boundaries_before_later_table_headers() {
+        let text = "# >>> anvil-managed: anvil-lints\n\
+                    # <<< anvil-managed: anvil-lints\n\
+                    rust.custom = \"warn\"\n\
+                    # >>> anvil-managed: keep\n\
+                    protected = true\n\
+                    # <<< anvil-managed: keep\n\
+                    [package]\n\
+                    name = \"fixture\"\n";
+
+        let adoption = adopt_unmanaged_toml_tables(text, "[lints.rust]\nmanaged = \"warn\"\n", SYN);
+
+        let TomlAdoption::Adopted { text: remaining, residue } = adoption else {
+            panic!("legacy dotted assignments should be adopted: {adoption:?}");
+        };
+        assert_eq!(residue, "custom = \"warn\"\n");
+        assert!(remaining.contains("# >>> anvil-managed: keep\nprotected = true\n# <<< anvil-managed: keep\n"));
+        assert!(remaining.ends_with("[package]\nname = \"fixture\"\n"));
+        assert!(!remaining.contains("rust.custom"));
     }
 
     #[test]
