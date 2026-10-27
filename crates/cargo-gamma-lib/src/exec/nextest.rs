@@ -49,7 +49,46 @@ impl Harness {
     pub(super) fn testing_paths(&self) -> [&Utf8Path; 2] {
         [&self.binaries, &self.metadata]
     }
+}
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod final_survivor_tests {
+    use super::*;
+
+    #[test]
+    fn leading_progress_indentation_is_discarded_before_identifying_the_first_failure() {
+        let output = " \tPASS [0.1s] binary ignored\n \tFAIL [0.2s] (2/3) binary first::failed \t\nFAIL [0.3s] binary later::failed\n";
+        assert_eq!(first_failure(output), Some("first::failed"));
+    }
+
+    #[test]
+    fn narrowed_nextest_commands_cannot_turn_an_empty_selection_into_a_pass() {
+        let root = Utf8PathBuf::from(if cfg!(windows) { "C:/nextest-policy" } else { "/nextest-policy" });
+        let work = Workspace::adopt(root.clone(), root.join("target"));
+        let binary = crate::testing::test_binary("subject-binary");
+        let harness = Harness::fake(&[("subject-binary", "subject::tests")]);
+        assert_eq!(
+            harness.testing_paths(),
+            [Utf8Path::new("/t/binaries.json"), Utf8Path::new("/t/metadata.json")]
+        );
+        for only in [&[][..], &["suite::one"][..]] {
+            let command = harness.command(&work, &binary, only, true, true).unwrap();
+            let arguments = command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                arguments.iter().filter(|argument| *argument == "--no-tests").count(),
+                usize::from(only.is_empty())
+            );
+            assert!(arguments.iter().any(|argument| argument == "--fail-fast"));
+            assert!(arguments.windows(2).any(|pair| pair == ["--test-threads", "1"]));
+        }
+    }
+}
+
+impl Harness {
     /// Describes the built tree to nextest, so that no later run of it needs cargo.
     ///
     /// # Errors
@@ -81,12 +120,9 @@ impl Harness {
     /// Builds the command that runs one binary's tests under nextest.
     ///
     /// `only` narrows the run to specific tests. A narrowed run keeps nextest's default of failing
-    /// when nothing matched, because such a run *is* the binary as far as the verdict is concerned
-    /// and an empty selection means the filterset and the built tree disagree — a fact about the
-    /// run, not evidence the mutant survived. Nextest also intersects command-line filtersets with
-    /// the `default-filter` in its own config, which the census cannot see because it lists tests by
-    /// running the binary directly under libtest, so an empty intersection is reachable in ordinary
-    /// use.
+    /// when nothing matched: an empty selection means the filterset and the built tree disagree,
+    /// not that the mutant survived. Nextest also intersects command-line filtersets with its own
+    /// `default-filter`, so a named probe can legitimately have an empty intersection.
     ///
     /// # Errors
     ///
@@ -652,10 +688,8 @@ mod tests {
     }
 
     /// Nextest intersects a command-line filterset with the `default-filter` in its own config, and
-    /// the census cannot see that filter because it lists a binary's tests by running it directly
-    /// under libtest. An empty intersection with `--no-tests pass` in force exits 0, and a narrowed
-    /// run's absence of failures is read as a verdict — so the mutant is reported as a survivor
-    /// though nothing ran. Keeping nextest's default `fail` turns that into exit code 4, which
+    /// named probes may have an empty intersection. With `--no-tests pass` in force, such a run
+    /// exits 0 despite having checked no test. Keeping nextest's default `fail` turns that into exit code 4, which
     /// `settle` reads as a fact about the run.
     #[test]
     #[cfg(unix)]
@@ -687,8 +721,8 @@ mod tests {
         assert!(whole.windows(2).any(|pair| pair == ["--no-tests", "pass"]), "{whole:?}");
     }
 
-    /// A census names every test that reaches a mutant, and nextest has to be asked for all of
-    /// them at once. The group of names is combined with the binary by `and` rather than by `or`, or a
+    /// A grouped probe asks nextest for several named tests at once.
+    /// The group of names is combined with the binary by `and` rather than by `or`, or a
     /// name that also exists in another binary would drag that binary's tests into a run budgeted
     /// for this one.
     #[test]

@@ -5,7 +5,7 @@ use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -16,6 +16,7 @@ use std::{env, fmt, fs, thread};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_gamma_process::{MemoryRequest, MemoryUsage, PlatformError, PreparedCommand, ProcessTree, SpawnedCommand, prepare};
 use serde::Serialize;
+use tick::{SimpleClock, Stopwatch};
 
 mod hubs;
 
@@ -63,30 +64,14 @@ pub(super) enum Only<'name> {
 
     /// One test, named exactly as the harness names it.
     One(&'name str),
-
-    /// Every test a census established can reach the mutant, and nothing else.
-    ///
-    /// Unlike [`Self::One`] this *is* a substitute for the binary, and a verdict may be read from
-    /// its absence of failures: the census measured that no other test executes the mutant's site,
-    /// so no other test can convict it. See `census` for why that is exact rather than a guess.
-    These(&'name [&'name str]),
 }
 
 impl<'name> Only<'name> {
     /// The tests to run, empty when the whole binary runs.
-    ///
-    /// Borrowed rather than copied wherever a borrow reaches far enough: a census's [`Self::These`]
-    /// selection can already name most of a large suite, and every reachable censused binary
-    /// launches at least one attempt against it, so cloning that slice into a second vector on every
-    /// one of those launches would allocate an unnecessary vector because `launcher` only reads
-    /// the result once to build one command. [`Self::One`] still allocates because the enum stores
-    /// only the string reference; returning a borrowed one-element slice would require storage
-    /// whose lifetime outlives this call.
-    fn names(self) -> Cow<'name, [&'name str]> {
+    pub(super) fn names(&self) -> &[&'name str] {
         match self {
-            Self::All => Cow::Owned(Vec::new()),
-            Self::One(name) => Cow::Owned(vec![name]),
-            Self::These(names) => Cow::Borrowed(names),
+            Self::All => &[],
+            Self::One(name) => core::slice::from_ref(name),
         }
     }
 }
@@ -119,12 +104,6 @@ pub(super) struct Attempt<'name> {
 
     /// How much of the binary's suite to run.
     pub(super) only: Only<'name>,
-
-    /// Where the runtime is to write the sites this run reached, for a census.
-    ///
-    /// `None` for every ordinary run. Setting it also selects unmutated behavior in the runtime,
-    /// which is why it is only ever paired with an `active` of `None`.
-    pub(super) census: Option<&'name Utf8Path>,
 }
 
 impl Attempt<'_> {
@@ -292,6 +271,7 @@ pub(super) struct FailureEvidence {
 /// The kill confirmation costs one extra run of the cheapest verdict class — the one that finishes
 /// as soon as a test fails rather than running the whole binary. `confirm` turns it off, at the
 /// price of a score that counts flakes as kills and cannot show which ones they were.
+#[cfg(test)]
 pub(super) fn run_binary(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>, confirm: bool) -> Verdict {
     run_binary_observed(work, binary, attempt, confirm).verdict
 }
@@ -314,10 +294,41 @@ pub(super) fn reach_hint_is_final(attempt: Attempt<'_>, confirm: bool) -> bool {
 }
 
 pub(super) fn run_binary_observed(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>, confirm: bool) -> BinaryRun {
+    #[cfg(test)]
+    if let Some(run) = SCRIPTED_RUNNER
+        .with_borrow_mut(|runner| runner.as_mut().map(|runner| runner(binary, attempt, confirm)))
+        .or_else(|| SHARED_RUNNER.with_borrow(|runner| runner.as_ref().map(|runner| runner(binary, attempt, confirm))))
+    {
+        super::sweep::record_observed_killer(binary, attempt.only, &run.verdict);
+        return run;
+    }
+
     let _resources = work.acquire_resources(binary, attempt.only);
+    let run = run_binary_with_observer(&SimpleClock::new_system(), attempt, confirm, |attempt| {
+        observe(work, binary, attempt)
+    });
+    super::sweep::record_observed_killer(binary, attempt.only, &run.verdict);
+    run
+}
+
+fn run_binary_with_observer(
+    clock: &SimpleClock,
+    attempt: Attempt<'_>,
+    confirm: bool,
+    mut observe: impl FnMut(Attempt<'_>) -> Observation,
+) -> BinaryRun {
+    let mut first = true;
+    let mut observe = |attempt: Attempt<'_>| {
+        super::sweep::record_binary_launch_attempt(!first);
+        let started = Stopwatch::new(clock);
+        let observed = observe(attempt);
+        super::sweep::record_binary_execution(!first, started.elapsed(), &observed.verdict);
+        first = false;
+        observed
+    };
     let mut reach = ReachObservation::Unknown;
     let confirmed = settle_suspicions(attempt, |attempt| {
-        let observed = observe(work, binary, attempt);
+        let observed = observe(attempt);
         if observed.reach == ReachObservation::Reached {
             reach = ReachObservation::Reached;
         } else if reach != ReachObservation::Reached && observed.reach == ReachObservation::NotReached {
@@ -329,12 +340,71 @@ pub(super) fn run_binary_observed(work: &Workspace, binary: &TestBinary, attempt
     // Reached from the first run and from a confirmation alike: a suspected timeout that turns out
     // to be a failing test is exactly as much of a suspicion as one reported straight away.
     let verdict = match confirmed {
-        Verdict::Failed(test) if confirm => confirm_kill(work, binary, attempt, test),
-        Verdict::TestEnumerationFailed(output) => confirm_enumeration(work, binary, attempt, output),
+        Verdict::Failed(test) if confirm => confirm_kill_with(attempt, test, |attempt| observe(attempt).verdict),
+        Verdict::TestEnumerationFailed(output) => confirm_enumeration_with(attempt, output, |attempt| observe(attempt).verdict),
         other => other,
     };
 
     BinaryRun { verdict, reach }
+}
+
+#[cfg(test)]
+type ScriptedRunner = Box<dyn FnMut(&TestBinary, Attempt<'_>, bool) -> BinaryRun>;
+
+#[cfg(test)]
+pub(super) type SharedRunner = Arc<dyn Fn(&TestBinary, Attempt<'_>, bool) -> BinaryRun + Send + Sync>;
+
+#[cfg(test)]
+std::thread_local! {
+    static SCRIPTED_RUNNER: std::cell::RefCell<Option<ScriptedRunner>> = const { std::cell::RefCell::new(None) };
+    static SHARED_RUNNER: std::cell::RefCell<Option<SharedRunner>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn shared_runner() -> Option<SharedRunner> {
+    SHARED_RUNNER.with_borrow(Clone::clone)
+}
+
+#[cfg(test)]
+pub(super) fn set_shared_runner(runner: Option<SharedRunner>) {
+    SHARED_RUNNER.with_borrow_mut(|slot| *slot = runner);
+}
+
+#[cfg(test)]
+pub(super) fn with_shared_runner<T>(runner: SharedRunner, body: impl FnOnce() -> T) -> T {
+    struct Reset(Option<SharedRunner>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            set_shared_runner(self.0.take());
+        }
+    }
+    let _reset = Reset(shared_runner());
+    set_shared_runner(Some(runner));
+    body()
+}
+
+/// Supplies final verdict/reach results for caller ordering tests, bypassing resource acquisition,
+/// execution, suspicion settlement and confirmation. Unlike the observer seam this replaces the
+/// whole binary run. Scoped to the calling thread and reset on return or unwind.
+#[cfg(test)]
+pub(super) fn with_binary_runner<T>(
+    runner: impl FnMut(&TestBinary, Attempt<'_>, bool) -> BinaryRun + 'static,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SCRIPTED_RUNNER.with_borrow_mut(|runner| {
+                let _ = runner.take();
+            });
+        }
+    }
+    SCRIPTED_RUNNER.with_borrow_mut(|slot| {
+        assert!(slot.is_none(), "a thread cannot install two binary runners simultaneously");
+        *slot = Some(Box::new(runner));
+    });
+    let _reset = Reset;
+    body()
 }
 
 /// How many times a spawn refused for want of a machine resource is attempted in all.
@@ -357,6 +427,14 @@ enum StartError {
 }
 
 fn spawn_patiently(command: Command, request: MemoryRequest) -> Result<SpawnedCommand, StartError> {
+    spawn_patiently_with_backoff(command, request, PreparedCommand::backoff)
+}
+
+fn spawn_patiently_with_backoff(
+    command: Command,
+    request: MemoryRequest,
+    mut backoff: impl FnMut(PreparedCommand, Duration) -> Result<PreparedCommand, PlatformError>,
+) -> Result<SpawnedCommand, StartError> {
     let mut waited = SPAWN_BACKOFF;
 
     // Prepared once, outside the loop, and carried through every wait: a retry re-spawns the launch
@@ -367,7 +445,7 @@ fn spawn_patiently(command: Command, request: MemoryRequest) -> Result<SpawnedCo
         match spawn_once(prepared) {
             Ok(spawned) => return Ok(spawned),
             Err(FailedSpawn { cause, prepared: returned }) if transient(&cause) => {
-                prepared = (*returned).backoff(waited).map_err(StartError::Containment)?;
+                prepared = backoff(*returned, waited).map_err(StartError::Containment)?;
             }
             Err(FailedSpawn { cause, .. }) => return Err(StartError::Spawn(cause)),
         }
@@ -380,7 +458,16 @@ fn spawn_patiently(command: Command, request: MemoryRequest) -> Result<SpawnedCo
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn start_or_verdict(command: Command, binary: &TestBinary, request: MemoryRequest) -> Result<SpawnedCommand, (Verdict, MemoryUsage)> {
-    spawn_patiently(command, request).map_err(|reason| {
+    start_or_verdict_with(command, binary, request, spawn_patiently)
+}
+
+fn start_or_verdict_with(
+    command: Command,
+    binary: &TestBinary,
+    request: MemoryRequest,
+    spawn: impl FnOnce(Command, MemoryRequest) -> Result<SpawnedCommand, StartError>,
+) -> Result<SpawnedCommand, (Verdict, MemoryUsage)> {
+    spawn(command, request).map_err(|reason| {
         // A spawn fails for reasons of the machine — descriptors, processes, address space, a
         // binary being written as it is read — and none of them is a test failing. Reporting one as
         // a failing suite would credit the tests with a kill they never made.
@@ -528,6 +615,7 @@ fn settle_suspicions(attempt: Attempt<'_>, mut run: impl FnMut(Attempt<'_>) -> V
 /// The question is settled the only way it can be: by running the same binary again with the
 /// mutant switched off. A suite that fails either way was not detecting anything.
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
 fn confirm_kill(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>, test: Option<String>) -> Verdict {
     confirm_kill_with(attempt, test, |attempt| observe(work, binary, attempt).verdict)
 }
@@ -589,6 +677,7 @@ fn confirm_kill_with(attempt: Attempt<'_>, test: Option<String>, observe: impl F
 
 /// Confirms that nextest's inability to enumerate tests was caused by the active mutant.
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg(test)]
 fn confirm_enumeration(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>, output: String) -> Verdict {
     confirm_enumeration_with(attempt, output, |attempt| observe(work, binary, attempt).verdict)
 }
@@ -646,7 +735,7 @@ pub(crate) const CONFIRM_FACTOR: u32 = 3;
 /// the arguments after `--` and sets each test's working directory to its own package root, so
 /// imposing one here would make it resolve the whole workspace relative to a single package.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn launcher(work: &Workspace, binary: &TestBinary, only: Only<'_>, fail_fast: bool) -> Result<Command, String> {
+fn launcher(work: &Workspace, binary: &TestBinary, only: Only<'_>, fail_fast: bool) -> Result<Command, Verdict> {
     let Some(harness) = work.runner() else {
         let mut command = Command::new(binary.path.as_std_path());
         let names = only.names();
@@ -670,11 +759,11 @@ fn launcher(work: &Workspace, binary: &TestBinary, only: Only<'_>, fail_fast: bo
             let allowed: Vec<&str> = names.iter().copied().filter(|name| user.admits(name)).collect();
 
             if allowed.is_empty() {
-                return Err(format!(
+                return Err(Verdict::Unjudged(format!(
                     "the test selection this run made for `{}` names nothing the harness filters allow, \
                      so it was refused rather than run as a wider selection",
                     binary.path
-                ));
+                )));
             }
 
             // The user's positional filters are not repeated here: `admits` has already applied
@@ -696,10 +785,9 @@ fn launcher(work: &Workspace, binary: &TestBinary, only: Only<'_>, fail_fast: bo
         return Ok(command);
     };
 
-    let resource_bearing = !work.required_resources(binary, only).is_empty();
     harness
-        .command(work, binary, &only.names(), fail_fast, resource_bearing)
-        .map_err(|cause| cause.to_string())
+        .command(work, binary, only.names(), fail_fast, true)
+        .map_err(|cause| Verdict::Unmetered(cause.to_string()))
 }
 
 /// Turns a runner's non-zero exit into a verdict about the mutant.
@@ -800,7 +888,7 @@ pub(super) fn baseline_environment(work: &Workspace, binary: &TestBinary, only: 
 
     serde_json::json!({
         "set": set,
-        "removed": [gamma_rt::ACTIVE_VAR, gamma_rt::CENSUS_VAR, "NEXTEST", "NEXTEST_*"],
+        "removed": [gamma_rt::ACTIVE_VAR, gamma_rt::REACH_VAR, "NEXTEST", "NEXTEST_*"],
         "valuesOmitted": [STACK_VAR],
         "loaderPathConfigured": launch.loader.is_some(),
     })
@@ -816,7 +904,7 @@ fn configure(
     launch: &Launch,
     threads: Option<&str>,
     active: Option<u32>,
-    census: Option<&Utf8Path>,
+    reach: Option<&Utf8Path>,
 ) {
     let _ = command
         .stdout(Stdio::piped())
@@ -879,24 +967,33 @@ fn configure(
         }
     }
 
-    // Removed rather than left alone on an ordinary run, because it is inherited: a census that
-    // crashed leaving the variable set in a developer's shell would otherwise turn every later run
-    // into one that activates no mutant and reports the whole population as surviving.
-    match census {
+    match reach {
         Some(path) => {
-            let _ = command.env(gamma_rt::CENSUS_VAR, path.as_std_path());
+            let _ = command.env(gamma_rt::REACH_VAR, path.as_std_path());
         }
         None => {
-            let _ = command.env_remove(gamma_rt::CENSUS_VAR);
+            let _ = command.env_remove(gamma_rt::REACH_VAR);
         }
     }
 }
 
+fn configured_launcher(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>) -> Result<Command, Verdict> {
+    let mut command = launcher(work, binary, attempt.only, attempt.active.is_some())?;
+    let launch = work.launch();
+    configure_loader(&mut command, launch);
+    work.configure_test_environment(&mut command, binary);
+    let threads = if work.required_resources(binary, attempt.only).is_empty() {
+        work.harness_threads()
+    } else {
+        Some("1")
+    };
+    // #[gamma::skip(call_result.default, reason = "configure returns unit and this mutator retains all command mutations before replacing unit with unit")]
+    configure(&mut command, binary, launch, threads, attempt.active, None);
+    Ok(command)
+}
+
 /// Runs one binary, publishing the harness's progress into `progress` as it goes.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one process lifecycle keeps launch, supervision, evidence collection, and cleanup in order"
-)]
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn run_with(
     work: &Workspace,
@@ -905,39 +1002,34 @@ fn run_with(
     progress: &Arc<Mutex<Progress>>,
     retain_failure: bool,
 ) -> (Verdict, MemoryUsage, Option<FailureEvidence>) {
+    run_with_observation(work, binary, attempt, progress, retain_failure, None, ask_after)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn run_with_observation(
+    work: &Workspace,
+    binary: &TestBinary,
+    attempt: Attempt<'_>,
+    progress: &Arc<Mutex<Progress>>,
+    retain_failure: bool,
+    reach: Option<&Utf8Path>,
+    mut observe_exit: impl FnMut(&mut ProcessTree) -> io::Result<Option<ExitStatus>>,
+) -> (Verdict, MemoryUsage, Option<FailureEvidence>) {
     let (active, timeout, stall, request) = (attempt.active, attempt.timeout, attempt.stall, attempt.request);
 
-    macro_rules! cut_short {
-        ($subtree:expr, $verdict_settled:expr) => {
-            match cut_short($subtree, request, binary, $verdict_settled) {
-                Ok(stopped) => stopped,
-                Err((verdict, usage)) => return (verdict, usage, None),
-            }
-        };
-    }
-
-    let mut command = match launcher(work, binary, attempt.only, attempt.active.is_some()) {
+    let mut command = match configured_launcher(work, binary, attempt) {
         Ok(command) => command,
-        Err(reason) => return (Verdict::Unmetered(reason), MemoryUsage::default(), None),
+        Err(verdict) => return (verdict, MemoryUsage::default(), None),
     };
-    let launch = work.launch();
-
-    configure_loader(&mut command, launch);
+    if let Some(path) = reach {
+        let _ = command.env(gamma_rt::REACH_VAR, path.as_std_path());
+    }
 
     // Nextest reports on stderr: the per-test `FAIL` lines that name what convicted a mutant, and
     // the progress that tells the stall detector the child is alive. Left discarded, every nextest
     // failure would be anonymous and a healthy run would look silent. A binary run directly says
     // all of that on stdout, and its stderr carries only panic noise that no verdict is read from.
     let under_nextest = work.runner().is_some();
-
-    work.configure_test_environment(&mut command, binary);
-    let threads = if work.required_resources(binary, attempt.only).is_empty() {
-        work.harness_threads()
-    } else {
-        Some("1")
-    };
-    // #[gamma::skip(call_result.default, reason = "configure returns unit and this mutator retains all command mutations before replacing unit with unit")]
-    configure(&mut command, binary, launch, threads, active, attempt.census);
 
     let spawned = match start_or_verdict(command, binary, request) {
         Ok(started) => started,
@@ -961,7 +1053,10 @@ fn run_with(
     let drained = match readers(&mut subtree, progress, &pulse, under_nextest, retain_failure) {
         Ok(drained) => drained,
         Err(cause) => {
-            let (usage, _ceiling) = cut_short!(&mut subtree, false);
+            let (usage, _ceiling) = match cut_short(&mut subtree, request, binary, false) {
+                Ok(stopped) => stopped,
+                Err((verdict, usage)) => return (verdict, usage, None),
+            };
 
             return (
                 Verdict::Unjudged(format!("`{}` output could not be supervised: {cause}", binary.path)),
@@ -971,21 +1066,108 @@ fn run_with(
         }
     };
 
-    let deadline = timeout.map(deadline_after);
+    let mut supervision = NativeSupervision {
+        subtree: &mut subtree,
+        drained: &drained,
+        pulse: &pulse,
+        binary,
+        request,
+        deadline: timeout.map(deadline_after),
+        stall,
+        observe_exit: &mut observe_exit,
+    };
+    supervise(&mut supervision, binary, active, under_nextest, request, progress, retain_failure)
+}
+
+/// The native lifecycle/clock boundary; the verdict state machine consumes only these observations.
+trait Supervision {
+    fn observe(&mut self) -> io::Result<Option<ExitStatus>>;
+    fn released(&self) -> bool;
+    fn collect(&self) -> Collected;
+    fn usage(&self) -> MemoryUsage;
+    fn cut_short(&mut self, settled: bool) -> Result<(MemoryUsage, Option<u64>), (Verdict, MemoryUsage)>;
+    fn expiration(&self, progress: &Mutex<Progress>) -> (bool, bool);
+    fn seen(&self) -> u64;
+    fn wait(&self, seen: u64, progress: &Mutex<Progress>);
+}
+
+struct NativeSupervision<'a, F> {
+    subtree: &'a mut ProcessTree,
+    drained: &'a Receiver<Drained>,
+    pulse: &'a Pulse,
+    binary: &'a TestBinary,
+    request: MemoryRequest,
+    deadline: Option<Instant>,
+    stall: Stall,
+    observe_exit: &'a mut F,
+}
+
+impl<F: FnMut(&mut ProcessTree) -> io::Result<Option<ExitStatus>>> Supervision for NativeSupervision<'_, F> {
+    fn observe(&mut self) -> io::Result<Option<ExitStatus>> {
+        (self.observe_exit)(self.subtree)
+    }
+    fn released(&self) -> bool {
+        self.subtree.released()
+    }
+    fn collect(&self) -> Collected {
+        collected(self.drained, DRAIN_GRACE)
+    }
+    fn usage(&self) -> MemoryUsage {
+        self.subtree.usage()
+    }
+    fn cut_short(&mut self, settled: bool) -> Result<(MemoryUsage, Option<u64>), (Verdict, MemoryUsage)> {
+        cut_short(self.subtree, self.request, self.binary, settled)
+    }
+    fn expiration(&self, progress: &Mutex<Progress>) -> (bool, bool) {
+        (
+            self.stall.exceeded(progress),
+            self.deadline.is_some_and(|deadline| deadline_reached(deadline, Instant::now())),
+        )
+    }
+    fn seen(&self) -> u64 {
+        self.pulse.seen()
+    }
+    fn wait(&self, seen: u64, progress: &Mutex<Progress>) {
+        self.pulse.wait(
+            seen,
+            WAIT_CAP
+                .min(self.deadline.map_or(WAIT_CAP, remaining))
+                .min(self.stall.slack(progress)),
+        );
+    }
+}
+
+fn supervise(
+    supervision: &mut impl Supervision,
+    binary: &TestBinary,
+    active: Option<u32>,
+    under_nextest: bool,
+    request: MemoryRequest,
+    progress: &Mutex<Progress>,
+    retain_failure: bool,
+) -> (Verdict, MemoryUsage, Option<FailureEvidence>) {
+    macro_rules! cut_short {
+        ($verdict_settled:expr) => {
+            match supervision.cut_short($verdict_settled) {
+                Ok(stopped) => stopped,
+                Err((verdict, usage)) => return (verdict, usage, None),
+            }
+        };
+    }
 
     loop {
         // Read before the child is checked, so a signal raised while this iteration is working is
         // not slept through.
-        let seen = pulse.seen();
+        let seen = supervision.seen();
 
-        match ask_after(&mut subtree) {
+        match supervision.observe() {
             Ok(Some(status)) => {
                 // `ProcessTree::observe` used a non-reaping observation, swept descendants, released
                 // the interrupt slot, and only then reaped the leader.
-                debug_assert!(subtree.released(), "the containment is released before the output is drained");
+                debug_assert!(supervision.released(), "the containment is released before the output is drained");
 
-                let collected = collected(&drained, DRAIN_GRACE);
-                let usage = subtree.usage();
+                let collected = supervision.collect();
+                let usage = supervision.usage();
                 let ceiling = request.limit.filter(|_limit| exhausted(&usage, status.success()));
                 let code = status.code();
                 let evidence = retain_failure.then(|| collected.failure_evidence(Some(termination(status)), announced_failures(progress)));
@@ -1018,8 +1200,8 @@ fn run_with(
 
             Ok(None) => {
                 if let Some(verdict) = environment_verdict(progress) {
-                    let (usage, _ceiling) = cut_short!(&mut subtree, true);
-                    let collected = collected(&drained, DRAIN_GRACE);
+                    let (usage, _ceiling) = cut_short!(true);
+                    let collected = supervision.collect();
 
                     return (
                         verdict,
@@ -1034,42 +1216,25 @@ fn run_with(
                 // replaying the failed child's captured output, which may hold the guard runtime's
                 // environment-error marker, so it is never cut here.
                 if !retain_failure && let Some(name) = failure_to_cut_short(under_nextest, progress) {
-                    let (usage, ceiling) = cut_short!(&mut subtree, true);
-                    let _collected = collected(&drained, DRAIN_GRACE);
+                    let (usage, ceiling) = cut_short!(true);
+                    let _collected = supervision.collect();
 
                     return (cut_by_named_failure(name, usage.peak, ceiling), usage, None);
                 }
 
-                let stalled = stall.exceeded(progress);
+                let (stalled, expired) = supervision.expiration(progress);
 
-                if stalled || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    let (usage, ceiling) = cut_short!(&mut subtree, true);
-                    let collected = collected(&drained, DRAIN_GRACE);
-                    let evidence = retain_failure.then(|| collected.failure_evidence(None, announced_failures(progress)));
-
-                    if let Some(verdict) = unfinished_nextest_failure(under_nextest, progress) {
-                        return (verdict, usage, evidence);
-                    }
-
-                    // No name was announced on this path, so there is nothing for the ceiling to
-                    // outrank: a workload thrashing against its limit runs out of time as well, and
-                    // the memory is the cause of both. See [`cut_short`].
-                    if let Some(limit) = ceiling {
-                        return (Verdict::MemoryLimit { peak: usage.peak, limit }, usage, evidence);
-                    }
-
-                    // The text is not read on this path, so there is nothing to wait for.
-                    return if stalled {
-                        (Verdict::Stalled(last_test(progress)), usage, evidence)
-                    } else {
-                        (Verdict::TimedOut, usage, evidence)
-                    };
+                if stalled || expired {
+                    let (usage, ceiling) = cut_short!(true);
+                    return settle_budget_with(under_nextest, progress, stalled, retain_failure, || {
+                        (usage, ceiling, supervision.collect())
+                    });
                 }
 
                 // Bounded by whichever comes first: the deadline, the earliest moment silence
                 // could be called a stall, and the backstop. Sleeping past any of the three would
                 // let the run overshoot a limit it promised to keep.
-                pulse.wait(seen, WAIT_CAP.min(deadline.map_or(WAIT_CAP, remaining)).min(stall.slack(progress)));
+                supervision.wait(seen, progress);
             }
 
             // A non-reaping exit observation reports an error only when the child can no longer
@@ -1084,15 +1249,15 @@ fn run_with(
             // ended and reaped first, since an orphan holds scratch-tree locks and the pipes the
             // readers below are waiting on, and both outlive this function into the next mutant.
             Err(cause) => {
-                let stopped = cut_short(&mut subtree, request, binary, false);
+                let stopped = supervision.cut_short(false);
 
-                debug_assert!(subtree.released(), "the containment is released before the output is drained");
+                debug_assert!(supervision.released(), "the containment is released before the output is drained");
 
                 // Discarded, since there is no verdict to read out of it: the drain is here so the
                 // reader threads reach end of file and end, rather than being left holding pipes
                 // for the rest of the run. Whether it was complete is discarded with it — nothing
                 // was going to be concluded from the text either way.
-                let collected = collected(&drained, DRAIN_GRACE);
+                let collected = supervision.collect();
 
                 let (usage, _ceiling) = match stopped {
                     Ok(stopped) => stopped,
@@ -1113,6 +1278,32 @@ fn run_with(
             }
         }
     }
+}
+
+fn deadline_reached(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
+fn settle_budget_with(
+    under_nextest: bool,
+    progress: &Mutex<Progress>,
+    stalled: bool,
+    retain_failure: bool,
+    observe: impl FnOnce() -> (MemoryUsage, Option<u64>, Collected),
+) -> (Verdict, MemoryUsage, Option<FailureEvidence>) {
+    let (usage, ceiling, collected) = observe();
+    let evidence = retain_failure.then(|| collected.failure_evidence(None, announced_failures(progress)));
+    let verdict = if let Some(verdict) = unfinished_nextest_failure(under_nextest, progress) {
+        verdict
+    } else if let Some(limit) = ceiling {
+        Verdict::MemoryLimit { peak: usage.peak, limit }
+    } else if stalled {
+        Verdict::Stalled(last_test(progress))
+    } else {
+        Verdict::TimedOut
+    };
+
+    (verdict, usage, evidence)
 }
 
 fn deadline_after(timeout: Duration) -> Instant {
@@ -1153,6 +1344,10 @@ struct Collected {
 }
 
 fn collected(drained: &Receiver<Drained>, grace: Duration) -> Collected {
+    collected_with_grace(drained, Some(grace))
+}
+
+fn collected_with_grace(drained: &Receiver<Drained>, grace: Option<Duration>) -> Collected {
     let mut text = Vec::new();
     let mut authoritative = Vec::new();
     let mut stdout_tail = Vec::new();
@@ -1161,10 +1356,19 @@ fn collected(drained: &Receiver<Drained>, grace: Duration) -> Collected {
     let mut whole = true;
 
     loop {
-        match drained.recv_timeout(grace) {
+        let received = match grace {
+            Some(grace) => drained.recv_timeout(grace),
+            None => drained.recv().map_err(|_disconnected| RecvTimeoutError::Disconnected),
+        };
+        match received {
             Ok(chunk) => {
                 if chunk.authoritative {
-                    authoritative.extend_from_slice(&chunk.text);
+                    let complete_prefix = if chunk.complete {
+                        chunk.text.len()
+                    } else {
+                        chunk.text.iter().rposition(|byte| *byte == b'\n').map_or(0, |last| last + 1)
+                    };
+                    authoritative.extend_from_slice(&chunk.text[..complete_prefix]);
                 }
                 text.extend_from_slice(&chunk.text);
                 match chunk.stream {
@@ -1311,6 +1515,16 @@ fn cut_short(
     binary: &TestBinary,
     verdict_settled: bool,
 ) -> Result<(MemoryUsage, Option<u64>), (Verdict, MemoryUsage)> {
+    cut_short_with_usage(subtree, request, binary, verdict_settled, ProcessTree::usage)
+}
+
+fn cut_short_with_usage(
+    subtree: &mut ProcessTree,
+    request: MemoryRequest,
+    binary: &TestBinary,
+    verdict_settled: bool,
+    observe_usage: impl FnOnce(&ProcessTree) -> MemoryUsage,
+) -> Result<(MemoryUsage, Option<u64>), (Verdict, MemoryUsage)> {
     // Only Unix has a numeric watch slot that can be released too early. On Windows `released`
     // necessarily returns true because the job handle itself remains the authority over the child.
     #[cfg(unix)]
@@ -1320,7 +1534,7 @@ fn cut_short(
     );
 
     let stopped = subtree.terminate();
-    let usage = subtree.usage();
+    let usage = observe_usage(subtree);
 
     if let Err(cause) = stopped {
         let point = if verdict_settled {
@@ -1420,12 +1634,16 @@ pub(super) fn observe_baseline(work: &Workspace, binary: &TestBinary, attempt: A
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn observe_with(work: &Workspace, binary: &TestBinary, attempt: Attempt<'_>, retain_failure: bool) -> Observation {
     let capture = ReachCapture::new(work, attempt);
-    let attempt = capture.as_ref().map_or(attempt, |capture| Attempt {
-        census: Some(&capture.path),
-        ..attempt
-    });
     let progress = Arc::new(Mutex::new(Progress::new(watch(work))));
-    let (verdict, usage, failure) = run_with(work, binary, attempt, &progress, retain_failure);
+    let (verdict, usage, failure) = run_with_observation(
+        work,
+        binary,
+        attempt,
+        &progress,
+        retain_failure,
+        capture.as_ref().map(|capture| capture.path.as_path()),
+        ask_after,
+    );
     let reach = capture.map_or(ReachObservation::Unknown, ReachCapture::finish);
     let quiet = quiet_of(&progress);
 
@@ -1452,12 +1670,13 @@ struct ReachCapture {
 impl ReachCapture {
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn new(work: &Workspace, attempt: Attempt<'_>) -> Option<Self> {
-        let ordinal = attempt.active?;
-        if attempt.census.is_some() {
-            return None;
-        }
+        Self::new_with_sequence(work, attempt, &NEXT_REACH_CAPTURE)
+    }
 
-        let sequence = NEXT_REACH_CAPTURE.fetch_add(1, Ordering::Relaxed);
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn new_with_sequence(work: &Workspace, attempt: Attempt<'_>, next: &AtomicUsize) -> Option<Self> {
+        let ordinal = attempt.active?;
+        let sequence = next.fetch_add(1, Ordering::Relaxed);
         let path = work.target.join(format!(".gamma-reach-{}-{sequence}.bin", std::process::id()));
         let _created = fs::create_dir_all(work.target.as_std_path());
         let _removed = fs::remove_file(path.as_std_path());
@@ -1537,7 +1756,11 @@ fn watch(work: &Workspace) -> Watch {
 
 /// How much of a deadline is left, saturating at zero once it has passed.
 fn remaining(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now())
+    remaining_at(deadline, Instant::now())
+}
+
+fn remaining_at(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
 }
 
 /// The longest the wait loop will sleep without being woken.
@@ -1547,6 +1770,57 @@ fn remaining(deadline: Instant) -> Duration {
 /// the case where a signal was never sent at all, and the case the loop must poll for because
 /// nothing can announce it: silence.
 const WAIT_CAP: Duration = Duration::from_millis(50);
+
+#[cfg(all(test, not(loom), not(miri)))]
+mod pulse_wait_regression_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    #[test]
+    fn real_supervision_enters_the_actual_pulse_wait_before_rechecking_a_contained_child() {
+        let (_directory, work) = crate::testing::helper_workspace("supervisor-pulse-wait-", &["exit:0"]);
+        let binary = crate::testing::helper();
+        let waits = Rc::new(Cell::new(0_usize));
+        let observed_waits = Rc::clone(&waits);
+        let mut observations = 0_usize;
+        let attempt = Attempt {
+            active: None,
+            timeout: Some(Duration::from_secs(30)),
+            stall: Stall::NONE,
+            request: MemoryRequest::default(),
+            only: Only::All,
+        };
+        let (verdict, _usage, evidence) = Pulse::with_wait_observer(
+            move |pulse, _seen, upto| {
+                observed_waits.set(observed_waits.get() + 1);
+                assert!(upto <= WAIT_CAP, "the real wait must retain the supervision backstop");
+                if observed_waits.get() == 1 {
+                    pulse.signal();
+                }
+            },
+            || {
+                run_with_observation(
+                    &work,
+                    &binary,
+                    attempt,
+                    &Arc::new(Mutex::new(Progress::new(Watch::Libtest))),
+                    false,
+                    None,
+                    |subtree| {
+                        observations += 1;
+                        if observations == 1 { Ok(None) } else { ask_after(subtree) }
+                    },
+                )
+            },
+        );
+        assert_eq!(verdict, Verdict::Passed);
+        assert!(evidence.is_none());
+        assert!(observations >= 2, "the real contained child must be observed through completion");
+        assert!(waits.get() >= 1, "every forced live observation must enter the actual Pulse::wait");
+    }
+}
 
 /// Returns a live failure only when its announcement cannot precede a startup-error marker.
 fn failure_to_cut_short(under_nextest: bool, progress: &Mutex<Progress>) -> Option<String> {
@@ -1695,7 +1969,7 @@ fn readers(
         let spawned = if refused {
             Err(io::Error::other("the reader thread a test asked to fail"))
         } else {
-            thread::Builder::new().name("cargo-gamma-output".to_owned()).spawn(move || {
+            reader_thread().spawn(move || {
                 READERS.started();
 
                 let (text, tail, tail_truncated, complete) = match pipe {
@@ -1734,6 +2008,10 @@ fn readers(
     Ok(drained)
 }
 
+fn reader_thread() -> thread::Builder {
+    thread::Builder::new().name("cargo-gamma-output".to_owned())
+}
+
 /// One of the two streams a child may be read from, so both can be started by the same loop.
 enum Either {
     Out(ChildStdout),
@@ -1760,19 +2038,21 @@ fn drain<R: Read>(
     authoritative: bool,
     retain_tail: bool,
 ) -> (Vec<u8>, Vec<u8>, bool, bool) {
-    use std::io::BufRead as _;
-
     let mut reader = BufReader::new(pipe);
     let mut kept = Vec::new();
     let mut tail = VecDeque::new();
     let mut tail_truncated = false;
     let mut line = Vec::new();
     let mut whole = true;
+    let mut continuing = false;
+    let marker_overlap_cap = gamma_rt::ENVIRONMENT_ERROR_MARKER
+        .len()
+        .max(gamma_rt::PRE_INSTALL_ERROR_MARKER.len())
+        .saturating_sub(1);
+    let mut marker_overlap = Vec::new();
 
     loop {
-        line.clear();
-
-        match reader.read_until(b'\n', &mut line) {
+        match read_output_fragment(&mut reader, &mut line) {
             Ok(0) => return (kept, tail.into_iter().collect(), tail_truncated, whole),
 
             // The partial line this read was building goes with the bytes it lost: half a line is
@@ -1781,6 +2061,16 @@ fn drain<R: Read>(
             Err(_truncated) => return (kept, tail.into_iter().collect(), tail_truncated, false),
 
             Ok(_read) => {
+                let fragmented = continuing || line.len() > OUTPUT_CAP;
+                continuing = fragmented && line.last() != Some(&b'\n');
+                whole &= !fragmented;
+                marker_overlap.extend_from_slice(&line[..line.len().min(marker_overlap_cap)]);
+                let boundary_error = runtime_startup_failure(&marker_overlap);
+                marker_overlap.clear();
+                if continuing {
+                    marker_overlap.extend_from_slice(&line[line.len().saturating_sub(marker_overlap_cap)..]);
+                }
+
                 // Published before the text is kept, so a binary past the cap still counts as
                 // making progress. Silence is the signal, not volume.
                 #[expect(clippy::unwrap_used, reason = "the watcher only panics if the process is unwinding")]
@@ -1790,7 +2080,8 @@ fn drain<R: Read>(
                     let environment_error = progress.environment_error;
 
                     let line = String::from_utf8_lossy(&line);
-                    if authoritative {
+                    progress.environment_error |= boundary_error;
+                    if authoritative && !fragmented {
                         progress.heard(&line);
                     } else {
                         progress.heard_diagnostic(&line);
@@ -1819,6 +2110,11 @@ fn drain<R: Read>(
             }
         }
     }
+}
+
+fn read_output_fragment(reader: &mut impl io::BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+    line.clear();
+    reader.take(OUTPUT_CAP as u64 + 1).read_until(b'\n', line)
 }
 
 /// Bytes retained from the end of each test-process stream for failure diagnostics.
@@ -1866,6 +2162,1067 @@ fn first_failure(output: &str) -> Option<&str> {
 /// This keeps the summary and nearby cause visible while bounding console noise. Enumeration and
 /// runner failures deliberately use the same local-diagnostic policy.
 pub(super) const DIAGNOSTIC_TAIL_LINES: usize = 20;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod final_survivor_tests {
+    use std::ffi::OsStr;
+
+    use super::ReachObservation::{NotReached, Reached, Unknown};
+    use super::*;
+    use crate::exec::resources::Resources;
+
+    fn policy_workspace() -> Workspace {
+        let root = Utf8PathBuf::from(if cfg!(windows) { "C:/verdict-policy" } else { "/verdict-policy" });
+        let mut work = Workspace::adopt(root.clone(), root.join("target"));
+        work.set_launch(Launch {
+            loader: None,
+            stack: "16777216".into(),
+        });
+        work
+    }
+
+    fn baseline_attempt() -> Attempt<'static> {
+        Attempt {
+            active: None,
+            timeout: Some(Duration::from_secs(30)),
+            stall: Stall::NONE,
+            request: MemoryRequest::default(),
+            only: Only::All,
+        }
+    }
+
+    #[test]
+    fn telemetry_pre_spawn_refusal_is_reported_as_an_inconclusive_runner_launch_attempt() {
+        let control = tick::ClockControl::new();
+        let clock = control.to_simple_clock();
+        super::super::sweep::begin_selection_trace();
+        let run = run_binary_with_observer(
+            &clock,
+            Attempt {
+                active: Some(37),
+                ..baseline_attempt()
+            },
+            false,
+            |_| {
+                control.advance_millis(17);
+                Observation {
+                    verdict: Verdict::Unmetered("runner unavailable; no child spawned".into()),
+                    reach: ReachObservation::Unknown,
+                    failure: None,
+                    quiet: Duration::ZERO,
+                    tests: None,
+                    peak: None,
+                }
+            },
+        );
+        assert!(matches!(run.verdict, Verdict::Unmetered(_)));
+        let costs = super::super::sweep::take_execution_costs();
+        let [(confirmation, cost)] = costs.as_slice() else {
+            panic!("exactly one runner invocation was attempted")
+        };
+        assert!(!confirmation);
+        assert_eq!((cost.launches, cost.hits, cost.misses, cost.inconclusive), (1, 0, 0, 1));
+        assert_eq!(cost.execution_ms, 17);
+        let mut json = serde_json::to_value(cost).unwrap();
+        assert_eq!(json["launchAttempts"], 1);
+        assert!(
+            json.get("launches").is_none(),
+            "runner invocations must never be labelled physical process launches"
+        );
+        let attempts = json.as_object_mut().unwrap().remove("launchAttempts").unwrap();
+        json["launches"] = attempts;
+        let legacy: super::super::session::AttemptCost = serde_json::from_value(json).unwrap();
+        assert_eq!(&legacy, cost, "previously named attempt counters remain readable");
+        assert!(super::super::sweep::take_selection_trace().is_empty());
+    }
+
+    #[test]
+    fn telemetry_records_each_confirmation_observation_once_without_launching_processes() {
+        for (confirm, verdicts) in [
+            (true, vec![Verdict::Failed(Some("killer".into())), Verdict::Passed]),
+            (false, vec![Verdict::TimedOut, Verdict::TimedOut]),
+            (false, vec![Verdict::TestEnumerationFailed("diagnostic".into()), Verdict::Passed]),
+            (
+                true,
+                vec![Verdict::TimedOut, Verdict::Failed(Some("killer".into())), Verdict::Passed],
+            ),
+            (
+                true,
+                vec![Verdict::Failed(Some("killer".into())), Verdict::Failed(Some("killer".into()))],
+            ),
+        ] {
+            let expected = verdicts.len();
+            let mut verdicts = verdicts.into_iter().enumerate();
+            let control = tick::ClockControl::new();
+            let clock = control.to_simple_clock();
+            super::super::sweep::begin_selection_trace();
+            let _run = run_binary_with_observer(
+                &clock,
+                Attempt {
+                    active: Some(37),
+                    ..baseline_attempt()
+                },
+                confirm,
+                |_| {
+                    let (index, verdict) = verdicts.next().expect("only the scripted observations may be executed");
+                    control.advance(Duration::from_millis(u64::try_from(index + 1).unwrap() * 7));
+                    Observation {
+                        verdict,
+                        reach: ReachObservation::Unknown,
+                        failure: None,
+                        quiet: Duration::ZERO,
+                        tests: Some(1),
+                        peak: None,
+                    }
+                },
+            );
+            assert!(verdicts.next().is_none());
+            let costs = super::super::sweep::take_execution_costs();
+            assert_eq!(costs.len(), expected);
+            for (index, (_, cost)) in costs.iter().enumerate() {
+                assert_eq!(cost.execution_ms, u64::try_from(index + 1).unwrap() * 7);
+            }
+            assert!(!costs[0].0, "only the first observation is a primary execution");
+            assert!(costs[1..].iter().all(|(confirmation, cost)| *confirmation && cost.launches == 1));
+            assert_eq!(costs.iter().map(|(_, cost)| cost.launches).sum::<usize>(), expected);
+            assert!(super::super::sweep::take_selection_trace().is_empty());
+        }
+    }
+
+    #[test]
+    fn filtered_selection_refusal_is_inconclusive_before_any_process_start() {
+        let mut work = policy_workspace();
+        work.set_test_args(vec!["allowed".to_owned()]);
+        let binary = crate::testing::test_binary("never-started");
+        let (verdict, _usage, evidence) = run_with_observation(
+            &work,
+            &binary,
+            Attempt {
+                active: Some(7),
+                only: Only::One("excluded"),
+                ..baseline_attempt()
+            },
+            &Arc::new(Mutex::new(Progress::new(Watch::Off))),
+            false,
+            None,
+            |_subtree| panic!("an empty filter intersection must return before starting a process"),
+        );
+        assert!(
+            matches!(verdict, Verdict::Unjudged(ref reason) if reason.contains("harness filters allow")),
+            "{verdict:?}"
+        );
+        assert!(evidence.is_none());
+    }
+
+    #[test]
+    fn repeated_observations_preserve_positive_reach_and_do_not_invent_negative_evidence() {
+        for (first, second, expected) in [
+            (Reached, NotReached, Reached),
+            (Reached, Unknown, Reached),
+            (NotReached, Unknown, NotReached),
+            (Unknown, Unknown, Unknown),
+            (Unknown, NotReached, NotReached),
+        ] {
+            let mut results = [(Verdict::TimedOut, first), (Verdict::Passed, second)].into_iter();
+            let result = run_binary_with_observer(
+                &SimpleClock::new_system(),
+                Attempt {
+                    active: Some(37),
+                    timeout: Some(Duration::from_secs(1)),
+                    stall: Stall::NONE,
+                    request: MemoryRequest::default(),
+                    only: Only::All,
+                },
+                false,
+                |_| {
+                    let (verdict, reach) = results.next().expect("one initial observation and one timeout confirmation");
+                    Observation {
+                        verdict,
+                        reach,
+                        failure: None,
+                        quiet: Duration::ZERO,
+                        tests: Some(1),
+                        peak: None,
+                    }
+                },
+            );
+            assert_eq!(result.verdict, Verdict::Passed);
+            assert_eq!(result.reach, expected, "{first:?}/{second:?}");
+            assert!(results.next().is_none());
+        }
+    }
+
+    #[test]
+    fn enumeration_suspicions_are_exonerated_even_when_kill_confirmation_is_disabled() {
+        let mut calls = Vec::new();
+        let result = run_binary_with_observer(
+            &SimpleClock::new_system(),
+            Attempt {
+                active: Some(37),
+                timeout: None,
+                stall: Stall::NONE,
+                request: MemoryRequest::default(),
+                only: Only::All,
+            },
+            false,
+            |attempt| {
+                calls.push(attempt.active);
+                Observation {
+                    verdict: if attempt.active.is_some() {
+                        Verdict::TestEnumerationFailed("original enumeration error".into())
+                    } else {
+                        Verdict::Passed
+                    },
+                    reach: ReachObservation::Unknown,
+                    failure: None,
+                    quiet: Duration::ZERO,
+                    tests: None,
+                    peak: None,
+                }
+            },
+        );
+        assert_eq!(calls, [Some(37), None]);
+        assert_eq!(result.verdict, Verdict::TestEnumerationFailed("original enumeration error".into()));
+    }
+
+    #[test]
+    fn native_spawn_retries_double_each_backoff_and_never_retry_a_permanent_refusal() {
+        let (_directory, work) = crate::testing::helper_workspace("spawn-backoff-contract-", &["exit:0"]);
+        let binary = crate::testing::helper();
+        let command = launcher(&work, &binary, Only::All, false).unwrap();
+        let refusals: Vec<_> = (0..3).map(|_| faults::arm(Fault::Spawn)).collect();
+        let mut waits = Vec::new();
+        let spawned = spawn_patiently_with_backoff(command, MemoryRequest::default(), |prepared, waited| {
+            waits.push(waited);
+            prepared.backoff(waited)
+        });
+        drop(refusals);
+        let spawned = spawned.unwrap_or_else(|error| match error {
+            StartError::Containment(reason) => panic!("the fourth helper spawn must establish native containment: {reason}"),
+            StartError::Spawn(reason) => panic!("the fourth helper spawn must succeed after three transient refusals: {reason}"),
+        });
+        let mut subtree = ProcessTree::adopt(spawned).unwrap();
+        subtree.terminate().unwrap();
+        assert_eq!(
+            waits,
+            [Duration::from_millis(50), Duration::from_millis(100), Duration::from_millis(200)]
+        );
+        let missing = work.root.join("does-not-exist");
+        let result = spawn_patiently_with_backoff(Command::new(missing), MemoryRequest::default(), |_, _| {
+            panic!("a missing executable is a permanent refusal and must never enter backoff")
+        });
+        assert!(matches!(result, Err(StartError::Spawn(error)) if error.kind() == io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn spawn_failures_name_a_memory_boundary_only_when_the_request_asked_for_one() {
+        let binary = crate::testing::test_binary("selected-test");
+        for meter in [false, true] {
+            let cause = io::Error::from(io::ErrorKind::NotFound);
+            let detail = cause.to_string();
+            let request = MemoryRequest { meter, limit: None };
+            let result = start_or_verdict_with(Command::new("not-started"), &binary, request, |_, actual| {
+                assert_eq!(actual.meter, meter);
+                Err(StartError::Spawn(cause))
+            });
+            let Err((Verdict::Unjudged(reason), usage)) = result else {
+                panic!("a spawn error must remain an unjudged run");
+            };
+            let boundary = if meter { " inside its memory accounting boundary" } else { "" };
+            assert_eq!(reason, format!("`selected-test` could not be started{boundary}: {detail}"));
+            assert_eq!(usage.peak, None);
+        }
+    }
+
+    #[test]
+    fn cleanup_failures_preserve_whether_the_verdict_was_already_settled() {
+        for settled in [false, true] {
+            let (_directory, work) = crate::testing::helper_workspace("cleanup-diagnostic-contract-", &["sleep:30000"]);
+            let binary = crate::testing::helper();
+            let mut command = launcher(&work, &binary, Only::All, false).unwrap();
+            configure(&mut command, &binary, work.launch(), None, None, None);
+            let spawned = prepare(command, MemoryRequest::default())
+                .unwrap()
+                .spawn()
+                .unwrap_or_else(|_| panic!("the owned helper process must spawn before its cleanup fault is armed"));
+            let mut subtree = ProcessTree::adopt(spawned).unwrap();
+            let _fault = process_faults::arm(ProcessFault::Terminate);
+            let Err((Verdict::Unmetered(reason), _usage)) = cut_short(&mut subtree, MemoryRequest::default(), &binary, settled) else {
+                panic!("a failed subtree termination must reject further uncontained execution");
+            };
+            let point = if settled {
+                "after its verdict was settled"
+            } else {
+                "after execution began"
+            };
+            assert!(
+                reason.starts_with(&format!(
+                    "`{}` and its descendants could not be terminated {point}; containment is unproven: ",
+                    binary.path
+                )),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn cutoff_retains_a_requested_ceiling_only_when_platform_accounting_reports_exhaustion() {
+        for exhausted in [false, true] {
+            for limit in [None, Some(4096)] {
+                let (_directory, work) = crate::testing::helper_workspace("cutoff-accounting-contract-", &["sleep:30000"]);
+                let binary = crate::testing::helper();
+                let mut command = launcher(&work, &binary, Only::All, false).unwrap();
+                configure(&mut command, &binary, work.launch(), None, None, None);
+                let spawned = prepare(command, MemoryRequest::default())
+                    .unwrap()
+                    .spawn()
+                    .unwrap_or_else(|_| panic!("the contained helper must spawn before accounting is observed"));
+                let mut subtree = ProcessTree::adopt(spawned).unwrap();
+                let (usage, ceiling) = cut_short_with_usage(&mut subtree, MemoryRequest { meter: true, limit }, &binary, false, |_| {
+                    MemoryUsage {
+                        peak: Some(123),
+                        exhausted,
+                    }
+                })
+                .unwrap();
+                assert_eq!(usage.peak, Some(123));
+                assert_eq!(usage.exhausted, exhausted);
+                assert_eq!(ceiling, limit.filter(|_| exhausted));
+            }
+        }
+    }
+
+    fn recorded_failures(environment_error: bool) -> Arc<Mutex<Progress>> {
+        let mut progress = Progress::new(Watch::Libtest);
+        progress.heard("running 2 tests");
+        progress.heard("test alpha ... FAILED");
+        progress.heard("test beta ... FAILED");
+        if environment_error {
+            progress.heard(core::str::from_utf8(gamma_rt::ENVIRONMENT_ERROR_MARKER).unwrap());
+        }
+        Arc::new(Mutex::new(progress))
+    }
+
+    fn empty_collected() -> Collected {
+        Collected {
+            text: Vec::new(),
+            authoritative: Vec::new(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+            tail_truncated: false,
+            whole: true,
+        }
+    }
+
+    struct ScriptedSupervision {
+        observation: Option<io::Result<Option<ExitStatus>>>,
+        expiration: (bool, bool),
+        stopped: Option<bool>,
+        collected: std::cell::Cell<bool>,
+        stop_error: Option<String>,
+    }
+
+    impl ScriptedSupervision {
+        fn new(observation: io::Result<Option<ExitStatus>>, expiration: (bool, bool)) -> Self {
+            Self {
+                observation: Some(observation),
+                expiration,
+                stopped: None,
+                collected: std::cell::Cell::new(false),
+                stop_error: None,
+            }
+        }
+    }
+
+    impl Supervision for ScriptedSupervision {
+        fn observe(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.observation.take().expect("only one completion observation is scripted")
+        }
+        fn released(&self) -> bool {
+            assert!(
+                self.observation.is_none(),
+                "completion must be observed before release is inspected"
+            );
+            true
+        }
+        fn collect(&self) -> Collected {
+            assert!(!self.collected.replace(true), "only one output collection is scripted");
+            empty_collected()
+        }
+        fn usage(&self) -> MemoryUsage {
+            assert!(self.collected.get(), "completed output is collected before usage");
+            MemoryUsage::default()
+        }
+        fn cut_short(&mut self, settled: bool) -> Result<(MemoryUsage, Option<u64>), (Verdict, MemoryUsage)> {
+            assert!(self.stopped.replace(settled).is_none(), "only one termination is scripted");
+            if let Some(reason) = self.stop_error.take() {
+                return Err((Verdict::Unmetered(reason), MemoryUsage::default()));
+            }
+            Ok((MemoryUsage::default(), None))
+        }
+        fn expiration(&self, _progress: &Mutex<Progress>) -> (bool, bool) {
+            self.expiration
+        }
+        fn seen(&self) -> u64 {
+            0
+        }
+        fn wait(&self, _seen: u64, _progress: &Mutex<Progress>) {
+            panic!("the supplied terminal observation must settle without waiting")
+        }
+    }
+
+    fn exit_status(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt as _;
+            ExitStatus::from_raw(u32::try_from(code).unwrap())
+        }
+    }
+
+    #[test]
+    fn completed_and_running_startup_errors_keep_all_named_failures() {
+        for completed in [false, true] {
+            let binary = crate::testing::test_binary("startup-evidence");
+            let progress = recorded_failures(true);
+            let mut supervision = ScriptedSupervision::new(Ok(completed.then(|| exit_status(7))), (false, false));
+            let (verdict, _usage, evidence) = supervise(&mut supervision, &binary, None, false, MemoryRequest::default(), &progress, true);
+            let Verdict::Unmetered(reason) = verdict else {
+                panic!("startup evidence must take precedence over a native exit or a pending process: {verdict:?}");
+            };
+            assert_eq!(
+                reason,
+                "the guard runtime could not acquire the process startup environment or install its startup selection"
+            );
+            let evidence = evidence.expect("requested startup diagnostics must retain their announced failures");
+            assert_eq!(evidence.failed_tests, ["alpha", "beta"]);
+            assert_eq!(evidence.termination, completed.then_some(Termination::ExitCode(7)));
+            assert_eq!(supervision.stopped, (!completed).then_some(true));
+            assert!(supervision.collected.get());
+        }
+    }
+
+    #[test]
+    fn supervision_errors_retain_failures_and_report_unproven_cleanup_at_the_right_stage() {
+        for refuse_cleanup in [false, true] {
+            let binary = crate::testing::test_binary("wait-evidence");
+            let cleanup_error = "controlled cleanup refusal after execution began; containment is unproven: controlled failure";
+            let mut supervision = ScriptedSupervision::new(Err(io::Error::other("controlled observation refusal")), (false, false));
+            supervision.stop_error = refuse_cleanup.then(|| cleanup_error.to_owned());
+            let (verdict, _usage, evidence) = supervise(
+                &mut supervision,
+                &binary,
+                None,
+                false,
+                MemoryRequest::default(),
+                &recorded_failures(false),
+                true,
+            );
+            assert_eq!(
+                verdict,
+                if refuse_cleanup {
+                    Verdict::Unmetered(cleanup_error.to_owned())
+                } else {
+                    Verdict::Unjudged(
+                        "`wait-evidence` could not be asked whether it had finished: controlled observation refusal".to_owned(),
+                    )
+                }
+            );
+            let evidence = evidence.expect("supervision errors must retain requested failure evidence");
+            assert_eq!(evidence.failed_tests, ["alpha", "beta"]);
+            assert_eq!(evidence.termination, None);
+            assert_eq!(supervision.stopped, Some(false));
+            assert!(supervision.collected.get());
+        }
+    }
+
+    #[test]
+    fn wall_and_silence_deadlines_keep_distinct_verdicts_and_all_failure_names() {
+        for stalled in [false, true] {
+            let binary = crate::testing::test_binary("deadline-evidence");
+            let mut supervision = ScriptedSupervision::new(Ok(None), (stalled, !stalled));
+            let (verdict, _usage, evidence) = supervise(
+                &mut supervision,
+                &binary,
+                None,
+                false,
+                MemoryRequest::default(),
+                &recorded_failures(false),
+                true,
+            );
+            if stalled {
+                assert_eq!(verdict, Verdict::Stalled(Some("beta".to_owned())));
+            } else {
+                assert_eq!(verdict, Verdict::TimedOut);
+            }
+            let evidence = evidence.expect("deadline exits must preserve requested failure evidence");
+            assert_eq!(evidence.failed_tests, ["alpha", "beta"]);
+            assert_eq!(evidence.termination, None);
+            assert_eq!(supervision.stopped, Some(true));
+            assert!(supervision.collected.get());
+        }
+        let now = Instant::now();
+        let later = now.checked_add(Duration::from_nanos(1)).unwrap();
+        assert!(!deadline_reached(later, now));
+        assert!(deadline_reached(now, now));
+        assert!(deadline_reached(now, later));
+    }
+
+    #[test]
+    fn launch_preparation_applies_loader_and_resource_policies_before_spawning() {
+        let mut work = policy_workspace();
+        let binary = crate::testing::test_binary("launch-preparation");
+        work.set_launch(Launch {
+            loader: Some("controlled-loader-path".into()),
+            stack: "16777216".into(),
+        });
+        work.set_test_environment(&binary.package, "CARGO_GAMMA_CONTROLLED_ENVIRONMENT", "wired");
+        work.set_harness_threads("4");
+        for serialized in [false, true] {
+            if serialized {
+                work.set_resources(Resources::fake_binary(&binary));
+            }
+            let command = configured_launcher(&work, &binary, baseline_attempt()).unwrap();
+            let actual: BTreeMap<_, _> = command.get_envs().collect();
+            assert_eq!(
+                actual.get(OsStr::new("CARGO_GAMMA_CONTROLLED_ENVIRONMENT")).copied().flatten(),
+                Some(OsStr::new("wired"))
+            );
+            assert_eq!(
+                actual.get(OsStr::new("RUST_TEST_THREADS")).copied().flatten(),
+                if serialized {
+                    Some(OsStr::new("1"))
+                } else {
+                    work.harness_threads().map(OsStr::new)
+                }
+            );
+            let mut loader = Command::new(binary.path.as_std_path());
+            configure_loader(&mut loader, work.launch());
+            let loader_environment: Vec<_> = loader.get_envs().collect();
+            assert!(
+                !loader_environment.is_empty(),
+                "the real workspace launch policy must contain a loader path"
+            );
+            for (key, value) in loader_environment {
+                assert_eq!(actual.get(key).copied(), Some(value), "loader variable {key:?} was not applied");
+            }
+        }
+    }
+
+    fn reader_helper_process() -> ProcessTree {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        let _ = command
+            .args([
+                "--exact",
+                "exec::verdict::final_survivor_tests::reader_contract_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CARGO_GAMMA_READER_CONTRACT_HELPER", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        let spawned = prepare(command, MemoryRequest::default())
+            .unwrap()
+            .spawn()
+            .unwrap_or_else(|_| panic!("the owned reader helper must spawn"));
+        ProcessTree::adopt(spawned).unwrap()
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    #[cfg_attr(miri, ignore = "native pipe acceptance launches a child and reads its operating-system pipes")]
+    fn real_pipe_readers_preserve_stream_authority_tails_and_completion_wakeups() {
+        for under_nextest in [false, true] {
+            for retain_tail in [false, true] {
+                let mut subtree = reader_helper_process();
+                let progress = Arc::new(Mutex::new(Progress::new(Watch::Libtest)));
+                let pulse = Arc::new(Pulse::default());
+                let before = pulse.seen();
+                let received = readers(&mut subtree, &progress, &pulse, under_nextest, retain_tail).unwrap();
+                let output = collected_with_grace(&received, None);
+                while ask_after(&mut subtree).unwrap().is_none() {
+                    thread::yield_now();
+                }
+                assert!(output.whole);
+                assert!(String::from_utf8_lossy(&output.text).contains("stdout-marker"));
+                assert!(String::from_utf8_lossy(&output.text).contains("stderr-marker"));
+                let (selected, rejected) = if under_nextest {
+                    ("stderr_case", "stdout_case")
+                } else {
+                    ("stdout_case", "stderr_case")
+                };
+                assert_eq!(announced_failure(&progress).as_deref(), Some(selected));
+                let authoritative = String::from_utf8_lossy(&output.authoritative);
+                assert!(authoritative.contains(selected), "{authoritative}");
+                assert!(!authoritative.contains(rejected), "{authoritative}");
+                if retain_tail {
+                    assert!(String::from_utf8_lossy(&output.stdout_tail).contains("stdout-marker"));
+                    assert!(String::from_utf8_lossy(&output.stderr_tail).contains("stderr-marker"));
+                } else {
+                    assert!(output.stdout_tail.is_empty());
+                    assert!(output.stderr_tail.is_empty());
+                }
+                assert_eq!(
+                    pulse.seen() - before,
+                    3,
+                    "one decisive failure and two completed streams wake supervision"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reader_threads_have_a_diagnostic_name_and_refusals_identify_the_first_stream() {
+        assert_eq!(
+            reader_thread()
+                .spawn(|| thread::current().name().unwrap().to_owned())
+                .unwrap()
+                .join()
+                .unwrap(),
+            "cargo-gamma-output"
+        );
+        let mut subtree = reader_helper_process();
+        let _fault = faults::arm(Fault::Thread);
+        let error = readers(
+            &mut subtree,
+            &Arc::new(Mutex::new(Progress::new(Watch::Libtest))),
+            &Arc::new(Pulse::default()),
+            false,
+            true,
+        )
+        .expect_err("the armed native reader-start fault must be returned");
+        subtree.terminate().unwrap();
+        assert!(matches!(error.stream, ReaderStream::Stdout));
+        assert_eq!(error.cause.to_string(), "the reader thread a test asked to fail");
+    }
+
+    #[test]
+    fn selected_resource_launches_strip_conflicting_thread_flags() {
+        for arguments in [vec!["--test-threads=8"], vec!["--test-threads", "8"]] {
+            let mut work = policy_workspace();
+            let binary = crate::testing::test_binary("selected-resource");
+            work.set_test_args(arguments.into_iter().map(str::to_owned).collect());
+            work.set_resources(Resources::fake_binary(&binary));
+            let command = launcher(&work, &binary, Only::One("chosen"), true).unwrap();
+            let arguments: Vec<_> = command.get_args().map(|argument| argument.to_string_lossy().into_owned()).collect();
+            assert_eq!(arguments, ["chosen", "--exact", "--test-threads", "1"]);
+        }
+    }
+
+    #[test]
+    fn nextest_launch_preparation_forwards_active_mutants_and_serializes_each_mutant() {
+        for resource in [false, true] {
+            let mut work = policy_workspace();
+            let binary = crate::testing::test_binary("/t/deps/nxspike-abc");
+            work.set_runner(nextest::Harness::fake(&[("/t/deps/nxspike-abc", "nxspike")]));
+            if resource {
+                work.set_resources(Resources::fake_binary(&binary));
+            }
+            for active in [None, Some(37)] {
+                let command = configured_launcher(
+                    &work,
+                    &binary,
+                    Attempt {
+                        active,
+                        ..baseline_attempt()
+                    },
+                )
+                .unwrap();
+                let arguments: Vec<_> = command.get_args().map(|argument| argument.to_string_lossy().into_owned()).collect();
+                assert_eq!(
+                    arguments.iter().any(|argument| argument == "--fail-fast"),
+                    active.is_some(),
+                    "{arguments:?}"
+                );
+                assert!(arguments.windows(2).any(|pair| pair == ["--test-threads", "1"]), "{arguments:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn named_failures_outrank_memory_ceiling_reports_and_direct_failures_are_not_partial_nextest_runs() {
+        assert_eq!(
+            prefer_named(Verdict::Failed(Some("named".to_owned())), Some(7), Some(5)),
+            Verdict::Failed(Some("named".to_owned()))
+        );
+        let progress = recorded_failures(false);
+        assert_eq!(unfinished_nextest_failure(false, &progress), None);
+        assert!(matches!(unfinished_nextest_failure(true, &progress), Some(Verdict::Unmetered(_))));
+    }
+
+    #[test]
+    fn failing_native_children_warn_only_when_their_output_was_actually_truncated() {
+        for oversized in [false, true] {
+            let amount = if oversized { OUTPUT_CAP + 1 } else { 16 };
+            let flood = format!("flood:{amount}");
+            let (_directory, work) = crate::testing::helper_workspace("partial-output-diagnostic-", &[&flood, "exit:1"]);
+            let binary = crate::testing::helper();
+            let notes = crate::notes::Run::new();
+            let _scope = crate::notes::enter(Some(&notes));
+            let (verdict, _usage, _failure) = run_with(
+                &work,
+                &binary,
+                baseline_attempt(),
+                &Arc::new(Mutex::new(Progress::new(Watch::Off))),
+                false,
+            );
+            assert_eq!(verdict, Verdict::Failed(None));
+            let messages = crate::notes::drain();
+            let expected = format!(
+                "the output of `{}` could not be read to the end, so the failing test may be named in text \
+                 this run never saw. The exit status still decided the verdict.",
+                binary.path
+            );
+            assert_eq!(messages, if oversized { vec![expected] } else { Vec::new() });
+        }
+    }
+
+    #[test]
+    fn an_unfinished_nextest_failure_is_not_reclassified_as_a_mutant_timeout() {
+        let mut progress = Progress::new(Watch::Nextest);
+        progress.heard("        FAIL [   0.024s] (1/1) helper named");
+        let progress = Arc::new(Mutex::new(progress));
+        assert_eq!(announced_failure(&progress).as_deref(), Some("named"));
+        let observed = std::cell::Cell::new(0);
+        let (verdict, _usage, evidence) = settle_budget_with(true, &progress, false, true, || {
+            observed.set(observed.get() + 1);
+            (
+                MemoryUsage::default(),
+                None,
+                Collected {
+                    text: Vec::new(),
+                    authoritative: Vec::new(),
+                    stdout_tail: Vec::new(),
+                    stderr_tail: Vec::new(),
+                    tail_truncated: false,
+                    whole: true,
+                },
+            )
+        });
+        assert_eq!(observed.get(), 1);
+        assert_eq!(
+            verdict,
+            Verdict::Unmetered(
+                "`cargo nextest` announced a failure but did not finish before the run budget, so its captured startup output could not be classified"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            evidence
+                .expect("an unfinished runner must preserve its announced failure")
+                .failed_tests,
+            ["named"]
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture launched by the real-pipe reader regression"]
+    fn reader_contract_helper() {
+        assert_eq!(std::env::var("CARGO_GAMMA_READER_CONTRACT_HELPER").unwrap(), "1");
+        println!("\ntest stdout_case ... FAILED\nstdout-marker");
+        eprintln!("\nrunning 1 test\ntest stderr_case ... FAILED\nstderr-marker");
+    }
+
+    #[test]
+    fn environment_markers_wake_the_drain_once_even_when_repeated_on_a_diagnostic_stream() {
+        let marker = core::str::from_utf8(gamma_rt::ENVIRONMENT_ERROR_MARKER).unwrap();
+        for authoritative in [false, true] {
+            for text in [format!("{marker}\n"), format!("{marker}\n{marker}\n")] {
+                let progress = Mutex::new(Progress::new(Watch::Libtest));
+                let pulse = Pulse::default();
+                let before = pulse.seen();
+                let (kept, _, _, complete) = drain(text.as_bytes(), &progress, &pulse, authoritative, false);
+                assert_eq!(kept, text.as_bytes());
+                assert!(complete);
+                let environment_error = progress
+                    .lock()
+                    .expect("this local mutex is used only by synchronous drain, which returned without unwinding while locked")
+                    .environment_error;
+                assert!(environment_error);
+                assert_eq!(pulse.seen() - before, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_output_sender_is_partial_but_a_disconnected_complete_channel_is_not() {
+        let (sender, receiver) = mpsc::channel();
+        assert!(!collected(&receiver, Duration::ZERO).whole);
+        drop(sender);
+        assert!(collected(&receiver, Duration::ZERO).whole);
+    }
+
+    #[test]
+    fn remaining_deadlines_are_positive_before_the_deadline_and_saturate_after_it() {
+        let now = Instant::now();
+        let future = now.checked_add(Duration::from_secs(30)).unwrap();
+        assert_eq!(remaining_at(future, now), Duration::from_secs(30));
+        assert_eq!(remaining_at(now, now), Duration::ZERO);
+        assert_eq!(remaining_at(now, future), Duration::ZERO);
+    }
+
+    #[test]
+    fn normal_binary_environments_keep_calibrated_threads_and_leave_an_empty_manifest_unset() {
+        let mut work = policy_workspace();
+        work.set_harness_threads("3");
+        let binary = TestBinary {
+            manifest_dir: Utf8PathBuf::new(),
+            ..crate::testing::test_binary("environment-policy")
+        };
+        assert_eq!(
+            baseline_environment(&work, &binary, Only::All)["set"][TEST_THREADS_VAR].as_str(),
+            work.harness_threads()
+        );
+        let mut command = Command::new("not-started");
+        let _inherited = command.env("CARGO_MANIFEST_DIR", "original-manifest");
+        configure(&mut command, &binary, &Launch::derive(&[]), None, None, None);
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == "CARGO_MANIFEST_DIR")
+            .and_then(|(_, value)| value);
+        assert_eq!(value, Some(std::ffi::OsStr::new("original-manifest")));
+    }
+
+    #[test]
+    fn inherited_nextest_and_nocapture_settings_are_checked_in_an_isolated_process() {
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "exec::verdict::final_survivor_tests::inherited_environment_helper",
+                "--nocapture",
+            ])
+            .env("CARGO_GAMMA_ENVIRONMENT_CONTRACT_HELPER", "1")
+            .env("NEXTEST", "1")
+            .env("NEXTEST_CONTRACT_MARKER", "1")
+            .env("CONTRACT_NEXTEST_", "1")
+            .env("RUST_TEST_NOCAPTURE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated child process for inherited_environment_helper"]
+    fn inherited_environment_helper() {
+        assert_eq!(env::var("CARGO_GAMMA_ENVIRONMENT_CONTRACT_HELPER").as_deref(), Ok("1"));
+        let (_directory, work) = crate::testing::helper_workspace("inherited-environment-contract-", &[]);
+        assert!(matches!(watch(&work), Watch::Off));
+        let mut command = Command::new("not-started");
+        configure(&mut command, &crate::testing::helper(), &Launch::derive(&[]), None, None, None);
+        let changes: BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(changes.get(std::ffi::OsStr::new("NEXTEST")), Some(&None));
+        assert_eq!(changes.get(std::ffi::OsStr::new("NEXTEST_CONTRACT_MARKER")), Some(&None));
+        assert!(!changes.contains_key(std::ffi::OsStr::new("CONTRACT_NEXTEST_")));
+    }
+
+    #[test]
+    fn collected_verdicts_keep_the_runner_selection_and_active_mutant_at_the_adapter_boundary() {
+        let collected = Collected {
+            text: b"  enumeration diagnostic \n".to_vec(),
+            authoritative: b"test observed ... FAILED\n".to_vec(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+            tail_truncated: false,
+            whole: true,
+        };
+        for (nextest, active, expected) in [
+            (true, Some(37), Verdict::TestEnumerationFailed("enumeration diagnostic".into())),
+            (false, Some(37), Verdict::Failed(Some("observed".into()))),
+        ] {
+            let (actual, retained) = settle_collected(
+                nextest,
+                active,
+                Some(nextest::TEST_LIST_CREATION_FAILED),
+                &collected,
+                MemoryUsage {
+                    peak: Some(19),
+                    exhausted: true,
+                },
+            );
+            assert_eq!(actual, expected);
+            assert_eq!(retained.peak, Some(19));
+            assert!(retained.exhausted);
+        }
+        let (actual, _) = settle_collected(
+            true,
+            None,
+            Some(nextest::TEST_LIST_CREATION_FAILED),
+            &collected,
+            MemoryUsage::default(),
+        );
+        assert!(matches!(actual, Verdict::Unmetered(_)), "{actual:?}");
+    }
+
+    #[test]
+    fn simultaneous_reach_captures_never_remove_each_others_records() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8Path::from_path(directory.path()).unwrap().to_owned();
+        let work = Workspace::adopt(root.clone(), root.join("target"));
+        let attempt = Attempt {
+            active: Some(37),
+            timeout: None,
+            stall: Stall::NONE,
+            request: MemoryRequest::default(),
+            only: Only::All,
+        };
+        let first = ReachCapture::new(&work, attempt).expect("an active mutant run needs its own capture");
+        fs::write(&first.path, 37_u32.to_le_bytes()).unwrap();
+        let second = ReachCapture::new(&work, attempt).expect("a second in-flight run needs an independent capture");
+        assert_ne!(first.path, second.path);
+        assert_eq!(fs::read(&first.path).unwrap(), 37_u32.to_le_bytes());
+        fs::write(&second.path, gamma_rt::SEAL.to_le_bytes()).unwrap();
+        assert_eq!(first.finish(), ReachObservation::Reached);
+        assert_eq!(second.finish(), ReachObservation::NotReached);
+        assert!(ReachCapture::new(&work, Attempt { active: None, ..attempt }).is_none());
+    }
+
+    #[test]
+    fn a_wrapping_reach_sequence_does_not_skip_into_the_next_live_capture_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(directory.path()).unwrap().to_owned();
+        let work = Workspace::adopt(root.clone(), root.join("target"));
+        let attempt = Attempt {
+            active: Some(37),
+            timeout: None,
+            stall: Stall::NONE,
+            request: MemoryRequest::default(),
+            only: Only::All,
+        };
+        let previous = AtomicUsize::new(1);
+        let live = ReachCapture::new_with_sequence(&work, attempt, &previous).unwrap();
+        fs::write(&live.path, 37_u32.to_le_bytes()).unwrap();
+        let next = AtomicUsize::new(usize::MAX);
+        let last = ReachCapture::new_with_sequence(&work, attempt, &next).unwrap();
+        let wrapped = ReachCapture::new_with_sequence(&work, attempt, &next).unwrap();
+        assert_ne!(wrapped.path, live.path);
+        assert_ne!(last.path, wrapped.path);
+        assert_eq!(live.finish(), ReachObservation::Reached);
+        assert_eq!(last.finish(), ReachObservation::Unknown);
+        assert_eq!(wrapped.finish(), ReachObservation::Unknown);
+    }
+
+    #[test]
+    fn finite_output_drain_wakes_only_for_new_decisive_evidence_and_retains_the_requested_tail() {
+        for authoritative in [false, true] {
+            for retain_tail in [false, true] {
+                for (text, decisive) in [
+                    ("ordinary diagnostic\n", 0),
+                    ("test named_failure ... FAILED\n", usize::from(authoritative)),
+                    (
+                        "test named_failure ... FAILED\ntest named_failure ... FAILED\n",
+                        usize::from(authoritative),
+                    ),
+                ] {
+                    let progress = Mutex::new(Progress::new(Watch::Libtest));
+                    progress
+                        .lock()
+                        .expect("this newly created local progress mutex has not yet been locked")
+                        .heard("running 1 test");
+                    let pulse = Pulse::default();
+                    let before = pulse.seen();
+                    let (kept, tail, truncated, whole) =
+                        drain(io::Cursor::new(text.as_bytes()), &progress, &pulse, authoritative, retain_tail);
+                    assert_eq!(kept, text.as_bytes());
+                    assert_eq!(tail, if retain_tail { text.as_bytes() } else { b"" });
+                    assert!(!truncated);
+                    assert!(whole);
+                    assert_eq!(pulse.seen() - before, decisive as u64);
+                    let failed = progress
+                        .lock()
+                        .expect("local heard and synchronous drain returned without unwinding while holding this mutex")
+                        .failed
+                        .is_some();
+                    assert_eq!(failed, decisive != 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failure_evidence_marks_each_independent_source_of_truncation() {
+        for (whole, bytes_truncated, stdout_lines, stderr_lines) in [
+            (true, false, 1, 1),
+            (false, false, 1, 1),
+            (true, true, 1, 1),
+            (true, false, OUTPUT_TAIL_LINES + 1, 1),
+            (true, false, 1, OUTPUT_TAIL_LINES + 1),
+        ] {
+            let collected = Collected {
+                text: Vec::new(),
+                authoritative: Vec::new(),
+                stdout_tail: "out\n".repeat(stdout_lines).into_bytes(),
+                stderr_tail: "err\n".repeat(stderr_lines).into_bytes(),
+                tail_truncated: bytes_truncated,
+                whole,
+            };
+            let evidence = collected.failure_evidence(None, vec!["named".into()]);
+            assert_eq!(
+                evidence.output_truncated,
+                !whole || bytes_truncated || stdout_lines > OUTPUT_TAIL_LINES || stderr_lines > OUTPUT_TAIL_LINES
+            );
+            assert_eq!(evidence.stdout_tail, vec!["out"; stdout_lines.min(OUTPUT_TAIL_LINES)].join("\n"));
+            assert_eq!(evidence.stderr_tail, vec!["err"; stderr_lines.min(OUTPUT_TAIL_LINES)].join("\n"));
+            assert_eq!(evidence.failed_tests, ["named"]);
+        }
+    }
+
+    #[test]
+    fn output_tail_reports_the_first_excess_byte_not_exact_capacity() {
+        let mut bytes = VecDeque::new();
+        assert!(!retain_output_tail(&mut bytes, b"one"));
+        assert!(!retain_output_tail(&mut bytes, &vec![b'x'; OUTPUT_TAIL_CAP - 3]));
+        assert_eq!(bytes.len(), OUTPUT_TAIL_CAP);
+        assert!(retain_output_tail(&mut bytes, b"y"));
+        assert_eq!(bytes.len(), OUTPUT_TAIL_CAP);
+        assert_eq!(bytes.front(), Some(&b'n'));
+        assert_eq!(bytes.back(), Some(&b'y'));
+        assert!(matches!(tail("a\nb\n", 2), Cow::Borrowed("a\nb")));
+        assert_eq!(tail("a\r\nb\r\n", 2), "a\nb");
+    }
+
+    #[test]
+    fn reach_capture_is_removed_for_valid_and_invalid_runtime_records() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let root = Utf8Path::from_path(directory.path()).unwrap();
+        for (index, records, fragment, expected) in [
+            (0, vec![7, gamma_rt::SEAL], false, ReachObservation::Reached),
+            (1, vec![8, gamma_rt::SEAL], false, ReachObservation::NotReached),
+            (2, vec![8], false, ReachObservation::Unknown),
+            (3, vec![gamma_rt::SEAL, gamma_rt::SEAL], false, ReachObservation::Unknown),
+            (4, vec![gamma_rt::SEAL, 8], false, ReachObservation::Unknown),
+            (5, vec![gamma_rt::OVERFLOW], false, ReachObservation::Unknown),
+            (6, vec![gamma_rt::SEAL], true, ReachObservation::Unknown),
+        ] {
+            let path = root.join(format!("capture-{index}"));
+            let mut bytes = records.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            if fragment {
+                bytes.push(1);
+            }
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                ReachCapture {
+                    path: path.clone(),
+                    ordinal: 7
+                }
+                .finish(),
+                expected
+            );
+            assert!(!path.exists());
+        }
+    }
+}
 
 /// Returns the last `count` lines without indexing the complete input.
 pub(super) fn tail(text: &str, count: usize) -> Cow<'_, str> {
@@ -1984,7 +3341,6 @@ mod tests {
             stall: Stall::NONE,
             request: MemoryRequest::default(),
             only: Only::All,
-            census: None,
         };
         assert_eq!(attempt.patient().timeout, None);
 
@@ -2040,7 +3396,6 @@ mod tests {
             stall: Stall::NONE,
             request: MemoryRequest::default(),
             only: Only::All,
-            census: None,
         };
         assert!(reach_hint_is_final(base, false));
         assert!(!reach_hint_is_final(
@@ -2071,7 +3426,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_mutant_run_harvests_reach_without_an_extra_launch() {
-        let directive = format!("write-le:{}|7|{}", gamma_rt::CENSUS_VAR, gamma_rt::SEAL);
+        let directive = format!("write-le:{}|7|{}", gamma_rt::REACH_VAR, gamma_rt::SEAL);
         let (_directory, work) = crate::testing::helper_workspace("reach-observation", &[&directive]);
         let binary = crate::testing::helper();
 
@@ -2084,7 +3439,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             false,
         );
@@ -2197,7 +3551,7 @@ mod tests {
         assert_eq!(set[INSTA_FORCE_PASS_VAR], "0");
         assert_eq!(
             environment["removed"],
-            serde_json::json!([gamma_rt::ACTIVE_VAR, gamma_rt::CENSUS_VAR, "NEXTEST", "NEXTEST_*"])
+            serde_json::json!([gamma_rt::ACTIVE_VAR, gamma_rt::REACH_VAR, "NEXTEST", "NEXTEST_*"])
         );
         assert_eq!(environment["valuesOmitted"], serde_json::json!([STACK_VAR]));
 
@@ -2213,7 +3567,7 @@ mod tests {
             &launch,
             Some("3"),
             Some(11),
-            Some(Utf8Path::new("census.bin")),
+            Some(Utf8Path::new("reach.bin")),
         );
         let env: BTreeMap<_, _> = command
             .get_envs()
@@ -2231,7 +3585,7 @@ mod tests {
         assert_eq!(env[INSTA_FORCE_PASS_VAR].as_deref(), Some("0"));
         assert_eq!(env[TEST_THREADS_VAR].as_deref(), Some("3"));
         assert_eq!(env[gamma_rt::ACTIVE_VAR].as_deref(), Some("11"));
-        assert_eq!(env[gamma_rt::CENSUS_VAR].as_deref(), Some("census.bin"));
+        assert_eq!(env[gamma_rt::REACH_VAR].as_deref(), Some("reach.bin"));
         assert_eq!(env["CARGO_MANIFEST_DIR"].as_deref(), Some("manifest"));
     }
 
@@ -2270,7 +3624,6 @@ mod tests {
                 limit: Some(100),
             },
             only: Only::All,
-            census: None,
         };
 
         let patient = base.patient();
@@ -2372,6 +3725,84 @@ mod tests {
             "the diagnostic tail did not retain the evidence discarded from the parsing prefix"
         );
         assert!(environment_failure(&progress), "the marker remains visible outside the output cap");
+    }
+
+    #[test]
+    fn unterminated_output_is_read_in_bounded_fragments_through_newline_and_eof() {
+        for ending in [b"".as_slice(), b"\nfollowing line\n".as_slice()] {
+            let bytes = OUTPUT_CAP * 3 + 17;
+            let pipe = io::repeat(b'x').take(bytes as u64).chain(io::Cursor::new(ending));
+            let mut reader = BufReader::new(pipe);
+            let mut fragment = Vec::new();
+            let mut observed = 0;
+            let mut largest = 0;
+            loop {
+                let read = read_output_fragment(&mut reader, &mut fragment).unwrap();
+                assert!(fragment.len() <= OUTPUT_CAP + 1);
+                assert!(fragment.capacity() <= (OUTPUT_CAP + 1) * 2);
+                largest = largest.max(fragment.len());
+                observed += read;
+                if read == 0 {
+                    break;
+                }
+            }
+            assert_eq!(largest, OUTPUT_CAP + 1);
+            assert_eq!(observed, bytes + ending.len());
+        }
+    }
+
+    #[test]
+    fn overlong_line_fragments_cannot_forge_failures_and_later_lines_still_count() {
+        let pipe = io::Cursor::new(b"running 1 test\n")
+            .chain(io::repeat(b'x').take(OUTPUT_CAP as u64 + 1))
+            .chain(io::Cursor::new(b"test forged::failure ... FAILED\ntest real::killer ... FAILED\n"));
+        let progress = Mutex::new(Progress::new(Watch::Libtest));
+        let (kept, tail, truncated, whole) = drain(pipe, &progress, &Pulse::default(), true, true);
+        assert_eq!(kept.len(), OUTPUT_CAP);
+        assert!(tail.len() <= OUTPUT_TAIL_CAP);
+        assert!(truncated);
+        assert!(!whole);
+        let progress = progress.lock().unwrap();
+        assert_eq!(progress.failed.as_deref(), Some("real::killer"));
+        assert_eq!(progress.failures, ["real::killer"]);
+    }
+
+    #[test]
+    fn startup_markers_split_across_overlong_fragments_remain_diagnostic_evidence() {
+        for marker in [gamma_rt::ENVIRONMENT_ERROR_MARKER, gamma_rt::PRE_INSTALL_ERROR_MARKER] {
+            let pipe = io::repeat(b'x')
+                .take((OUTPUT_CAP + 1 - marker.len() / 2) as u64)
+                .chain(io::Cursor::new(marker))
+                .chain(io::Cursor::new(b"\n"));
+            let progress = Mutex::new(Progress::new(Watch::Libtest));
+            let (_kept, _tail, _truncated, whole) = drain(pipe, &progress, &Pulse::default(), true, false);
+            assert!(!whole);
+            assert!(environment_failure(&progress));
+            assert!(progress.lock().unwrap().failed.is_none());
+        }
+    }
+
+    #[test]
+    fn truncated_output_prefixes_never_supply_a_partial_final_failure_line() {
+        for complete in [false, true] {
+            let (sink, drained) = mpsc::channel();
+            sink.send(Drained {
+                text: b"running 1 test\ntest forged::failure ... FAILED".to_vec(),
+                tail: Vec::new(),
+                tail_truncated: false,
+                complete,
+                authoritative: true,
+                stream: ReaderStream::Stdout,
+            })
+            .unwrap();
+            drop(sink);
+            let output = collected(&drained, Duration::from_secs(1));
+            assert_eq!(
+                first_failure(&String::from_utf8_lossy(&output.authoritative)),
+                complete.then_some("forged::failure")
+            );
+            assert!(String::from_utf8_lossy(&output.text).contains("forged::failure"));
+        }
     }
 
     #[test]
@@ -2489,7 +3920,6 @@ mod tests {
             stall: Stall::NONE,
             request: MemoryRequest::default(),
             only: Only::All,
-            census: None,
         }
     }
 
@@ -2710,7 +4140,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 &Arc::new(Mutex::new(Progress::new(Watch::Libtest))),
                 false,
@@ -2768,7 +4197,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest { meter: false, limit: None },
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -2803,7 +4231,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest { meter: true, limit: None },
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -2906,7 +4333,6 @@ mod tests {
             stall: Stall::NONE,
             request: MemoryRequest { meter: false, limit: None },
             only: Only::All,
-            census: None,
         }
     }
 
@@ -2935,7 +4361,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest { meter: true, limit: None },
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -2967,7 +4392,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
         );
 
@@ -3009,7 +4433,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
             );
 
@@ -3051,7 +4474,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
             );
 
@@ -3097,7 +4519,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
             );
 
@@ -3151,7 +4572,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3174,7 +4594,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest { meter: false, limit: None },
                 only: Only::All,
-                census: None,
             },
             &Arc::new(Mutex::new(Progress::new(Watch::Off))),
             false,
@@ -3205,7 +4624,6 @@ mod tests {
                 },
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -3227,7 +4645,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
         );
 
@@ -3243,7 +4660,6 @@ mod tests {
                 },
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
         );
 
@@ -3278,7 +4694,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3302,7 +4717,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3329,7 +4743,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -3360,7 +4773,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
         );
 
@@ -3391,7 +4803,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3416,7 +4827,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3442,7 +4852,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3471,7 +4880,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3505,7 +4913,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3538,7 +4945,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3598,7 +5004,6 @@ mod tests {
                     limit: Some(limit),
                 },
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -3644,7 +5049,6 @@ mod tests {
                     limit: Some(limit),
                 },
                 only: Only::All,
-                census: None,
             },
             &Arc::new(Mutex::new(Progress::new(Watch::Libtest))),
             false,
@@ -3680,7 +5084,6 @@ mod tests {
                         limit: Some(512 * 1024 * 1024)
                     },
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -3836,7 +5239,6 @@ mod tests {
                     limit: Some(limit),
                 },
                 only: Only::All,
-                census: None,
             },
             false,
         );
@@ -3866,7 +5268,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             true,
         );
@@ -3897,7 +5298,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             Some("a::b".to_owned()),
         );
@@ -3915,7 +5315,6 @@ mod tests {
             stall: Stall::NONE,
             request: MemoryRequest::default(),
             only: Only::All,
-            census: None,
         };
         for test in [None, Some("original".to_owned())] {
             let check = |actual: Attempt<'_>, expected: Only<'_>| {
@@ -3924,7 +5323,6 @@ mod tests {
                 assert_eq!(actual.timeout, attempt.timeout);
                 assert_eq!(actual.stall.budget, attempt.stall.budget);
                 assert_eq!(actual.request, attempt.request);
-                assert_eq!(actual.census, attempt.census);
             };
             assert_eq!(
                 confirm_kill_with(attempt, test.clone(), |actual| {
@@ -4021,7 +5419,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             "nextest could not list the tests".to_owned(),
         );
@@ -4052,7 +5449,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -4080,7 +5476,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 false
             ),
@@ -4107,7 +5502,6 @@ mod tests {
                     stall: Stall::NONE,
                     request: MemoryRequest::default(),
                     only: Only::All,
-                    census: None,
                 },
                 true
             ),
@@ -4357,7 +5751,10 @@ mod tests {
         let reason = launcher(&work, &crate::testing::test_binary("/t/deps/stranger-def"), Only::All, false)
             .expect_err("an unknown binary cannot be launched");
 
-        assert!(reason.contains("/t/deps/stranger-def"), "{reason}");
+        assert!(
+            matches!(reason, Verdict::Unmetered(ref reason) if reason.contains("/t/deps/stranger-def")),
+            "{reason:?}"
+        );
     }
 
     /// A run that cannot even be launched is unmetered, not a kill. Recording it as a kill would
@@ -4377,7 +5774,6 @@ mod tests {
                 stall: Stall { budget: None },
                 request: MemoryRequest { meter: false, limit: None },
                 only: Only::All,
-                census: None,
             },
             &Arc::new(Mutex::new(Progress::new(Watch::Nextest))),
             false,
@@ -4478,37 +5874,6 @@ mod tests {
         assert_eq!(args, vec!["--gamma-step=exit:0", "tests::parses", "--exact"]);
     }
 
-    /// A run narrowed by a census asks for every test the census named, in one launch.
-    ///
-    /// libtest matches a test that any one of its positional filters matches, so several names mean
-    /// "any of these" — and one `--exact` covers them all, which is why it comes last rather than
-    /// once per name.
-    #[test]
-    fn a_run_narrowed_by_a_census_asks_for_all_of_its_tests_at_once() {
-        let (_scratch, work) = crate::testing::helper_workspace("launch-censused", &["exit:0"]);
-        let binary = crate::testing::helper();
-        let names = ["tests::parses", "tests::rejects"];
-        let command = launcher(&work, &binary, Only::These(&names), false).expect("a direct launch needs nothing from a runner");
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-
-        assert_eq!(args, vec!["--gamma-step=exit:0", "tests::parses", "tests::rejects", "--exact"]);
-    }
-
-    /// An empty census selection is not a filter that matches nothing.
-    ///
-    /// It reaches here only from a caller that had no names to give, and a launch carrying just
-    /// `--exact` would run the whole binary anyway — so the shape that says "everything" is the one
-    /// with no filter at all, which is what the whole-binary path already produces.
-    #[test]
-    fn a_census_selection_with_no_names_runs_the_binary_whole() {
-        let (_scratch, work) = crate::testing::helper_workspace("launch-censused-empty", &["exit:0"]);
-        let binary = crate::testing::helper();
-        let command = launcher(&work, &binary, Only::These(&[]), false).expect("a direct launch needs nothing from a runner");
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-
-        assert_eq!(args, vec!["--gamma-step=exit:0"]);
-    }
-
     /// A test this run chose that the user's own filter excludes is refused, not run.
     ///
     /// libtest matches a test that any *one* of its positional filters matches, so appending the
@@ -4525,7 +5890,10 @@ mod tests {
 
         let refusal = launcher(&work, &binary, Only::One("tests::excluded"), false).expect_err("the selection is empty");
 
-        assert!(refusal.contains("harness filters allow"), "{refusal}");
+        assert!(
+            matches!(refusal, Verdict::Unjudged(ref reason) if reason.contains("harness filters allow")),
+            "{refusal:?}"
+        );
     }
 
     /// A test the user's filter admits is run alone, without their filter being repeated.
@@ -4545,21 +5913,6 @@ mod tests {
         let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
 
         assert_eq!(args, vec!["--skip", "slow", "tests::allowed_case", "--exact"]);
-    }
-
-    /// A census selection keeps the part the user's filter admits rather than being refused whole.
-    #[test]
-    fn a_census_selection_keeps_only_the_tests_the_users_filter_admits() {
-        let (_scratch, mut work) = crate::testing::helper_workspace("launch-intersected", &["exit:0"]);
-        let binary = crate::testing::helper();
-
-        work.set_test_args(vec!["allowed".to_owned()]);
-
-        let names = ["tests::allowed_one", "tests::excluded", "tests::allowed_two"];
-        let command = launcher(&work, &binary, Only::These(&names), false).expect("the selection is not empty");
-        let args: Vec<_> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
-
-        assert_eq!(args, vec!["tests::allowed_one", "tests::allowed_two", "--exact"]);
     }
 
     /// A wakeup raised while the waiter was busy elsewhere is not slept through.
@@ -4660,7 +6013,6 @@ mod tests {
                 stall: Stall::NONE,
                 request: MemoryRequest::default(),
                 only: Only::All,
-                census: None,
             },
             false,
         );

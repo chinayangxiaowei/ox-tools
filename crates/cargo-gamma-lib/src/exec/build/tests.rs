@@ -3,7 +3,13 @@
 
 use core::fmt::Write as _;
 use core::ops::Range;
+use std::cell::RefCell;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt as _;
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::{fs, io, thread};
 
@@ -20,6 +26,533 @@ use super::*;
 use crate::discover::TargetFile;
 use crate::schema::Position;
 use crate::testing::Recorder;
+
+type CompileStep = (&'static str, Option<&'static str>, Result<Option<std::process::Output>>);
+
+pub(super) fn scripted_output(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
+    #[cfg(unix)]
+    let status = std::process::ExitStatus::from_raw(if success { 0 } else { 256 });
+    #[cfg(windows)]
+    let status = std::process::ExitStatus::from_raw(u32::from(!success));
+    std::process::Output {
+        status,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+fn compile_script<T>(steps: Vec<CompileStep>, body: impl FnOnce() -> T) -> T {
+    let remaining = Rc::new(RefCell::new(std::collections::VecDeque::from(steps)));
+    let result = native_test_util::with_compiler(
+        {
+            let remaining = Rc::clone(&remaining);
+            move |work, arguments, budget, _events| {
+                let (verb, package, output) = remaining
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("every Cargo launch must match a scripted step");
+                assert_eq!(arguments[0], verb);
+                assert_eq!(work.root, policy_workspace().root);
+                assert!(arguments.iter().any(|argument| argument == "--message-format=json"));
+                for flag in ["--no-run", "--no-fail-fast"] {
+                    assert_eq!(
+                        arguments.iter().filter(|argument| *argument == flag).count(),
+                        usize::from(verb == "test")
+                    );
+                }
+                assert_eq!(budget, Some(Duration::from_millis(19)));
+                if let Some(package) = package {
+                    assert!(arguments.windows(2).any(|pair| pair == ["--package", package]));
+                    assert!(!arguments.iter().any(|argument| argument == "--workspace"));
+                } else {
+                    assert!(arguments.iter().any(|argument| argument == "--workspace"));
+                    assert!(!arguments.iter().any(|argument| argument == "--package"));
+                }
+                output
+            }
+        },
+        body,
+    );
+    assert!(remaining.borrow().is_empty(), "all scripted Cargo launches must occur");
+    result
+}
+
+fn policy_workspace() -> Workspace {
+    let root = Utf8PathBuf::from(if cfg!(windows) {
+        "C:/synthetic/build-policy"
+    } else {
+        "/synthetic/build-policy"
+    });
+    Workspace::adopt(root.clone(), root.join("target"))
+}
+
+fn scripted_limits() -> BuildLimits {
+    BuildLimits {
+        timeout: Some(Duration::from_millis(19)),
+        multiplier: Some(3.0),
+        rollback_rounds: 2,
+    }
+}
+
+// Supplies coherent discovery evidence to real target selection while compilation is scripted.
+// Dep-info, capture output/source/extra filename and Cargo executable identity must agree.
+
+#[test]
+fn uncompiled_source_withdrawal_never_relabels_a_settled_mutant_from_the_same_uncompiled_file() {
+    let work = policy_workspace();
+    for outcome in [
+        Outcome::Killed,
+        Outcome::Survived,
+        Outcome::CompileError,
+        Outcome::NotBuilt,
+        Outcome::NoCoverage,
+    ] {
+        let mut plan = empty_plan(&work);
+        plan.files.push(TargetFile {
+            path: "src/lib.rs".into(),
+            absolute: work.root.join("src/lib.rs"),
+            package: "trivial".to_owned(),
+            source: None,
+        });
+        plan.mutants = (1..=3)
+            .map(|ordinal| Mutant {
+                ordinal,
+                file: Utf8PathBuf::from("src/lib.rs").into(),
+                outcome: Outcome::Pending,
+                ..mutant()
+            })
+            .collect();
+        plan.mutants[0].file = Utf8PathBuf::from("src/uncompiled.rs").into();
+        plan.mutants[0].outcome = outcome;
+        plan.mutants[2].file = Utf8PathBuf::from("src/uncompiled.rs").into();
+        withdraw_uncompiled(&mut plan, &HashSet::from_iter([Utf8PathBuf::from("src/lib.rs")]));
+        assert_eq!(plan.mutants[0].outcome, outcome);
+        assert_eq!(plan.mutants[1].outcome, Outcome::Pending);
+        assert_eq!(plan.mutants[2].outcome, Outcome::NotBuilt);
+    }
+}
+
+#[test]
+fn preflight_wrapper_forwards_nondefault_limits_selection_and_both_success_and_transport_error() {
+    let work = policy_workspace();
+    let plan = empty_plan(&work);
+    for test_lib in [false, true] {
+        for success in [false, true] {
+            let verb = if test_lib { "test" } else { "check" };
+            let result = compile_script(
+                vec![(
+                    verb,
+                    Some("trivial"),
+                    if success {
+                        Ok(Some(scripted_output(true, "original discovery stream", "")))
+                    } else {
+                        Err(error!("wrapper transport refusal"))
+                    },
+                )],
+                || {
+                    Converger::preflight(
+                        &work,
+                        &plan,
+                        Some(&["trivial".into()]),
+                        &[],
+                        test_lib,
+                        scripted_limits(),
+                        &mut Recorder::default(),
+                    )
+                },
+            );
+            if success {
+                let preflight = result.unwrap();
+                assert!(!preflight.whole_workspace);
+                assert!(preflight.dropped.is_empty());
+            } else {
+                assert_eq!(result.unwrap_err().message(), "wrapper transport refusal");
+            }
+        }
+    }
+}
+
+#[test]
+fn settlement_preserves_conflict_members_but_clears_stale_notes_for_unqualified_withdrawals() {
+    let work = policy_workspace();
+    let mut plan = empty_plan(&work);
+    plan.mutants = (1..=2)
+        .map(|ordinal| Mutant {
+            id: format!("settle-{ordinal}").into(),
+            ordinal,
+            outcome: Outcome::Pending,
+            note: Some("stale previous note".into()),
+            ..mutant()
+        })
+        .collect();
+    let mut converger = Converger {
+        withdrawn: HashSet::from_iter([1, 2]),
+        abandoned: HashSet::from_iter([1]),
+        ..Converger::default()
+    };
+    let _ = converger.interactions.insert(1, vec![1, 9]);
+    converger.settle(&mut plan);
+    assert_eq!(plan.mutants[0].outcome, Outcome::NotBuilt);
+    assert_eq!(
+        plan.mutants[0].note.as_deref(),
+        Some("this mutant was excluded without blame because compiler isolation found a conflict among ordinals 1, 9")
+    );
+    assert_eq!(plan.mutants[1].outcome, Outcome::CompileError);
+    assert_eq!(plan.mutants[1].note, None);
+}
+
+#[test]
+fn foreign_compiler_census_entries_keep_empty_package_and_mutator_fallbacks() {
+    let work = policy_workspace();
+    let plan = empty_plan(&work);
+    let mut converger = Converger::default();
+    let _ = converger.census.insert(99, CompilerReason::isolated());
+    let census = converger.tally(&plan);
+    assert_eq!(census.len(), 1);
+    assert_eq!(census[0].package, "");
+    assert_eq!(census[0].mutator, "");
+    assert_eq!(census[0].mutants, 1);
+}
+
+#[test]
+fn rollback_limit_diagnostics_report_exactly_the_last_five_rounds() {
+    let work = policy_workspace();
+    let failure = Converger::rollback_limit_error(7, 7, &[1, 2, 3, 4, 5, 6, 7], &work, "");
+    assert!(failure.message().contains("after 7 of the 7 rollback rounds"), "{failure}");
+    assert!(failure.message().contains("28 blamed during this build"), "{failure}");
+    assert!(
+        failure
+            .message()
+            .contains("Mutants blamed in the last rounds of this build: 3, 4, 5, 6, 7.\n"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn cargo_adapter_uses_the_measured_round_when_scaling_later_invocation_budgets() {
+    let work = policy_workspace();
+    let plan = empty_plan(&work);
+    let outcome = native_test_util::with_compiler(
+        |_workspace, arguments, budget, _events| {
+            assert_eq!(arguments, ["check", "--tests", "--message-format=json", "--workspace"]);
+            assert_eq!(budget, Some(Duration::from_secs(40)));
+            Ok(Some(scripted_output(true, "successful check stream", "captured stderr")))
+        },
+        || {
+            invoke::run_cargo(
+                &work,
+                &plan,
+                &["check", "--tests"],
+                None,
+                BuildLimits {
+                    timeout: Some(Duration::from_mins(2)),
+                    multiplier: Some(2.0),
+                    rollback_rounds: 5,
+                },
+                Some(Duration::from_secs(20)),
+                &mut Recorder::default(),
+            )
+        },
+    )
+    .unwrap();
+    assert!(outcome.succeeded);
+    assert_eq!(outcome.stdout.as_deref(), Some("successful check stream"));
+    assert_eq!(outcome.stderr, "captured stderr");
+}
+
+#[test]
+fn preflight_timeouts_and_missing_compiler_diagnostics_keep_their_distinct_causes() {
+    for test_lib in [false, true] {
+        for timed_out in [false, true] {
+            let work = policy_workspace();
+            let plan = empty_plan(&work);
+            let verb = if test_lib { "test" } else { "check" };
+            let output = if timed_out {
+                None
+            } else {
+                Some(scripted_output(false, "", "driver stopped before diagnostics"))
+            };
+            let failure = compile_script(vec![(verb, None, Ok(output))], || {
+                Converger::check(&work, &plan, None, &[], test_lib, scripted_limits(), &mut Recorder::default())
+            })
+            .expect_err("neither an expired invocation nor a missing compiler can establish a baseline");
+            if timed_out {
+                let stage = if test_lib {
+                    "test --no-run --lib --no-fail-fast"
+                } else {
+                    "check --tests --keep-going"
+                };
+                assert!(
+                    failure
+                        .message()
+                        .starts_with(&format!("the compiler invocation `cargo {stage}` was still running after 19ms")),
+                    "{failure}"
+                );
+            } else {
+                assert!(
+                    failure
+                        .message()
+                        .starts_with("the tree could not be checked, and the compiler reported nothing"),
+                    "{failure}"
+                );
+                assert!(failure.message().ends_with("driver stopped before diagnostics"), "{failure}");
+                assert!(
+                    !failure.message().contains("this tree does not compile before any mutation"),
+                    "{failure}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_scope_transport_failures_propagate_without_changing_scope() {
+    for failing_stage in ["check", "build"] {
+        for timed_out in [false, true] {
+            let work = policy_workspace();
+            let mut plan = empty_plan(&work);
+            plan.mutants.push(Mutant {
+                package: "trivial".into(),
+                ..mutant()
+            });
+            let mut steps = Vec::new();
+            if failing_stage == "build" {
+                steps.push(("check", Some("trivial"), Ok(Some(scripted_output(true, "", "")))));
+            }
+            steps.push((
+                failing_stage,
+                Some("trivial"),
+                if timed_out {
+                    Ok(None)
+                } else {
+                    Err(error!("wide transport failure"))
+                },
+            ));
+            let failure = compile_script(steps, || {
+                Converger::default().finish(
+                    &work,
+                    &mut plan,
+                    Some(&["trivial".into()]),
+                    scripted_limits(),
+                    &mut Recorder::default(),
+                )
+            })
+            .expect_err("failure to supervise the widening build is not a compiler verdict");
+            if timed_out {
+                assert!(failure.message().contains(&format!("cargo {failing_stage}")), "{failure}");
+                assert!(failure.message().contains("19ms"), "{failure}");
+            } else {
+                assert_eq!(failure.message(), "wide transport failure");
+            }
+            assert_eq!(plan.mutants[0].outcome, Outcome::Pending);
+        }
+    }
+}
+
+#[test]
+fn empty_and_explicitly_whole_scopes_keep_workspace_flags_and_do_not_widen_twice() {
+    for (whole_workspace, pending) in [(true, true), (true, false), (false, false)] {
+        for failing_stage in [None, Some("check"), Some("build")] {
+            let work = policy_workspace();
+            let mut plan = empty_plan(&work);
+            if pending {
+                plan.mutants.push(Mutant {
+                    package: "trivial".into(),
+                    ..mutant()
+                });
+            }
+            let mut converger = Converger::default();
+            if whole_workspace {
+                converger.require_whole_workspace();
+            }
+            let build_package = (!whole_workspace).then_some("trivial");
+            let mut steps = vec![(
+                "check",
+                build_package,
+                Ok(Some(scripted_output(failing_stage != Some("check"), "checked", "check failure"))),
+            )];
+            if failing_stage != Some("check") {
+                steps.push((
+                    "build",
+                    build_package,
+                    Ok(Some(scripted_output(failing_stage != Some("build"), "built", "build failure"))),
+                ));
+            }
+            let expected_rounds = u32::try_from(steps.len()).unwrap();
+            let built = compile_script(steps, || {
+                converger.finish(
+                    &work,
+                    &mut plan,
+                    Some(&["trivial".into()]),
+                    scripted_limits(),
+                    &mut Recorder::default(),
+                )
+            })
+            .unwrap();
+            assert_eq!(built.rounds, expected_rounds);
+            assert!(!built.widened);
+            assert_eq!(built.stuck.is_some(), failing_stage.is_some());
+            if pending {
+                assert_eq!(
+                    plan.mutants[0].outcome,
+                    if failing_stage.is_some() {
+                        Outcome::NotBuilt
+                    } else {
+                        Outcome::Pending
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_finish_stops_at_the_original_failure_without_retrying_other_scopes() {
+    for (check_fails, build_fails) in [(false, false), (true, false), (false, true)] {
+        let work = policy_workspace();
+        let mut plan = empty_plan(&work);
+        plan.mutants.push(Mutant {
+            package: "trivial".into(),
+            ..mutant()
+        });
+        let success = |text| Ok(Some(scripted_output(true, text, "")));
+        let failure = |text| Ok(Some(scripted_output(false, "", text)));
+        let mut steps = vec![(
+            "check",
+            Some("trivial"),
+            if check_fails { failure("narrow-check") } else { success("checked") },
+        )];
+        if !check_fails {
+            steps.push((
+                "build",
+                Some("trivial"),
+                if build_fails { failure("narrow-build") } else { success("built") },
+            ));
+        }
+        let expected_rounds = u32::try_from(steps.len()).expect("there are at most three scripted rounds");
+        let built = compile_script(steps, || {
+            Converger::default().finish(
+                &work,
+                &mut plan,
+                Some(&["trivial".into()]),
+                scripted_limits(),
+                &mut Recorder::default(),
+            )
+        })
+        .unwrap();
+        assert_eq!(built.rounds, expected_rounds);
+        assert_eq!(built.history.len(), usize::try_from(expected_rounds).unwrap());
+        assert!(!built.widened);
+        assert!(built.binaries.is_empty());
+        if !check_fails && !build_fails {
+            assert!(built.stuck.is_none());
+            assert_eq!(built.artifacts, "built");
+            assert_eq!(plan.mutants[0].outcome, Outcome::Pending);
+        } else {
+            let stuck = built.stuck.expect("both narrow and whole scopes failed");
+            let diagnostic = stuck.reason.as_str();
+            assert!(
+                diagnostic.contains(if check_fails { "narrow-check" } else { "narrow-build" }),
+                "{diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(if check_fails { "wide-check" } else { "wide-build" }),
+                "{diagnostic}"
+            );
+            assert_eq!(stuck.ordinals, [plan.mutants[0].ordinal]);
+            assert_eq!(plan.mutants[0].outcome, Outcome::NotBuilt);
+            assert!(built.artifacts.is_empty());
+        }
+        assert_eq!(built.withdrawn, 0);
+    }
+}
+
+#[test]
+fn compiler_timeout_and_transport_errors_propagate_before_later_stages_are_started() {
+    for failing_stage in ["check", "build"] {
+        for timed_out in [false, true] {
+            let work = policy_workspace();
+            let mut plan = empty_plan(&work);
+            plan.mutants.push(Mutant {
+                package: "trivial".into(),
+                ..mutant()
+            });
+            let mut steps = Vec::new();
+            if failing_stage == "build" {
+                steps.push(("check", Some("trivial"), Ok(Some(scripted_output(true, "checked", "")))));
+            }
+            steps.push((
+                failing_stage,
+                Some("trivial"),
+                if timed_out {
+                    Ok(None)
+                } else {
+                    Err(error!("scripted transport failure"))
+                },
+            ));
+            let failure = compile_script(steps, || {
+                Converger::default().finish(
+                    &work,
+                    &mut plan,
+                    Some(&["trivial".into()]),
+                    scripted_limits(),
+                    &mut Recorder::default(),
+                )
+            })
+            .expect_err("a failed Cargo transport or budget cannot produce a completed build");
+            if timed_out {
+                assert!(failure.message().contains("19ms"), "{failure}");
+                assert!(failure.message().contains(failing_stage), "{failure}");
+            } else {
+                assert_eq!(failure.message(), "scripted transport failure");
+            }
+            assert_eq!(plan.mutants[0].outcome, Outcome::Pending);
+        }
+    }
+}
+
+#[test]
+fn preflight_checks_pin_library_mode_package_selection_and_diagnostic_priority() {
+    let work = policy_workspace();
+    let mut plan = empty_plan(&work);
+    plan.specs.insert("trivial".into(), (Utf8PathBuf::new(), "0.0.0".into()));
+    let messages = [
+        serde_json::json!({"reason":"compiler-message","manifest_path":work.root.join("unrelated/Cargo.toml"),"message":{"level":"error","rendered":"unrelated diagnostic\n"}}),
+        serde_json::json!({"reason":"compiler-message","manifest_path":work.root.join("Cargo.toml"),"message":{"level":"error","rendered":"selected diagnostic\n"}}),
+    ].map(|message| message.to_string()).join("\n");
+    for test_lib in [false, true] {
+        let verb = if test_lib { "test" } else { "check" };
+        let failure = compile_script(vec![(verb, None, Ok(Some(scripted_output(false, &messages, "fallback"))))], || {
+            Converger::check(
+                &work,
+                &plan,
+                None,
+                &["trivial".into()],
+                test_lib,
+                scripted_limits(),
+                &mut Recorder::default(),
+            )
+        })
+        .expect_err("both selected and unrelated compiler errors prevent preflight");
+        let diagnostic = failure.message();
+        let selected = diagnostic
+            .find("selected diagnostic")
+            .expect("the selected package diagnostic is retained");
+        let unrelated = diagnostic
+            .find("unrelated diagnostic")
+            .expect("the unrelated package diagnostic is retained");
+        assert!(selected < unrelated, "{diagnostic}");
+        assert!(
+            diagnostic.contains(if test_lib {
+                "`cargo test --no-run --lib` reproduces it"
+            } else {
+                "`cargo check --tests` reproduces it"
+            }),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("fallback"), "{diagnostic}");
+    }
+}
 
 /// The ordinals [`blame`] attributed, without the error codes it attributed them under.
 ///
@@ -191,6 +724,7 @@ fn mixed_test_invocations_preserve_the_exact_failed_verb() {
             proof_verb: vec!["check".to_owned(), "--tests".to_owned()],
             files: HashSet::from_iter([Utf8PathBuf::from("src/lib.rs")]),
             codes: HashSet::from_iter(["E0308".to_owned()]),
+            locations: HashMap::default(),
         }]
     );
     assert_eq!(
@@ -419,8 +953,8 @@ fn inconclusive_failure_modes_remain_unresolved() {
         clippy::unnecessary_wraps,
         reason = "the oracle matches subset_fails's Option<bool> verdict, where None is an indeterminate build"
     )]
-    fn pristine_fails(_active: &HashSet<u32>) -> Option<bool> {
-        Some(true)
+    fn populated_passes(_active: &HashSet<u32>) -> Option<bool> {
+        Some(false)
     }
 
     fn populated_is_indeterminate(active: &HashSet<u32>) -> Option<bool> {
@@ -448,7 +982,10 @@ fn inconclusive_failure_modes_remain_unresolved() {
     })
     .to_string();
 
-    for oracle in [pristine_fails as fn(&HashSet<u32>) -> Option<bool>, populated_is_indeterminate] {
+    for (index, oracle) in [populated_passes as fn(&HashSet<u32>) -> Option<bool>, populated_is_indeterminate]
+        .into_iter()
+        .enumerate()
+    {
         let mut converger = Converger {
             subset_oracle: Some(oracle),
             ..Converger::default()
@@ -465,6 +1002,14 @@ fn inconclusive_failure_modes_remain_unresolved() {
             )
             .expect("the scripted proof builds ran");
 
+        if index == 0 {
+            assert!(
+                isolated.is_empty(),
+                "a passing populated schema is not an unresolved mutation interaction"
+            );
+            assert_eq!(converger.isolation_budget.proof_count(), 1);
+            continue;
+        }
         assert_eq!(isolated.len(), 1, "one exact failed invocation produces one unresolved context");
         assert!(matches!(
             isolated.as_slice(),
@@ -472,7 +1017,7 @@ fn inconclusive_failure_modes_remain_unresolved() {
         ));
         assert_eq!(
             converger.isolation_budget.proof_count(),
-            2,
+            1,
             "the exact failed invocation must be proved once rather than once per possible mode"
         );
     }
@@ -498,8 +1043,8 @@ fn isolation_with_no_candidates_has_no_result() {
 }
 
 #[test]
-fn an_over_limit_complete_context_remains_unresolved_without_proof_builds() {
-    let (_dir, work) = trivial_workspace("build-over-limit-isolation-");
+fn passing_bounded_partitions_leave_the_complete_context_unresolved() {
+    let work = policy_workspace();
     let mut plan = empty_plan(&work);
     plan.reach.insert("trivial".to_owned(), HashSet::from_iter(["trivial".to_owned()]));
     plan.mutants = (1..=isolation::MAX_ISOLATION_CANDIDATES + 1)
@@ -521,7 +1066,10 @@ fn an_over_limit_complete_context_remains_unresolved_without_proof_builds() {
         },
     })
     .to_string();
-    let mut converger = Converger::default();
+    let mut converger = Converger {
+        subset_oracle: Some(|_| Some(false)),
+        ..Converger::default()
+    };
 
     let isolated = converger
         .isolate_scoped(
@@ -533,14 +1081,14 @@ fn an_over_limit_complete_context_remains_unresolved_without_proof_builds() {
             BuildLimits::default(),
             &mut Recorder::default(),
         )
-        .expect("an over-limit context is reported without proof builds");
+        .expect("bounded partitions use the in-process proof oracle");
 
     assert!(matches!(
         isolated.as_slice(),
         [Isolation::Unresolved { ordinals, .. }]
             if ordinals.len() == isolation::MAX_ISOLATION_CANDIDATES + 1
     ));
-    assert_eq!(converger.isolation_budget.proof_count(), 0);
+    assert_eq!(converger.isolation_budget.proof_count(), 2);
 }
 
 #[test]
@@ -553,7 +1101,7 @@ fn one_failed_round_isolates_independent_targets_together() {
         Some(active.contains(&1) || active.contains(&2))
     }
 
-    let (_dir, work) = trivial_workspace("build-independent-targets-");
+    let work = policy_workspace();
     let mut plan = empty_plan(&work);
     plan.reach.insert("first".to_owned(), HashSet::from_iter(["first".to_owned()]));
     plan.reach.insert("second".to_owned(), HashSet::from_iter(["second".to_owned()]));
@@ -633,7 +1181,7 @@ fn proof_tiers_hold_unrelated_pending_mutants_inactive_and_find_cross_tier_inter
         Some(active == &HashSet::from_iter([1, 2]))
     }
 
-    let (_dir, work) = trivial_workspace("build-cross-tier-interaction-");
+    let work = policy_workspace();
     let mut plan = empty_plan(&work);
     plan.reach
         .insert("app".to_owned(), HashSet::from_iter(["app".to_owned(), "dependency".to_owned()]));
@@ -703,7 +1251,7 @@ fn interaction_minimization_reuses_halves_already_proved_clean() {
 
     let observations = OBSERVED.get_or_init(|| Mutex::new(Vec::new()));
     observations.lock().expect("oracle observations").clear();
-    let (_dir, work) = trivial_workspace("build-proof-cache-");
+    let work = policy_workspace();
     let mut plan = empty_plan(&work);
     plan.mutants = [1, 2]
         .map(|ordinal| Mutant {
@@ -974,7 +1522,7 @@ fn stuck_reason(convergence: Convergence) -> String {
 }
 
 /// A workspace holding one trivial crate, so a real cargo invocation is cheap.
-fn trivial_workspace(prefix: &str) -> (tempfile::TempDir, Workspace) {
+pub(super) fn trivial_workspace(prefix: &str) -> (tempfile::TempDir, Workspace) {
     let dir = crate::testing::workdir(prefix);
     let root = Utf8PathBuf::from_path_buf(dir.path().join("src")).expect("utf8");
 
@@ -1002,24 +1550,27 @@ fn convergence_still_checks_a_library_without_a_test_harness() -> Result<()> {
         work.root.join("Cargo.toml").as_std_path(),
         "[package]\nname = \"trivial\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ntest = false\n\n[workspace]\n",
     )?;
+    fs::create_dir(work.root.join("tests"))?;
+    fs::write(
+        work.root.join("tests/library_dependency.rs"),
+        "#[test] fn sees_library() { assert_eq!(trivial::A, 1); }\n",
+    )?;
     let mut plan = empty_plan(&work);
     let _previous = plan.specs.insert("trivial".to_owned(), (Utf8PathBuf::new(), "0.0.0".to_owned()));
-    let mut converger = Converger::default();
-    converger.library_packages(std::iter::once("trivial".to_owned()).collect());
-
-    let checked = converger.converge_check(
+    let build = Converger::default().finish(
         &work,
-        &plan,
+        &mut plan,
         None,
         BuildLimits::default(),
-        false,
         &mut crate::testing::Recorder::default(),
     )?;
 
     assert!(
-        matches!(checked, Convergence::Built(stdout) if stdout.contains("\"reason\":\"compiler-artifact\"")),
+        build.stuck.is_none() && build.artifacts.contains("\"reason\":\"compiler-artifact\""),
         "the library source was skipped by the target selectors"
     );
+    assert_eq!(build.binaries.len(), 1);
+    assert_eq!(build.binaries[0].target, "library_dependency");
     Ok(())
 }
 
@@ -1097,9 +1648,9 @@ fn a_build_that_never_reached_the_compiler_says_so_rather_than_blaming_the_tree(
     );
 }
 
-/// A narrowed build that fails is retried across the whole workspace before giving up.
+/// Invalid fixed roots are not replaced by an unvalidated workspace context.
 #[test]
-fn a_narrowed_build_that_fails_is_retried_across_the_whole_workspace() {
+fn a_fixed_build_that_fails_does_not_widen_to_the_whole_workspace() {
     let (_dir, work) = trivial_workspace("build-widen-");
     let mut plan = empty_plan(&work);
     let select = vec!["no-such-package".to_owned()];
@@ -1114,43 +1665,10 @@ fn a_narrowed_build_that_fails_is_retried_across_the_whole_workspace() {
             BuildLimits::default(),
             &mut crate::testing::Recorder::default(),
         )
-        .expect("widening to the whole workspace must succeed");
+        .expect("the failed fixed-scope invocation produces a build result");
 
-    assert!(build.widened, "the build should have reported that it widened");
-}
-
-#[test]
-fn widened_check_and_build_restore_every_narrow_verdict_before_succeeding() {
-    for verb in [&["check", "--keep-going", "--lib"][..], &["build", "--keep-going", "--tests"][..]] {
-        let (_dir, work) = trivial_workspace("build-widen-state-");
-        let plan = empty_plan(&work);
-        let mut converger = Converger::default();
-        let before = converger.verdict_state();
-
-        let _ = converger.withdrawn.insert(7);
-        let _ = converger.abandoned.insert(8);
-        let _ = converger.interactions.insert(8, vec![8, 9]);
-        let _ = converger.unresolved.insert(10, "narrow target".to_owned());
-        let _ = converger.unavailable.insert(11);
-        let _ = converger.census.insert(7, CompilerReason::isolated());
-        let _ = converger.probed.insert(7);
-        converger.ordering.offered = 1;
-        converger.restore_verdict_state(before);
-
-        let widened = converger
-            .converge(&work, &plan, None, verb, BuildLimits::default(), &mut Recorder::default())
-            .expect("the widened graph compiles");
-
-        assert!(matches!(widened, Convergence::Built(_)));
-        assert!(converger.withdrawn.is_empty());
-        assert!(converger.abandoned.is_empty());
-        assert!(converger.interactions.is_empty());
-        assert!(converger.unresolved.is_empty());
-        assert!(converger.unavailable.is_empty());
-        assert!(converger.census.is_empty());
-        assert!(converger.probed.is_empty());
-        assert_eq!(converger.ordering, OrderingHints::default());
-    }
+    assert!(!build.widened);
+    assert!(build.stuck.is_some());
 }
 
 /// Targets that cargo-gamma will not run do not belong to its compilation oracle.
@@ -1231,7 +1749,7 @@ fn a_library_only_oracle_never_compiles_integration_targets() {
     let selected = ["trivial".to_owned()];
     let mut converger = Converger::default();
     converger.select_test_lib(true);
-    let preflight = Converger::preflight(
+    Converger::preflight(
         &work,
         &plan,
         Some(&selected),
@@ -1241,7 +1759,6 @@ fn a_library_only_oracle_never_compiles_integration_targets() {
         &mut Recorder::default(),
     )
     .expect("the library harness compiles without the broken integration target");
-    converger.target_discovery(preflight.discovery);
     assert!(
         converger
             .stage(&work, &mut plan, &selected, BuildLimits::default(), &mut Recorder::default(),)
@@ -1582,22 +2099,15 @@ fn isolation_withdrawals_use_the_same_rollback_round_budget() {
     );
 }
 
-/// A stage that cannot be converged gives up on its own mutants instead of ending the run, and
-/// records them as never built rather than as unviable.
-///
-/// The two are not the same claim. `unviable` says the compiler looked at this mutant and
-/// refused it; `notbuilt` says nobody ever asked. A run that could not converge has made the
-/// second claim about every mutant in the failing build, and dressing that up as the first
-/// would put a verdict on mutants the tool never judged.
+/// Exhausting rollback rounds retains an established singleton proof rather than abandoning it.
 #[test]
-fn a_stage_that_cannot_be_converged_abandons_its_mutants_as_never_built() {
+fn rollback_exhaustion_preserves_an_already_proven_singleton() {
     let (_dir, work) = trivial_workspace("build-stage-abandons-");
     let mut plan = unguardable_plan(&work, 1);
 
     plan.mutants[0].package = ("trivial".to_owned()).into();
 
-    // One round only, so the guard the first round blames exhausts the budget rather than being
-    // withdrawn and retried. That is the rollback-limit half of giving up.
+    // Isolation withdraws the proven singleton, but the budget prevents a confirming rebuild.
     let limits = BuildLimits {
         timeout: None,
         multiplier: None,
@@ -1616,13 +2126,9 @@ fn a_stage_that_cannot_be_converged_abandons_its_mutants_as_never_built() {
         .expect("the stage ran, however badly")
         .expect("a budget of one round cannot survive a failing round");
 
-    assert_eq!(abandoned.ordinals, vec![1]);
+    assert!(abandoned.ordinals.is_empty(), "the individually proved mutant is already withdrawn");
 
-    // The advice that would otherwise reach the user as the run's dying words has to reach them as a
-    // diagnostic instead: whether the counts were falling or flat is the only thing that
-    // decides whether raising `--rollback-rounds` would have helped. With a budget of one
-    // round the series is this one round, so it has to be there rather than being omitted for
-    // never having been withdrawn.
+    // The exhaustion diagnostic still includes the proof count from the sole completed round.
     assert!(abandoned.reason.contains("rollback rounds"), "{}", abandoned.reason);
     assert!(
         abandoned.reason.contains("Mutants blamed in the last rounds of this build: 1"),
@@ -1630,14 +2136,13 @@ fn a_stage_that_cannot_be_converged_abandons_its_mutants_as_never_built() {
         abandoned.reason
     );
 
-    assert_eq!(plan.mutants[0].outcome, Outcome::NotBuilt);
-    assert!(plan.mutants[0].note.is_some(), "the mutant should say why it never ran");
-
-    // And the count the run reports as unviable does not swallow them: nothing here was
-    // blamed on a mutant.
     converger.settle(&mut plan);
 
-    assert_eq!(plan.mutants[0].outcome, Outcome::NotBuilt, "settling must not overwrite it");
+    assert_eq!(
+        plan.mutants[0].outcome,
+        Outcome::CompileError,
+        "settling retains the singleton proof"
+    );
 }
 
 /// The run carries on after a stage it could not converge, because giving up on that stage's
@@ -1848,8 +2353,8 @@ fn unguardable_plan(work: &Workspace, ordinal: u32) -> Plan {
 }
 
 #[test]
-fn speculative_convergence_defers_census_progress_until_committed() {
-    for (publish_progress, expected) in [(false, Vec::new()), (true, vec![1])] {
+fn isolation_publishes_confirmed_census_progress_immediately() {
+    for publish_progress in [false, true] {
         let (_dir, work) = trivial_workspace("build-progress-publication-");
         let plan = unguardable_plan(&work, 1);
         let mut converger = Converger::default();
@@ -1872,7 +2377,7 @@ fn speculative_convergence_defers_census_progress_until_committed() {
 
         assert!(matches!(result, Convergence::Built(_)));
         assert_eq!(converger.census.len(), 1);
-        assert_eq!(events.convergence, expected);
+        assert_eq!(events.convergence, [1]);
     }
 }
 
@@ -2627,15 +3132,14 @@ fn mutant() -> Mutant {
 /// used again — and rustc reports that at the use, at the move and at the reinitialization,
 /// none of which is where the guard sits.
 #[test]
-fn a_move_error_is_blamed_on_the_deletion_that_changed_which_paths_exist() {
+fn a_move_error_requires_proof_rather_than_blaming_a_nearby_deletion() {
     let mut guards = Guards::default();
 
     // The deleted `continue`, at line 396: inside the region the diagnostic talks about, but
     // named by none of its spans.
     let _ = guards.insert(7, (Utf8PathBuf::from("src/codegen.rs"), guard(at(396, 9)..at(396, 17), None)));
 
-    // A substitution in the same region. It cannot have changed reachability, so it is not the
-    // one to withdraw while a deletion is available.
+    // Neither this substitution nor the deletion has an individual proof.
     let _ = guards.insert(
         8,
         (
@@ -2655,7 +3159,10 @@ fn a_move_error_is_blamed_on_the_deletion_that_changed_which_paths_exist() {
 
     let blamed = ordinals_blamed(&stdout, Utf8Path::new(""), &guards);
 
-    assert_eq!(blamed, HashSet::from_iter([7]), "the deletion is the only reachability change");
+    assert!(
+        blamed.is_empty(),
+        "reachability hints are candidates for isolation, not proof of individual invalidity"
+    );
 }
 
 /// A run can report how many mutants would not compile; without the code it cannot say whether
@@ -2795,7 +3302,7 @@ fn a_diagnostic_without_a_code_still_retains_its_category() {
 }
 
 #[test]
-fn a_secondary_span_intersecting_generated_text_blames_that_mutant() {
+fn only_a_secondary_span_wholly_inside_generated_text_blames_that_mutant() {
     let mut guards = Guards::default();
     let _ = guards.insert(
         7,
@@ -2805,9 +3312,17 @@ fn a_secondary_span_intersecting_generated_text_blames_that_mutant() {
         ),
     );
 
-    let stdout = compiler_message(&[span("src/lib.rs", 12, 5, 12, 20, true), span("src/lib.rs", 10, 5, 10, 40, false)]);
-
-    assert_eq!(ordinals_blamed(&stdout, Utf8Path::new(""), &guards), HashSet::from_iter([7]));
+    for (start, end, expected) in [(20, 25, true), (21, 24, true), (5, 40, false), (19, 24, false), (21, 26, false)] {
+        let stdout = compiler_message(&[
+            span("src/lib.rs", 12, 5, 12, 20, true),
+            span("src/lib.rs", 10, start, 10, end, false),
+        ]);
+        assert_eq!(
+            ordinals_blamed(&stdout, Utf8Path::new(""), &guards),
+            if expected { HashSet::from_iter([7]) } else { HashSet::default() },
+            "secondary columns {start}..{end}"
+        );
+    }
 }
 
 #[test]
@@ -2986,7 +3501,7 @@ fn a_region_with_no_deletion_requires_isolation() {
 }
 
 #[test]
-fn flow_sensitive_regions_match_guards_by_path_suffix() {
+fn a_flow_sensitive_path_suffix_still_requires_isolation() {
     let mut guards = Guards::default();
     let _ = guards.insert(
         3,
@@ -2998,14 +3513,11 @@ fn flow_sensitive_regions_match_guards_by_path_suffix() {
         &[span("/other/crates/pkg/src/codegen.rs", 383, 9, 383, 13, false)],
     );
 
-    assert_eq!(
-        ordinals_blamed(&stdout, Utf8Path::new("/scratch/tree"), &guards),
-        HashSet::from_iter([3])
-    );
+    assert!(ordinals_blamed(&stdout, Utf8Path::new("/scratch/tree"), &guards).is_empty());
 }
 
 #[test]
-fn blame_and_region_collection_ignore_messages_without_usable_spans() {
+fn blame_ignores_messages_without_usable_spans() {
     let mut guards = Guards::default();
     let _ = guards.insert(1, (Utf8PathBuf::from("src/lib.rs"), guard(at(1, 1)..at(2, 1), None)));
 
@@ -3029,37 +3541,14 @@ fn blame_and_region_collection_ignore_messages_without_usable_spans() {
         },
     })
     .to_string();
-    let message = super::messages::cargo_message(&malformed).expect("the message is valid JSON");
-    let diagnostic = message.message.expect("the message has a diagnostic");
-    assert!(super::blame::regions(&diagnostic).is_empty());
+    assert!(ordinals_blamed(&malformed, Utf8Path::new(""), &guards).is_empty());
 }
 
 #[test]
-fn diagnostic_regions_widen_inclusively_across_children_and_clamp_hostile_numbers() {
-    let line = serde_json::json!({
-        "reason": "compiler-message",
-        "message": {
-            "level": "error",
-            "spans": [
-                {"file_name": "src/lib.rs", "line_start": 20, "line_end": 25},
-                {"file_name": "src/other.rs", "line_start": 7, "line_end": 7}
-            ],
-            "children": [{
-                "spans": [
-                    {"file_name": "src/lib.rs", "line_start": 10, "line_end": 30},
-                    {"file_name": "src/max.rs", "line_start": u64::MAX, "line_end": u64::MAX}
-                ]
-            }]
-        }
-    })
-    .to_string();
-    let message = super::messages::cargo_message(&line).expect("valid cargo message");
-    let diagnostic = message.message.expect("the message has a diagnostic");
-    let regions = super::blame::regions(&diagnostic);
-
-    assert_eq!(regions["src/lib.rs"], 10..=30);
-    assert_eq!(regions["src/other.rs"], 7..=7);
-    assert_eq!(regions["src/max.rs"], u32::MAX..=u32::MAX);
+fn diagnostic_position_numbers_clamp_at_the_host_independent_limit() {
+    assert_eq!(super::blame::clamped(0), 0);
+    assert_eq!(super::blame::clamped(1), 1);
+    assert_eq!(super::blame::clamped(u64::from(u32::MAX)), u32::MAX);
     assert_eq!(super::blame::clamped(u64::MAX), u32::MAX);
 }
 
@@ -3072,10 +3561,9 @@ fn source_range_boundaries_are_half_open() {
     assert!(!super::blame::covers(&outer, &(at(1, 1)..at(1, 6))));
 }
 
-/// The positional tiers are still the better answer when they have one, since they name a
-/// single mutant rather than a region's worth of them.
+/// A generated replacement can be where another guard's ownership consequence becomes visible.
 #[test]
-fn a_diagnostic_that_lands_on_a_guard_is_still_blamed_on_that_guard_alone() {
+fn a_move_diagnostic_that_lands_on_replacement_text_still_requires_proof() {
     let mut guards = Guards::default();
 
     let _ = guards.insert(
@@ -3094,7 +3582,7 @@ fn a_diagnostic_that_lands_on_a_guard_is_still_blamed_on_that_guard_alone() {
         &[span("src/codegen.rs", 383, 9, 383, 13, false)],
     );
 
-    assert_eq!(ordinals_blamed(&stdout, Utf8Path::new(""), &guards), HashSet::from_iter([5]));
+    assert!(ordinals_blamed(&stdout, Utf8Path::new(""), &guards).is_empty());
 }
 
 #[test]
@@ -4167,7 +4655,7 @@ fn baseline_reaches_the_function() {
 /// into a function body compiles perfectly well. That gives a fixture with two populations whose
 /// fate the compiler decides for real, which is what a test of build *ordering* needs: nothing here
 /// may be settled by the hint itself.
-fn probe_plan(work: &Workspace, unviable: usize, viable: usize) -> Plan {
+pub(super) fn probe_plan(work: &Workspace, unviable: usize, viable: usize) -> Plan {
     let mut text = String::new();
 
     for index in 0..unviable {
@@ -4225,240 +4713,6 @@ fn probe_plan(work: &Workspace, unviable: usize, viable: usize) -> Plan {
     }
 
     plan
-}
-
-/// The ids of the mutants at the given indices, which is the form a hint takes.
-fn hinted(plan: &Plan, indices: impl IntoIterator<Item = usize>) -> HashSet<crate::model::MutantId> {
-    indices.into_iter().map(|index| plan.mutants[index].id.clone()).collect()
-}
-
-/// The mutants' outcomes after a build, keyed by ordinal, which is the population a hint may not move.
-fn population(plan: &Plan) -> Vec<(u32, Outcome)> {
-    let mut outcomes: Vec<(u32, Outcome)> = plan.mutants.iter().map(|mutant| (mutant.ordinal, mutant.outcome)).collect();
-
-    outcomes.sort_unstable_by_key(|(ordinal, _outcome)| *ordinal);
-    outcomes
-}
-
-/// A stale hint may reorder the build and nothing else.
-///
-/// This is the whole safety claim of the tier. The record whose unviability produced these hints is
-/// rejected for context — it is never consulted as a filter — so the only way it may be allowed to
-/// act is on what the compiler is shown first. Two runs over the same tree, one guided and one not,
-/// therefore have to reach the same verdict for every mutant; if the guided one differs anywhere,
-/// the hint has moved the population and the tier is unsafe at any speed.
-#[test]
-fn a_context_mismatch_changes_the_order_and_never_the_population() {
-    let (_blind_dir, blind_work) = guarded_workspace("build-probe-blind-");
-    let mut blind_plan = probe_plan(&blind_work, 5, 2);
-
-    let blind = Converger::default()
-        .finish(
-            &blind_work,
-            &mut blind_plan,
-            None,
-            BuildLimits::default(),
-            &mut crate::testing::Recorder::default(),
-        )
-        .expect("the unguided build converges");
-
-    let (_guided_dir, guided_work) = guarded_workspace("build-probe-guided-");
-    let mut guided_plan = probe_plan(&guided_work, 5, 2);
-
-    let guided = Converger::guided(hinted(&guided_plan, 0..5))
-        .finish(
-            &guided_work,
-            &mut guided_plan,
-            None,
-            BuildLimits::default(),
-            &mut crate::testing::Recorder::default(),
-        )
-        .expect("the guided build converges");
-
-    assert_eq!(
-        population(&blind_plan),
-        population(&guided_plan),
-        "a hint that changes any verdict is filtering, not ordering"
-    );
-
-    assert_eq!(blind.withdrawn, guided.withdrawn, "the same mutants must be withdrawn either way");
-    assert_eq!(blind.ordering.rounds, 0, "an unguided build takes no probe round");
-    assert_eq!(guided.ordering.offered, 5, "every hinted mutant was front-loaded");
-    assert_eq!(guided.ordering.confirmed, 5, "the compiler agreed with every hint");
-    assert_eq!(guided.ordering.rounds, 1, "one probe round, taken once");
-}
-
-/// A hint that is wrong costs its round and leaves the mutant exactly where it was.
-///
-/// The dangerous failure is the silent one: a mutant named by a stale record that would compile
-/// perfectly well today, quietly withheld and never judged, leaves the denominator and flatters the
-/// score. Here every hint is wrong by construction — the hinted mutants are the ones in function
-/// bodies, which compile — so nothing may be withdrawn, and the run must settle them normally.
-#[test]
-fn a_hint_the_compiler_disagrees_with_leaves_its_mutant_live_and_judged() {
-    let (_dir, work) = guarded_workspace("build-probe-wrong-");
-    let mut plan = probe_plan(&work, 0, 5);
-
-    let build = Converger::guided(hinted(&plan, 0..5))
-        .finish(
-            &work,
-            &mut plan,
-            None,
-            BuildLimits::default(),
-            &mut crate::testing::Recorder::default(),
-        )
-        .expect("the build converges");
-
-    assert_eq!(build.ordering.offered, 5, "the hints were taken at face value and probed");
-    assert_eq!(build.ordering.confirmed, 0, "no hint was confirmed, because none was right");
-    assert_eq!(build.withdrawn, 0, "a wrong hint must never withdraw a mutant");
-
-    for mutant in &plan.mutants {
-        assert_eq!(
-            mutant.outcome,
-            Outcome::Pending,
-            "a hinted mutant that compiles has to be left for the sweep to judge: {mutant:?}"
-        );
-    }
-}
-
-/// A hint the compiler agrees with is confirmed by the compiler, not by the hint.
-#[test]
-fn a_hint_the_compiler_agrees_with_is_settled_by_the_compiler() {
-    let (_dir, work) = guarded_workspace("build-probe-right-");
-    let mut plan = probe_plan(&work, 5, 1);
-    let mut events = crate::testing::Recorder::default();
-
-    let build = Converger::guided(hinted(&plan, 0..5))
-        .finish(&work, &mut plan, None, BuildLimits::default(), &mut events)
-        .expect("the build converges");
-
-    assert_eq!(build.ordering.confirmed, 5, "every hinted mutant was refused by the compiler");
-    assert_eq!(
-        events.convergence,
-        [5],
-        "compiler-confirmed hints must update the visible unviability count"
-    );
-
-    for mutant in plan.mutants.iter().take(5) {
-        assert_eq!(mutant.outcome, Outcome::CompileError, "{mutant:?}");
-    }
-
-    assert_eq!(
-        plan.mutants[5].outcome,
-        Outcome::Pending,
-        "the unhinted mutant compiles and is judged"
-    );
-}
-
-/// Too few hints do not buy a round, so no round is spent on them.
-#[test]
-fn a_handful_of_hints_is_not_worth_a_probe_round() {
-    let (_dir, work) = guarded_workspace("build-probe-floor-");
-    let mut plan = probe_plan(&work, 3, 1);
-
-    let build = Converger::guided(hinted(&plan, 0..3))
-        .finish(
-            &work,
-            &mut plan,
-            None,
-            BuildLimits::default(),
-            &mut crate::testing::Recorder::default(),
-        )
-        .expect("the build converges");
-
-    assert_eq!(build.ordering.rounds, 0, "a probe below the floor costs a build and buys nothing");
-    assert_eq!(build.ordering.offered, 0, "nothing was front-loaded");
-    assert_eq!(build.withdrawn, 3, "the ordinary rounds still find every unviable mutant");
-}
-
-/// The probe is taken once per mutant for the whole run, however many builds ask for it.
-#[test]
-fn no_mutant_is_probed_twice_however_many_builds_run() {
-    let (_dir, work) = guarded_workspace("build-probe-once-");
-    let mut plan = probe_plan(&work, 5, 1);
-    let mut converger = Converger::guided(hinted(&plan, 0..5));
-
-    let staged = converger
-        .converge(
-            &work,
-            &plan,
-            None,
-            &["build", "--keep-going"],
-            BuildLimits::default(),
-            &mut crate::testing::Recorder::default(),
-        )
-        .expect("the staged build runs");
-
-    assert!(
-        matches!(staged, Convergence::Built(_)),
-        "the tree converges once the consts are out"
-    );
-
-    let build = converger
-        .finish(
-            &work,
-            &mut plan,
-            None,
-            BuildLimits::default(),
-            &mut crate::testing::Recorder::default(),
-        )
-        .expect("the deciding build converges");
-
-    assert_eq!(
-        build.ordering.rounds, 1,
-        "the second build must not re-probe what the first already did"
-    );
-    assert_eq!(build.ordering.offered, 5, "each hinted mutant is offered exactly once");
-}
-
-/// The probe set is derived from the plan, so the same tree and the same hints probe the same thing.
-///
-/// Iterating the hint set directly would make the order — and so the reported counts and any future
-/// tie-break — depend on hash iteration order, which differs between processes.
-#[test]
-fn the_probe_set_is_ordered_by_the_plan_rather_than_by_the_hint_set() {
-    let (_dir, work) = guarded_workspace("build-probe-order-");
-    let plan = probe_plan(&work, 5, 2);
-
-    let forwards = Converger::guided(hinted(&plan, 0..5));
-    let backwards = Converger::guided(hinted(&plan, (0..5).rev()));
-
-    let (first, deferred) = forwards.probe_sets(&plan, None);
-    let (second, also_deferred) = backwards.probe_sets(&plan, None);
-
-    assert_eq!(first, vec![1, 2, 3, 4, 5], "the candidates follow the plan's ordinals");
-    assert_eq!(first, second, "the hint set's own order may not reach the build");
-    assert_eq!(deferred, also_deferred);
-
-    let held: Vec<u32> = {
-        let mut ordinals: Vec<u32> = deferred.into_iter().collect();
-        ordinals.sort_unstable();
-        ordinals
-    };
-
-    assert_eq!(held, vec![6, 7], "only the unhinted mutants are held back from the probe round");
-}
-
-/// A probe round defers every mutant outside its attribution scope.
-///
-/// A workspace-scoped stage compiles packages outside that scope, so leaving their mutants spliced
-/// would mean the hinted candidates were not actually offered alone.
-#[test]
-fn a_probe_defers_mutants_outside_the_attribution_scope() {
-    let (_dir, work) = guarded_workspace("build-probe-selection-");
-    let mut plan = probe_plan(&work, 5, 2);
-
-    for mutant in plan.mutants.iter_mut().skip(5) {
-        mutant.package = "elsewhere".to_owned().into();
-    }
-
-    let converger = Converger::guided(hinted(&plan, 0..5));
-    let select = vec![plan.mutants[0].package.to_string()];
-    let (candidates, deferred) = converger.probe_sets(&plan, Some(&select));
-
-    assert_eq!(candidates, vec![1, 2, 3, 4, 5]);
-    assert_eq!(deferred, HashSet::from_iter([6, 7]));
 }
 
 #[test]

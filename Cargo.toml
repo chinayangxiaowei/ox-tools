@@ -42,22 +42,29 @@ cargo-gamma-unsafe = { path = "crates/cargo-gamma-unsafe", default-features = fa
 # external dependencies
 cargo-platform = { version = "0.3.3", default-features = false }
 cargo_metadata = { version = "0.23.1", default-features = false }
-cel = { version = "0.14.4", default-features = false }
+cel = { version = "0.15.0", default-features = false }
 chrono = { version = "0.4.45", default-features = false }
 clap = { version = "4.6.6", default-features = false }
 clap_complete = { version = "4.6.9", default-features = false }
 command-group = { version = "5.0.1", default-features = false }
 compact_str = { version = "0.10.0", default-features = false }
+# blake3 accepts yanked 0.4.3; the registry mirror still selects it.
+constant_time_eq = { version = "=0.4.2", default-features = false }
 csv = { version = "1.4.0", default-features = false }
 duct = { version = "1.1.1", default-features = false }
 env_logger = { version = "0.11.11", default-features = false }
+fakeable = { version = "0.2.2", default-features = false }
+fetch = { version = "0.19.0", default-features = false }
 flate2 = { version = "1.1.10", default-features = false }
+future_assert = { version = "0.1.0", default-features = false }
 futures = { version = "0.3.34", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 glob = { version = "0.3.3", default-features = false }
+http-body-util = { version = "0.1.5", default-features = false }
 ignore = { version = "0.4.33", default-features = false }
 indicatif = { version = "0.18.6", default-features = false }
 insta = { version = "1.48.0", default-features = false }
+jsonc-parser = { version = "0.34", default-features = false }
 layered = { version = "0.3.6", default-features = false }
 lcov = { version = "0.8.2", default-features = false }
 libc = { version = "0.2.189", default-features = false }
@@ -76,13 +83,12 @@ proc-macro2 = { version = "1.0.107", default-features = false }
 quote = { version = "1.0.42", default-features = false }
 # 0.0.349 includes a parser fixture that crashes CodeQL 2.26.4; retry the bump with a newer CodeQL release.
 ra_ap_syntax = { version = "0.0.331", default-features = false }
-rallocator = { version = "0.1.0", default-features = false }
+rallocator = { version = "0.3.0", default-features = false }
 reflink-copy = { version = "0.1.30", default-features = false }
 regex = { version = "1.13.1", default-features = false }
 regex-syntax = { version = "0.8.11", default-features = false }
-reqwest = { version = "0.13.4", default-features = false }
 rmp-serde = { version = "1.3.1", default-features = false }
-rust_xlsxwriter = { version = "0.99.0", default-features = false }
+rust_xlsxwriter = { version = "0.101.0", default-features = false }
 rustc-hash = { version = "2.1.3", default-features = false }
 rustc_lexer = { version = "0.1.0", default-features = false }
 rustdoc-types-v50 = { package = "rustdoc-types", version = "0.50.0", default-features = false }
@@ -95,7 +101,7 @@ rustdoc-types-v56 = { package = "rustdoc-types", version = "0.56.0", default-fea
 rustdoc-types-v57 = { package = "rustdoc-types", version = "0.57.4", default-features = false }
 rustsec = { version = "0.33.0", default-features = false }
 saphyr-parser = { version = "0.0.12", default-features = false }
-seatbelt = { version = "0.9.0", default-features = false }
+seatbelt = { version = "0.11.0", default-features = false }
 semver = { version = "1.0.28", default-features = false }
 serde = { version = "1.0.229", default-features = false }
 serde_json = { version = "1.0.151", default-features = false }
@@ -107,8 +113,8 @@ syn = { version = "3.0.4", default-features = false }
 tar = { version = "0.4.46", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
 terminal_size = { version = "0.4.4", default-features = false }
-tick = { version = "0.7.0", default-features = false }
-tokio = { version = "1.53.1", default-features = false }
+tick = { version = "0.8.0", default-features = false }
+tokio = { version = "1.53.3", default-features = false }
 toml = { version = "1.1.4", default-features = false }
 toml_edit = { version = "0.25.13", default-features = false, features = ["parse", "display"] }
 toml_parser = { version = "1.1.3", default-features = false }
@@ -130,6 +136,7 @@ walkdir = { version = "2.5.0", default-features = false }
 windows = { version = "0.62.2", default-features = false }
 windows-sys = { version = "0.61.2", default-features = false }
 wiremock = { version = "0.6.5", default-features = false }
+xmlparser = { version = "0.13.6", default-features = false }
 yaml_serde = { version = "0.10.7", default-features = false }
 zstd = { version = "0.14.0", default-features = false }
 

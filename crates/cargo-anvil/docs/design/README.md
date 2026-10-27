@@ -95,6 +95,9 @@ missed, and onboarding new Rust repos requires copying-and-praying.
   catalog pins.
 - Managing exact tool versions on the user's behalf — we enforce minimums only. See
   [local.md §3](./local.md#3-tool-versions-and-installation).
+- Supporting Cargo older than 1.93, the minimum supported version for every toolchain an
+  adopter selects, including a declared MSRV. Recipes rely on its behaviour, such as
+  source-qualified package IDs in `cargo metadata`, and keep no workarounds for older Cargo.
 - Hosting a service. The tool is a CLI binary; updates ship via crates.io.
 - Acting as a runtime: the tool emits `just` recipes and cloud-workflow building blocks, then exits.
   It is **not** invoked at build/test/cloud workflows time. `just` is the runtime. (A narrow exception
@@ -237,11 +240,22 @@ The tool produces a small set of files. They fall into three categories:
   since the last render** — claiming a file with no upstream churn produces zero
   noise.
 - **managed-region** — a user-composed file with one or more tool-managed sections
-  bracketed by sentinel comments. The sentinel pair (`# >>> anvil-managed: <id>` …
-  `# <<< anvil-managed: <id>`) delimits the region body and identifies it by stable ID;
-  the manifest tracks the last-rendered checksum per `(host, id)`. Outside the
-  sentinels, the user's content is preserved byte-for-byte — except that first
-  adoption into a TOML host may relocate compatible hand-written settings, see
+  bracketed by complete-line sentinel comments. Hash hosts use
+  `# >>> anvil-managed: <id>` … `# <<< anvil-managed: <id>`, `//` hosts use the
+  equivalent line comments, and XML/MSBuild hosts use
+  `<!-- >>> anvil-managed: <id> -->` … `<!-- <<< anvil-managed: <id> -->`.
+  XML region IDs may not contain `--`, CR, LF, or characters XML 1.0 forbids.
+  In an existing XML host, a new region is inserted before the complete-line
+  closing tag of the document's actual root element. A missing, malformed,
+  self-closing, or compact-root host is refused rather than scaffolded or
+  guessed. Root-end insertion is an
+  intentional first-step trade-off: it is simple and sufficient for the
+  current adopter use cases, while the artifact model can grow a more explicit
+  placement specification when catalogs need regions at other XML locations.
+  The pair delimits the region body and identifies it by stable ID; the manifest
+  tracks the last-rendered checksum per `(host, id)`. Outside the sentinels, the
+  user's content is preserved byte-for-byte — except that first adoption into a
+  TOML host may relocate compatible hand-written settings, see
   [updates.md](./updates.md#adopting-a-hand-written-table).
 - **user-authored** — files the user owns; the tool only reads them.
   `rust-toolchain.toml` and `.cargo/config.toml` fall in this category.
@@ -437,7 +451,7 @@ pipeline.
 |-------------------------------------------------------------|----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `pr-fast`, `scheduled-advisories`                             | All legs above                         | Contain compile-sensitive checks (clippy, doc-build, udeps, semver-check, external-types) that only see the host's compiled crate graph -- cfg-gated code is invisible to a single-leg run. Text/metadata checks running redundantly is cheaper than splitting jobs. |
 | `pr-test`, `pr-msrv`, `pr-runtime-analysis`, `scheduled-test`          | All legs above                         | Where compile-time and runtime OS / arch bugs actually surface. `pr-msrv` runs the affected test suite under the minimum supported compiler. The slow PR groups run as parallel cloud-workflow jobs for shorter wall-clock per leg. |
-| `pr-mutants`                                                    | GH: Linux x86_64 + Windows x86_64 + Linux aarch64 (windows-arm self-skips). ADO: Linux x86_64 + Windows x86_64 | Diff-scoped mutation testing. cargo-mutants doesn't build on `aarch64-pc-windows-msvc`; the recipe self-skips so the windows-arm leg is a no-op. |
+| `pr-mutants`                                                    | GH: Windows x86_64 executes; the other three legs are compatibility no-ops. ADO: Linux x86_64 + Windows x86_64 | Diff-scoped mutation testing. GitHub preserves all four stable ruleset contexts while running the campaign on one reliable Windows runner; `scheduled-exhaustive` retains Linux + Windows mutation coverage. |
 | `scheduled-exhaustive`                                       | Linux x86_64 + Windows x86_64 | Full `cargo-mutants` / `cargo-hack` / `bench`. cargo-mutants doesn't build on `aarch64-pc-windows-msvc`; rather than splitting the matrix to add an ARM-Linux leg for cargo-hack and bench, the whole group is x86-only. Adopters with ARM-specific concerns extend the matrix in their root workflow. |
 
 macOS is not in the default matrix — adopters who need it fork the owned reusable

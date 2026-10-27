@@ -896,6 +896,17 @@ mod tests {
     }
 
     #[test]
+    fn a_backtick_quoted_method_key_with_parentheses_resolves_without_a_plain_key() {
+        let resolved = links(&["`call_method()`"]);
+
+        assert_eq!(
+            count_broken_links::<u32>("See [`call_method()`] and [`missing_method()`].", &resolved),
+            1
+        );
+        assert_eq!(count_broken_links::<u32>("See [`call_method`].", &resolved), 1);
+    }
+
+    #[test]
     fn inline_links_are_skipped() {
         let broken = count_broken_links::<u32>("See [`docs`](https://example.com) here.", &links(&[]));
         assert_eq!(broken, 0);
@@ -961,6 +972,13 @@ mod tests {
         let docs = "See [`Error::chain()`].\n\n[`Error::chain`]: Self::chain\n";
         let broken = count_broken_links::<u32>(docs, &links(&["Self::chain"]));
         assert_eq!(broken, 0);
+    }
+
+    #[test]
+    fn campaign_regression_reference_definition_with_parentheses_resolves_only_that_method_spelling() {
+        let docs = "See [`Alias::call()`] and [`Alias::call`].\n\n[`Alias::call()`]: Self::actual\n";
+        assert_eq!(count_broken_links::<u32>(docs, &links(&["Self::actual"])), 1);
+        assert_eq!(count_broken_links::<u32>(docs, &links(&[])), 3);
     }
 
     #[test]

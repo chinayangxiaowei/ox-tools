@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::num::NonZeroUsize;
 use std::panic::{self, UnwindSafe};
+use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -20,8 +21,8 @@ use ohno::{AppError, IntoAppError};
 use tempfile::NamedTempFile;
 
 use crate::cli::EachArgs;
-use crate::error::{InvalidTargetKindError, JobsConflictWithOnceError, JsonInputConflictError};
-use crate::filter::Predicate;
+use crate::error::{EachError, InvalidTargetKindError, JobsConflictWithOnceError, JsonInputConflictError};
+use crate::filter::{PackagePredicate, TargetPredicate};
 use crate::json_lines;
 use crate::plan::{BuildOptions, Invocation, Mode, PackagesExpansion, Plan};
 use crate::select::Selection;
@@ -48,14 +49,32 @@ pub(crate) fn run(args: &EachArgs) -> Result<ExitCode, AppError> {
     if !args.json_lines.is_empty() || !args.json_lines_files.is_empty() {
         return run_json(args);
     }
+    run_workspace_with(args, build_selection, Workspace::load, execute)
+}
 
+#[cfg(test)]
+fn run_cargo_with(
+    args: &EachArgs,
+    load_workspace: impl FnOnce(Option<&Path>) -> Result<Workspace, EachError>,
+    execute_plan: impl FnOnce(&Plan, bool, NonZeroUsize, Option<Duration>) -> Result<ExitCode, AppError>,
+) -> Result<ExitCode, AppError> {
+    run_workspace_with(args, build_selection, load_workspace, execute_plan)
+}
+
+/// Share workspace orchestration between production and tests, with controlled input, discovery, and execution.
+fn run_workspace_with(
+    args: &EachArgs,
+    load_selection: impl FnOnce(&EachArgs) -> Result<Selection, EachError>,
+    load_workspace: impl FnOnce(Option<&Path>) -> Result<Workspace, EachError>,
+    execute_plan: impl FnOnce(&Plan, bool, NonZeroUsize, Option<Duration>) -> Result<ExitCode, AppError>,
+) -> Result<ExitCode, AppError> {
     let command_uses_workspace_rust_version = uses_workspace_rust_version(&args.command);
 
-    let selection = build_selection(args).into_app_err(SELECTION_READ_CONTEXT)?;
-    let workspace = Workspace::load(args.manifest_path.as_deref()).into_app_err("failed to load workspace")?;
+    let selection = load_selection(args).into_app_err(SELECTION_READ_CONTEXT)?;
+    let workspace = load_workspace(args.manifest_path.as_deref()).into_app_err("failed to load workspace")?;
 
     let mut members = selection.resolve(&workspace).into_app_err("failed to resolve package selection")?;
-    apply_filters(&mut members, args)?;
+    apply_package_filters(&mut members, args)?;
 
     // The `{packages}` pass-through only applies when the resolved set is the
     // untouched whole workspace: no per-package narrowing and no filters.
@@ -66,7 +85,7 @@ pub(crate) fn run(args: &EachArgs) -> Result<ExitCode, AppError> {
     };
 
     let target_kinds = parse_target_kinds(&args.each_targets)?;
-    let target_required_features = args.target_required_feature.iter().cloned().collect();
+    let target_filters = parse_target_predicates(&args.target_filters)?;
     let mode = if args.once {
         Mode::Once
     } else if target_kinds.is_empty() {
@@ -83,7 +102,8 @@ pub(crate) fn run(args: &EachArgs) -> Result<ExitCode, AppError> {
         chdir: args.chdir,
         packages,
         target_kinds: &target_kinds,
-        target_required_features: &target_required_features,
+        target_filters: &target_filters,
+        require_target_per_package: args.require_target_per_package,
         workspace_rust_version: None,
     };
     if Plan::is_empty(&members, &args.command, build_options).into_app_err(PLAN_BUILD_CONTEXT)? {
@@ -111,7 +131,7 @@ pub(crate) fn run(args: &EachArgs) -> Result<ExitCode, AppError> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    execute(&plan, args.keep_going, args.jobs, args.timeout)
+    execute_plan(&plan, args.keep_going, args.jobs, args.timeout)
 }
 
 fn run_json(args: &EachArgs) -> Result<ExitCode, AppError> {
@@ -149,7 +169,8 @@ fn validate_json_mode(args: &EachArgs) -> Result<(), AppError> {
         (!args.filters.is_empty(), "--filter"),
         (args.once, "--once"),
         (!args.each_targets.is_empty(), "--each-target"),
-        (!args.target_required_feature.is_empty(), "--target-required-feature"),
+        (!args.target_filters.is_empty(), "--target-filter"),
+        (args.require_target_per_package, "--require-target-per-package"),
         (args.chdir, "--chdir"),
         (args.manifest_path.is_some(), "--manifest-path"),
     ];
@@ -166,16 +187,23 @@ fn build_selection(args: &EachArgs) -> Result<Selection, crate::error::EachError
 
 /// Narrow `members` by package filter expressions. Repeated expressions are
 /// AND-combined; exclusion is expressed with the Boolean `not` operator.
-fn apply_filters(members: &mut Vec<&Member>, args: &EachArgs) -> Result<(), AppError> {
-    let filters = parse_predicates(&args.filters)?;
+fn apply_package_filters(members: &mut Vec<&Member>, args: &EachArgs) -> Result<(), AppError> {
+    let filters = parse_package_predicates(&args.filters)?;
     members.retain(|member| filters.iter().all(|filter| filter.matches(member)));
     Ok(())
 }
 
-fn parse_predicates(specs: &[String]) -> Result<Vec<Predicate>, AppError> {
+fn parse_package_predicates(specs: &[String]) -> Result<Vec<PackagePredicate>, AppError> {
     specs
         .iter()
-        .map(|s| Predicate::parse(s).into_app_err("invalid filter expression"))
+        .map(|s| PackagePredicate::parse(s).into_app_err("invalid filter expression"))
+        .collect()
+}
+
+fn parse_target_predicates(specs: &[String]) -> Result<Vec<TargetPredicate>, AppError> {
+    specs
+        .iter()
+        .map(|spec| TargetPredicate::parse(spec).into_app_err("invalid target filter expression"))
         .collect()
 }
 
@@ -478,24 +506,44 @@ fn run_streamed_group_with(
     timeout: Option<Duration>,
     spawn: impl FnOnce(Command) -> Result<GroupChild, String>,
 ) -> InvocationResult {
+    run_streamed_group_control_with(
+        invocation,
+        timeout,
+        spawn,
+        |process| process.inner().try_wait(),
+        terminate_group,
+        || {
+            let started = Instant::now();
+            move || started.elapsed()
+        },
+        thread::sleep,
+    )
+}
+
+fn run_streamed_group_control_with<T, E>(
+    invocation: &Invocation,
+    timeout: Option<Duration>,
+    spawn: impl FnOnce(Command) -> Result<T, String>,
+    observe: impl FnMut(&mut T) -> io::Result<Option<ExitStatus>>,
+    terminate: impl FnOnce(T) -> io::Result<()>,
+    start_elapsed: impl FnOnce() -> E,
+    sleep: impl FnMut(Duration),
+) -> InvocationResult
+where
+    E: FnMut() -> Duration,
+{
     let (program, command) = match command_for(invocation) {
         Ok(command) => command,
         Err(message) => return InvocationResult::Infrastructure(message),
     };
-    let tree = match spawn(command) {
-        Ok(tree) => tree,
+    let process = match spawn(command) {
+        Ok(process) => process,
         Err(error) => {
             return InvocationResult::Infrastructure(format!("failed to spawn `{program}`: {error}"));
         }
     };
-    wait_for_process(
-        tree,
-        timeout,
-        |process| process.inner().try_wait(),
-        terminate_group,
-        CHILD_LEADER_OBSERVATION,
-    )
-    .result
+    let elapsed = start_elapsed();
+    wait_for_process_with(process, timeout, observe, terminate, CHILD_LEADER_OBSERVATION, elapsed, sleep).result
 }
 
 fn run_captured(invocation: &Invocation, timeout: Option<Duration>) -> BufferedOutcome {
@@ -974,10 +1022,13 @@ fn exit_byte(raw: Option<i32>) -> u8 {
 }
 
 #[cfg(test)]
+mod package_identity_tests;
+
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, HashSet, VecDeque};
     use std::io::{Read as _, Seek as _};
     use std::num::NonZeroUsize;
     #[cfg(unix)]
@@ -991,7 +1042,9 @@ mod tests {
     use std::time::{Duration, Instant};
     use std::{env, fs, io, thread};
 
+    use cargo_metadata::TargetKind;
     use clap::Parser as _;
+    use serde_json::Value;
     use tempfile::NamedTempFile;
 
     use super::{
@@ -1001,12 +1054,39 @@ mod tests {
         WORKER_PANIC_TEST_PROGRAM, WORKER_READY_POLL_INTERVAL, WORKER_SPAWN_ERROR_TEST_PROGRAM, WORKSPACE_RUST_VERSION_CONTEXT,
         add_infrastructure_failure, combine_captured_output, create_output_capture_with, display_duration, display_invocation,
         effective_worker_count, emit_buffered_to, emit_label_to, execute_parallel, execute_parallel_with, exit_byte,
-        failure_stops_launching, finish_capture, panic_description, parallel_failure_exit_code, parse_predicates, parse_target_kinds,
-        record_emitted_failure, run, run_captured, run_captured_with, run_streamed, run_streamed_with_timeout,
-        run_streamed_with_timeout_with, shell_join, spawn_group, spawn_worker, spawn_worker_with, terminate_child, terminate_group,
-        validate_json_mode, wait_for_process, wait_for_process_with, wait_for_worker, wait_for_worker_with, with_cleanup_failure,
+        failure_stops_launching, finish_capture, panic_description, parallel_failure_exit_code, parse_package_predicates,
+        parse_target_kinds, parse_target_predicates, record_emitted_failure, run, run_captured, run_captured_with, run_cargo_with,
+        run_streamed, run_streamed_group_control_with, run_streamed_with_timeout, run_streamed_with_timeout_with, shell_join, spawn_group,
+        spawn_worker, spawn_worker_with, terminate_child, terminate_group, validate_json_mode, wait_for_process, wait_for_process_with,
+        wait_for_worker, wait_for_worker_with, with_cleanup_failure,
     };
     use crate::cli::CargoCli;
+    use crate::workspace::{Member, MemberTarget, Workspace};
+
+    fn target_requirement_workspace() -> Workspace {
+        let member = |name: &str, features: &[&str], targets: Vec<MemberTarget>| Member {
+            name: name.to_owned(),
+            version: "0.1.0".to_owned(),
+            rust_version: Some("1.70.0".parse().expect("valid Rust version")),
+            manifest_path: PathBuf::from(format!("/ws/{name}/Cargo.toml")),
+            publishable: true,
+            doctest: true,
+            features: features.iter().map(|feature| (*feature).to_owned()).collect(),
+            targets,
+            dependencies: BTreeSet::new(),
+            metadata: Value::Null,
+        };
+        let alpha_target = MemberTarget {
+            name: "loom-test".to_owned(),
+            kinds: std::iter::once(TargetKind::Test).collect(),
+            required_features: std::iter::once("loom".to_owned()).collect(),
+        };
+        Workspace {
+            members: vec![member("alpha", &["loom"], vec![alpha_target]), member("beta", &[], Vec::new())],
+            default_member_names: HashSet::new(),
+            root_manifest_path: PathBuf::from("/ws/Cargo.toml"),
+        }
+    }
 
     #[test]
     fn json_mode_names_each_conflicting_option_and_preserves_precedence() {
@@ -1019,7 +1099,8 @@ mod tests {
             "--filter",
             "--once",
             "--each-target",
-            "--target-required-feature",
+            "--target-filter",
+            "--require-target-per-package",
             "--chdir",
             "--manifest-path",
         ];
@@ -1035,11 +1116,13 @@ mod tests {
                 "--filter" => args.filters.push("publishable".to_owned()),
                 "--once" => args.once = true,
                 "--each-target" => args.each_targets.push("bin".to_owned()),
-                "--target-required-feature" => args.target_required_feature.push("feature".to_owned()),
+                "--target-filter" => args.target_filters.push("required-feature:feature".to_owned()),
+                "--require-target-per-package" => args.require_target_per_package = true,
                 "--chdir" => args.chdir = true,
                 "--manifest-path" => args.manifest_path = Some("Cargo.toml".into()),
                 _ => unreachable!("options lists only the JSON-mode conflicts"),
             }
+
             let error = validate_json_mode(&args).expect_err("Cargo options conflict with JSON mode");
             assert!(error.to_string().contains(&format!("with `{option}`")), "{error}");
             args.packages.push("highest-priority".to_owned());
@@ -1047,6 +1130,102 @@ mod tests {
             let error = validate_json_mode(&args).expect_err("conflict priority is deterministic");
             assert!(error.to_string().contains("with `--package`"), "{error}");
         }
+    }
+
+    #[test]
+    fn target_requirement_preflight_prevents_execution() {
+        let CargoCli::Each(args) = CargoCli::try_parse_from([
+            "cargo",
+            "each",
+            "-p",
+            "alpha",
+            "-p",
+            "beta",
+            "--each-target",
+            "test",
+            "--target-filter",
+            "required-feature:loom",
+            "--require-target-per-package",
+            "--",
+            "echo",
+            "{name}",
+        ])
+        .expect("target requirement arguments are valid");
+        let executed = Cell::new(false);
+        let error = run_cargo_with(
+            &args,
+            |manifest| {
+                assert_eq!(manifest, None);
+                Ok(target_requirement_workspace())
+            },
+            |_plan, _keep_going, _jobs, _timeout| {
+                executed.set(true);
+                Ok(ExitCode::SUCCESS)
+            },
+        )
+        .expect_err("beta has no matching target");
+        assert!(!executed.get(), "plan-wide preflight must finish before execution");
+        let rendered = error.to_string();
+        let normalized = rendered
+            .rsplit_once(" (at ")
+            .map(|(message, _location)| message)
+            .expect("AppError context always includes its captured source location");
+        assert_eq!(
+            normalized,
+            "`--require-target-per-package` found selected packages without a matching target: beta@0.1.0\n> failed to build command plan"
+        );
+    }
+
+    #[test]
+    fn package_filter_narrows_target_requirement_before_execution() {
+        let CargoCli::Each(args) = CargoCli::try_parse_from([
+            "cargo",
+            "each",
+            "--workspace",
+            "--filter",
+            "feature:loom",
+            "--each-target",
+            "test",
+            "--target-filter",
+            "required-feature:loom",
+            "--require-target-per-package",
+            "--",
+            "echo",
+            "{name}::{target}",
+        ])
+        .expect("filtered target requirement arguments are valid");
+        let executed = Cell::new(false);
+        let result = run_cargo_with(
+            &args,
+            |_manifest| Ok(target_requirement_workspace()),
+            |plan, _keep_going, _jobs, _timeout| {
+                executed.set(true);
+                assert_eq!(plan.invocations.len(), 1);
+                assert_eq!(plan.invocations[0].argv, ["echo", "alpha::loom-test"]);
+                Ok(ExitCode::SUCCESS)
+            },
+        )
+        .expect("package filtering removes beta from requirement scope");
+        assert_eq!(result, ExitCode::SUCCESS);
+        assert!(executed.get(), "the validated plan is passed to the injected executor");
+    }
+
+    #[test]
+    fn parses_target_predicates_with_filter_error_context() {
+        assert_eq!(
+            parse_target_predicates(&["name:unit-*".to_owned()]).expect("target filter").len(),
+            1
+        );
+        let error = parse_target_predicates(&["unknown".to_owned()]).expect_err("unknown target atom");
+        let rendered = error.to_string();
+        let normalized = rendered
+            .rsplit_once(" (at ")
+            .map(|(message, _location)| message)
+            .expect("AppError context always includes its captured source location");
+        assert_eq!(
+            normalized,
+            "invalid filter expression `unknown`: expected one of: name:<glob>, required-feature:<name>, name-in-metadata:<dotted.key>\n> invalid target filter expression"
+        );
     }
 
     #[test]
@@ -1693,11 +1872,36 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "spawns process groups")]
-    fn real_group_execution_observes_completion_and_timeout() {
-        let success = run_streamed_with_timeout(&invocation(&["rustc", "--version"]), Duration::from_secs(5));
-        assert!(matches!(success, InvocationResult::Exited(status) if status.success()));
+    fn streamed_group_runner_observes_success_before_its_deadline_in_process() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let spawned = Cell::new(false);
+        let process = FakeProcess {
+            observations: VecDeque::from([Ok(None), Ok(Some(successful_status()))]),
+            termination: None,
+        };
 
+        let result = run_streamed_group_control_with(
+            &invocation(&["controlled-program"]),
+            Some(Duration::from_millis(25)),
+            |_| {
+                spawned.set(true);
+                Ok(process)
+            },
+            FakeProcess::observe,
+            FakeProcess::terminate,
+            || {
+                assert!(spawned.get(), "the timeout clock starts after spawning");
+                || elapsed.get()
+            },
+            |pause| elapsed.set(elapsed.get() + pause),
+        );
+
+        assert!(matches!(result, InvocationResult::Exited(status) if status.success()));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns process groups")]
+    fn real_group_termination_stops_group_and_direct_child() {
         let group = spawn_group(sleeping_test_command()).expect("spawn sleeping process group");
         let started = Instant::now();
         terminate_group(group).expect("process-group termination succeeds");
@@ -2339,7 +2543,7 @@ mod tests {
 
     #[test]
     fn predicate_parse_error_has_run_context_and_exact_cause() {
-        let error = parse_predicates(&["feature:".to_owned()]).expect_err("invalid predicate");
+        let error = parse_package_predicates(&["feature:".to_owned()]).expect_err("invalid predicate");
         let rendered = error.to_string();
         assert!(rendered.starts_with("invalid filter expression"), "{rendered}");
         assert!(
