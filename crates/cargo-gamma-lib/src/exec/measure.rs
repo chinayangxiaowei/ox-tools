@@ -1801,6 +1801,7 @@ mod tests {
         let base = campaign_base(&survey.root, &survey.target, config.cache_dir.as_deref());
         super::super::testing_state::RecordPreparation {
             report_info: None,
+            name_filtered: false,
             inputs: crate::discover::RunRecord::snapshot_with_external(
                 &survey.root,
                 &base,
