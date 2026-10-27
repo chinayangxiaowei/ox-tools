@@ -151,11 +151,11 @@ pub struct MergeArgs {
 /// Arguments for `suppress`.
 #[derive(Debug, Args)]
 pub struct SuppressArgs {
-    /// Path to the workspace or package whose completed campaign should be used.
+    /// Path to the workspace or package whose latest campaign should be used.
     #[arg(short = 'd', long, value_name = "PATH", default_value = ".", help_heading = "Suppressing")]
     pub dir: Utf8PathBuf,
 
-    /// Read the completed campaign from this cache directory instead of cargo-gamma's default.
+    /// Read completed or interrupted testing evidence from this cache directory.
     #[arg(long, value_name = "PATH", help_heading = "Cache")]
     pub cache_dir: Option<Utf8PathBuf>,
 
@@ -218,7 +218,7 @@ pub struct UnsuppressArgs {
 /// Arguments for `hints`.
 #[derive(Debug, Args, Default)]
 pub struct HintsArgs {
-    /// Path to the workspace or package whose latest completed campaign should be promoted.
+    /// Path to the workspace or package whose latest campaign knowledge should be promoted.
     #[arg(short = 'd', long, value_name = "PATH", default_value = ".")]
     pub dir: Utf8PathBuf,
 
@@ -234,7 +234,7 @@ pub struct HintsArgs {
     #[arg(long, help_heading = "Run control")]
     pub dry_run: bool,
 
-    /// Replace the complete hints artifact instead of merging the completed campaign into it.
+    /// Replace the complete hints artifact instead of merging the recorded campaign into it.
     ///
     /// Ordinary promotion preserves knowledge outside the recorded campaign population. Use this
     /// only after a deliberately complete run when retained knowledge from every other scope
@@ -266,6 +266,23 @@ pub struct SelectArgs {
     /// Skip files matching these glob patterns.
     #[arg(long = "exclude-file", value_name = "GLOB")]
     pub exclude_files: Vec<String>,
+
+    /// Only select mutants whose listed name matches this regular expression. Repeat to match any.
+    ///
+    /// REGEX uses Rust regex syntax. A bare word matches any substring, e.g. `--re accepts`.
+    ///
+    /// To select the top-level `accepts` function in one file:
+    ///
+    /// `--re '^app/src/main\.rs:[0-9]+:[0-9]+: accepts:'`
+    ///
+    /// Here `^` anchors the start, `\.` is a literal dot, and `[0-9]+` matches a number. The
+    /// input is each line of `list mutants`, such as
+    /// `app/src/main.rs:1:34: accepts: replace ... [relational.ge_to_gt]`.
+    /// A suppressed line includes its `[suppressed: channel]` marker in the matched text.
+    /// Control characters are encoded as visible escapes in both the list and matched name;
+    /// use `\\` in REGEX to match a displayed backslash.
+    #[arg(long = "re", value_name = "REGEX")]
+    pub name_patterns: Vec<String>,
 
     /// Unqualified Rust identifiers forming the final written trait-path segment, excluded through
     /// `gamma.toml`.
@@ -550,15 +567,6 @@ pub struct MeasureArgs {
     #[arg(long, conflicts_with = "test_packages")]
     pub test_workspace: bool,
 
-    /// Measure which individual tests reach each mutation site before testing mutants.
-    ///
-    /// This experimental optimization may reduce sweep work by selecting only tests observed
-    /// reaching a site. It can add substantial listing and sampling work of its own, so it is
-    /// disabled unless explicitly requested. Incomplete observations remain checked hints and
-    /// always fall back to the whole binary when they do not kill.
-    #[arg(long, conflicts_with = "whole_test_binaries")]
-    pub optimize_test_execution: bool,
-
     /// Run every selected test in each reachable test binary.
     ///
     /// This explicitly suppresses case-level reachability selection and runs each reachable binary
@@ -609,6 +617,13 @@ pub struct MeasureArgs {
     reason = "each is an independent command-line flag, and grouping them would only obscure that"
 )]
 pub struct RunArgs {
+    /// Continue the interrupted campaign's testing phase using its existing prepared tree.
+    ///
+    /// Completed verdicts are retained. Discovery, copying, mutation, building and baseline
+    /// measurement are not repeated. Mutation and testing settings are frozen by the campaign.
+    #[arg(long, conflicts_with_all = ["dry_run", "only_survivors", "mutants"], help_heading = "Run control")]
+    pub resume_testing: bool,
+
     /// Which mutants to consider.
     #[command(flatten)]
     pub select: SelectArgs,
@@ -899,6 +914,7 @@ impl Default for SelectArgs {
             mutators: None,
             files: Vec::new(),
             exclude_files: Vec::new(),
+            name_patterns: Vec::new(),
             exclude_trait_impls: Vec::new(),
             shard_count: None,
             shard_index: None,
@@ -1013,6 +1029,11 @@ impl FeatureArgs {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn survivor_default_selection_names_the_current_directory_instead_of_an_empty_or_invented_path() {
+        assert_eq!(SelectArgs::default().dir, camino::Utf8Path::new("."));
+    }
 
     #[test]
     fn shard_index_must_be_in_range() {
@@ -1228,6 +1249,25 @@ mod tests {
 
         assert_eq!(args.select.shard_count, Some(4));
         assert!(args.select.shard().unwrap_err().is_usage());
+    }
+
+    #[test]
+    fn name_patterns_parse_for_run_and_list_mutants() {
+        let run = Cli::try_parse_from(["cargo-gamma", "run", "--re", "add", "--re", "src/lib.rs"])
+            .expect("repeated name patterns parse for a run");
+        let Command::Run(run) = run.command else {
+            panic!("expected run");
+        };
+        assert_eq!(run.select.name_patterns, ["add", "src/lib.rs"]);
+
+        let list = Cli::try_parse_from(["cargo-gamma", "list", "mutants", "--re", "add"]).expect("name patterns parse for mutant listing");
+        let Command::List(list) = list.command else {
+            panic!("expected list");
+        };
+        let ListCommand::Mutants(list) = list.command else {
+            panic!("expected mutant listing");
+        };
+        assert_eq!(list.select.name_patterns, ["add"]);
     }
 
     #[test]

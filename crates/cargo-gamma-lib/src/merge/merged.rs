@@ -24,7 +24,7 @@ pub(crate) const MAX_SHARDS: u32 = 65_536;
 /// What a merge concluded.
 #[derive(Debug, Default)]
 pub struct Merged {
-    /// The merged report, ready to render.
+    /// The merged report, ready to render when every filtered verdict has a compatible presentation.
     pub report: Option<Report>,
 
     /// Mutants with a verdict inside the freshness window.
@@ -74,12 +74,15 @@ pub struct Merged {
 
     /// Files whose withdrawals could not be checked because no input supplied a complete population.
     ///
-    /// Sharded and previously merged reports can both describe incomplete populations, so their
+    /// Sharded, filtered, legacy, and previously merged reports can describe incomplete populations, so their
     /// silence about an id says nothing about whether that code still exists.
     pub unchecked: usize,
 
     /// Verdicts omitted because their mutation presentation does not fit the selected source.
     pub incompatible: usize,
+
+    /// Filtered verdicts without a compatible presentation, which would be lost by staging.
+    pub unpresentable_filtered: usize,
 }
 
 impl Merged {
@@ -113,7 +116,7 @@ impl Merged {
     /// population structurally rather than by relying on the printed score being unflattering.
     #[must_use]
     pub fn scored(&self) -> Option<f64> {
-        (self.valid > 0).then(|| self.score())
+        (self.valid > 0 && self.unpresentable_filtered == 0).then(|| self.score())
     }
 
     /// How much of the rotation the inputs covered, as a percentage.
@@ -155,6 +158,25 @@ mod tests {
     use super::*;
     use crate::fixtures;
     use crate::fixtures::{mutant_result_at as mutant, report_with as report};
+
+    #[test]
+    fn survivor_rotation_zero_one_and_missing_first_shard_have_distinct_coverage() {
+        for (count, seen, expected, missing) in [
+            (None, Vec::new(), 100.0, Vec::new()),
+            (Some(0), Vec::new(), 100.0, Vec::new()),
+            (Some(1), Vec::new(), 0.0, vec![0]),
+            (Some(1), vec![0], 100.0, Vec::new()),
+            (Some(4), vec![1, 3], 50.0, vec![0, 2]),
+        ] {
+            let merged = Merged {
+                shard_count: count,
+                shards_seen: seen.into_iter().collect(),
+                ..Merged::default()
+            };
+            assert!((merged.coverage() - expected).abs() < f64::EPSILON);
+            assert_eq!(merged.missing_shards(), missing);
+        }
+    }
 
     #[test]
     fn rotation_coverage_reports_the_shards_that_were_missed() {

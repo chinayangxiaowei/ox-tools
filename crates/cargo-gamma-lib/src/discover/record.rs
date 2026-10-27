@@ -18,6 +18,7 @@ use super::killers::Killers;
 use super::workspace_snapshot::WorkspaceSnapshot;
 use super::{Plan, input};
 use crate::cfg::Build;
+use crate::error::error;
 use crate::model::{MUTANT_ID_VERSION, Mutant, MutantId, Outcome, normalize_site_text};
 use crate::{HashMap, HashSet};
 
@@ -36,6 +37,9 @@ use crate::{HashMap, HashSet};
 /// question they do not depend on. What moves this number is a change of *meaning* in what is
 /// already there, which no reader could detect for itself.
 const VERSION: u32 = 12;
+
+/// Increment when compiler attribution or isolation changes which exclusions can be trusted.
+const COMPILER_EVIDENCE_POLICY_EPOCH: u32 = 3;
 
 /// The file name under the gamma scratch base.
 const FILE: &str = "last-gamma-run.json";
@@ -280,7 +284,7 @@ pub struct ContextDigest {
     /// The compiler's version string.
     toolchain: String,
 
-    /// This tool's own version.
+    /// This tool's version, mutant identity version, and compiler-evidence policy epoch.
     tool: String,
 
     /// The test filtering and execution arguments.
@@ -297,6 +301,36 @@ pub struct ContextDigest {
 }
 
 impl ContextDigest {
+    // #[gamma::skip(all, reason = "the process-global environment adapter delegates to injected environment-only digest tests")]
+    pub(crate) fn from_inherited_environment() -> Self {
+        Self::from_environment(&inherited_environment())
+    }
+
+    fn from_environment(environment: &[(Vec<u8>, Vec<u8>)]) -> Self {
+        Self {
+            environment: Some(environment_digest(environment)),
+            ..Self::default()
+        }
+    }
+
+    // #[gamma::skip(all, reason = "the process-global inherited environment is checked through injected digest validation; tests must not mutate it")]
+    pub(crate) fn validate_inherited_environment(&self) -> crate::Result<()> {
+        self.validate_environment(&environment_digest(&inherited_environment()))
+    }
+
+    fn validate_environment(&self, current: &str) -> crate::Result<()> {
+        match self.environment.as_deref() {
+            Some(saved) if saved == current => Ok(()),
+            Some(_) => Err(error!(
+                "cannot resume testing: the inherited environment differs from the saved campaign; \
+                 restore the original environment or start a new campaign"
+            )),
+            None => Err(error!(
+                "cannot resume testing: the saved campaign did not record its inherited environment; start a new campaign"
+            )),
+        }
+    }
+
     /// The digest of one term, which is the empty string for a term this digest does not state.
     #[must_use]
     pub fn term(&self, term: Term) -> &str {
@@ -484,7 +518,7 @@ pub struct GeneralizedHints {
     /// Interned test sets used by `reach`.
     pub test_sets: Vec<Vec<Killer>>,
 
-    /// Stable mutation sites mapped to an interned census reach set.
+    /// Stable mutation sites mapped to an interned set of reaching tests.
     pub reach: Vec<ReachCluster>,
 }
 
@@ -574,7 +608,7 @@ impl From<&GeneralizedHints> for CompactGeneralizedHints {
             .flat_map(|item| item.candidates.iter().map(|ranked| ranked.candidate.clone()))
             .chain(hints.test_sets.iter().flatten().cloned())
             .collect();
-        killers.sort_by(|left, right| (&left.package, &left.target, &left.test).cmp(&(&right.package, &right.target, &right.test)));
+        killers.sort_by(compare_killers);
         killers.dedup();
 
         let mut binary_identities: Vec<BinaryHint> = hints
@@ -582,7 +616,7 @@ impl From<&GeneralizedHints> for CompactGeneralizedHints {
             .iter()
             .flat_map(|file| file.candidates.iter().map(|ranked| ranked.candidate.clone()))
             .collect();
-        binary_identities.sort_by(|left, right| (&left.package, &left.target).cmp(&(&right.package, &right.target)));
+        binary_identities.sort_by(compare_binaries);
         binary_identities.dedup();
 
         let items = hints
@@ -594,7 +628,7 @@ impl From<&GeneralizedHints> for CompactGeneralizedHints {
                 candidates: item
                     .candidates
                     .iter()
-                    .map(|ranked| ranked.map_candidate(index_of(&killers, &ranked.candidate)))
+                    .map(|ranked| ranked.map_candidate(index_of(&killers, &ranked.candidate, compare_killers)))
                     .collect(),
             })
             .collect();
@@ -606,14 +640,14 @@ impl From<&GeneralizedHints> for CompactGeneralizedHints {
                 candidates: file
                     .candidates
                     .iter()
-                    .map(|ranked| ranked.map_candidate(index_of(&binary_identities, &ranked.candidate)))
+                    .map(|ranked| ranked.map_candidate(index_of(&binary_identities, &ranked.candidate, compare_binaries)))
                     .collect(),
             })
             .collect();
         let test_sets = hints
             .test_sets
             .iter()
-            .map(|tests| tests.iter().map(|killer| index_of(&killers, killer)).collect())
+            .map(|tests| tests.iter().map(|killer| index_of(&killers, killer, compare_killers)).collect())
             .collect();
 
         Self {
@@ -632,7 +666,7 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
     type Error = &'static str;
 
     fn try_from(compact: CompactGeneralizedHints) -> Result<Self, Self::Error> {
-        let items = compact
+        let items: Vec<ItemHints> = compact
             .items
             .into_iter()
             .map(|item| {
@@ -646,8 +680,8 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
                         .collect::<Result<_, _>>()?,
                 })
             })
-            .collect::<Result<_, _>>()?;
-        let binaries = compact
+            .collect::<Result<_, &'static str>>()?;
+        let binaries: Vec<FileBinaryHints> = compact
             .binaries
             .into_iter()
             .map(|file| {
@@ -660,7 +694,7 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
                         .collect::<Result<_, _>>()?,
                 })
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, &'static str>>()?;
         let test_sets = compact
             .test_sets
             .into_iter()
@@ -682,10 +716,17 @@ impl TryFrom<CompactGeneralizedHints> for GeneralizedHints {
     }
 }
 
-fn index_of<T: PartialEq>(pool: &[T], entry: &T) -> u32 {
+fn compare_killers(left: &Killer, right: &Killer) -> core::cmp::Ordering {
+    (&left.package, &left.target, &left.test).cmp(&(&right.package, &right.target, &right.test))
+}
+
+fn compare_binaries(left: &BinaryHint, right: &BinaryHint) -> core::cmp::Ordering {
+    (&left.package, &left.target).cmp(&(&right.package, &right.target))
+}
+
+fn index_of<T>(pool: &[T], entry: &T, compare: impl Fn(&T, &T) -> core::cmp::Ordering) -> u32 {
     let index = pool
-        .iter()
-        .position(|known| known == entry)
+        .binary_search_by(|known| compare(known, entry))
         .expect("the identity pool was built from every referenced entry");
 
     u32::try_from(index).expect("an identity index cannot exceed the number of entries retained in the bounded artifact")
@@ -712,9 +753,11 @@ impl GeneralizedHints {
         match self.version {
             1 => {
                 for candidate in self.items.iter_mut().flat_map(|item| &mut item.candidates) {
+                    // #[gamma::skip(call_result.default, reason = "reset returns unit and call_result.default retains every field reset")]
                     reset(candidate);
                 }
                 for candidate in self.binaries.iter_mut().flat_map(|file| &mut file.candidates) {
+                    // #[gamma::skip(call_result.default, reason = "reset returns unit and call_result.default retains every field reset")]
                     reset(candidate);
                 }
             }
@@ -753,6 +796,60 @@ impl GeneralizedHints {
     // #[gamma::skip(all, reason = "emptiness is the conjunction of all independently tested record sections; partial states are covered by record serialization tests")]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty() && self.binaries.is_empty() && self.reach.is_empty()
+    }
+
+    /// Incorporates newer score-neutral knowledge without dropping unrelated item and file hints.
+    pub(crate) fn merge_from(&mut self, newer: Self) {
+        if newer.supported().is_none() {
+            return;
+        }
+        if self.supported().is_none() {
+            *self = Self::empty_supported();
+        }
+        let items: HashMap<_, _> = newer
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| ((item.file.as_path(), item.item.as_str()), index))
+            .collect();
+        self.items
+            .retain(|item| !items.contains_key(&(item.file.as_path(), item.item.as_str())));
+        let keep = newer
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| items.get(&(item.file.as_path(), item.item.as_str())) == Some(&index))
+            .collect::<Vec<_>>();
+        drop(items);
+        self.items
+            .extend(newer.items.into_iter().zip(keep).filter(|(_, keep)| *keep).map(|(item, _)| item));
+        let binaries: HashMap<_, _> = newer
+            .binaries
+            .iter()
+            .enumerate()
+            .map(|(index, binary)| (binary.file.as_path(), index))
+            .collect();
+        self.binaries.retain(|binary| !binaries.contains_key(binary.file.as_path()));
+        let keep = newer
+            .binaries
+            .iter()
+            .enumerate()
+            .map(|(index, binary)| binaries.get(binary.file.as_path()) == Some(&index))
+            .collect::<Vec<_>>();
+        drop(binaries);
+        self.binaries.extend(
+            newer
+                .binaries
+                .into_iter()
+                .zip(keep)
+                .filter(|(_, keep)| *keep)
+                .map(|(binary, _)| binary),
+        );
+        // #[gamma::skip(all, reason = "the branch handles process, filesystem, platform, or synchronization state that cannot be forced safely and deterministically in unit tests")]
+        if !newer.reach.is_empty() {
+            self.test_sets = newer.test_sets;
+            self.reach = newer.reach;
+        }
     }
 }
 
@@ -1044,7 +1141,9 @@ impl Display for UpdateLoadError {
             Self::UnsupportedVersion { path, version } => {
                 write!(
                     f,
-                    "`{path}` has unsupported version {version}; expected {VERSION}; remove it or use a compatible cargo-gamma version"
+                    "`{path}` has unsupported version {version}; expected {VERSION}; move this file to a separate archive path \
+                     to preserve its evidence, then retry (use `--resume-testing` if testing already finished), \
+                     or use a compatible cargo-gamma version"
                 )
             }
             Self::Read { path, cause } => write!(f, "`{path}` could not be read: {cause}"),
@@ -1126,7 +1225,19 @@ fn safe_relative_path(path: &Utf8Path) -> bool {
     !path.as_str().is_empty() && path.components().all(|component| matches!(component, Utf8Component::Normal(_)))
 }
 
+fn normalize_compilation_roots(roots: &mut Vec<Utf8PathBuf>) {
+    roots.sort();
+    roots.dedup();
+}
+
 impl RunRecord {
+    /// Refuses an update that would discard readable evidence from a different record format.
+    pub(crate) fn validate_update(base: &Utf8Path) -> crate::Result<()> {
+        Self::load_for_update(base, FILE)
+            .map(|_| ())
+            .map_err(|failure| crate::error::error!("refusing to overwrite campaign state `{}`", base.join(FILE)).caused_by(failure))
+    }
+
     /// Captures the workspace before it is copied or executed.
     #[cfg(test)]
     #[must_use]
@@ -1233,6 +1344,7 @@ impl RunRecord {
 
         Ok(serde_json::from_str::<Self>(&text)
             .ok()
+            // #[gamma::skip(logical.and_remove_left, reason = "the version-only pass above already returned an error for every successfully parsed foreign version; full-record deserialization reads the same version field")]
             .filter(|record| record.version == VERSION && record.paths_are_workspace_relative()))
     }
 
@@ -1326,13 +1438,12 @@ impl RunRecord {
             .any(|entry| entry.outcome == Outcome::CompileError)
     }
 
-    /// The mutants this record saw fail to compile, offered as an order to build in.
+    /// The exact mutant identities this record saw fail to compile.
     ///
     /// [`Tier::Ordering`] requires no term of the context and no source digest, which is what
-    /// separates it from [`Self::settled`]: this is not a claim that these mutants are unviable
-    /// now, only that they are the ones worth compiling first. Nothing downstream may withhold,
-    /// settle or exclude a mutant on the strength of it — every one of them is built, and the
-    /// compiler decides, exactly as it would have without the hint.
+    /// separates it from [`Self::settled`]. Campaigns import these identities once when
+    /// initializing their explicit compiler-exclusion inventory; that inventory, rather than
+    /// a speculative compiler probe, decides whether a historical failure is excluded.
     #[must_use]
     // #[gamma::skip(all, reason = "ordering is normalized and deduplicated for deterministic cache output, which is asserted by record round-trip tests")]
     pub fn ordering(&self) -> Vec<&str> {
@@ -1384,7 +1495,7 @@ impl RunRecord {
     /// The incomplete record is deliberately narrower than a completed campaign record: pending,
     /// ignored, and test-derived outcomes carry no evidence that a later run may consume. Existing
     /// score-neutral probe learning is retained because the sweep may have written it independently.
-    pub(crate) fn store_incomplete_convergence(&self, base: &Utf8Path) -> crate::Result<Self> {
+    pub fn store_incomplete_convergence(&self, base: &Utf8Path) -> crate::Result<Self> {
         let earlier = Self::load_for_update(base, INCOMPLETE_FILE)
             .map_err(|failure| {
                 crate::error::error!(
@@ -1394,12 +1505,13 @@ impl RunRecord {
                 .caused_by(failure)
             })?
             .unwrap_or_default();
-        let mut merged = self.absorbing(&earlier);
+        let mut merged = self.absorbing(&earlier, false);
 
         for file in &mut merged.files {
             file.mutants.retain(|entry| entry.outcome == Outcome::CompileError);
         }
         merged.files.retain(|file| !file.mutants.is_empty());
+        // #[gamma::skip(try.propagate_to_unwrap, reason = "RunRecord serializes only strings, integer/bool fields, sequences, and maps with string keys; its custom serializers also emit only those JSON-compatible values")]
         let text = serde_json::to_string(&merged)
             .map_err(|cause| crate::error::error!("could not serialize incomplete compiler learning").caused_by(cause))?;
 
@@ -1556,7 +1668,8 @@ impl RunRecord {
     /// The run command uses [`Self::from_snapshot`] instead, with the snapshot captured before the
     /// workspace was copied. This constructor serves operations that create synthetic records in
     /// one uninterrupted step.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internals"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     #[must_use]
     pub fn from_run(root: &Utf8Path, mutants: &[Mutant], context: &ContextDigest, _source_dirs: &[Utf8PathBuf]) -> Self {
         let inputs = WorkspaceSnapshot::capture(root, &[root.join(FILE)]);
@@ -1571,7 +1684,8 @@ impl RunRecord {
     /// changed after that snapshot, there is no safe attribution and the caller receives `None`.
     /// This costs the next run work rather than letting an old execution verdict acquire new
     /// provenance.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internals"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     #[must_use]
     fn from_snapshot(
         root: &Utf8Path,
@@ -1605,11 +1719,26 @@ impl RunRecord {
         inputs: WorkspaceSnapshot,
         killers: &Killers,
     ) -> Option<Self> {
-        if !inputs.contains_plan_sources(plan) {
+        if !Self::contains_captured_sources(plan, &inputs) {
             return None;
         }
 
         Self::from_plan_snapshot_checked(plan, context, inputs, killers, false)
+    }
+
+    pub(crate) fn contains_captured_sources(plan: &Plan, inputs: &WorkspaceSnapshot) -> bool {
+        inputs.contains_plan_sources(plan)
+            && plan.files.iter().all(|file| {
+                file.source.as_deref().is_none_or(|source| {
+                    inputs
+                        .file(&file.path)
+                        .is_some_and(|input| input.digest == digest(source.as_bytes()))
+                        && plan
+                            .digests
+                            .get(&file.path)
+                            .is_some_and(|expected| *expected == digest(source.strip_prefix('\u{feff}').unwrap_or(source).as_bytes()))
+                })
+            })
     }
 
     fn paths_are_workspace_relative(&self) -> bool {
@@ -1639,8 +1768,7 @@ impl RunRecord {
                 .filter_map(|dependency| plan.specs.get(dependency).map(|(root, _version)| root.clone()))
                 .collect();
 
-            roots.sort();
-            roots.dedup();
+            normalize_compilation_roots(&mut roots);
             let _previous = compilation_roots.insert(package.clone(), roots);
         }
 
@@ -1789,7 +1917,7 @@ impl RunRecord {
                 return;
             }
         };
-        let merged = self.absorbing(&earlier);
+        let merged = self.absorbing(&earlier, false);
 
         if !merged.inputs.matches_current(root) {
             return;
@@ -1810,11 +1938,21 @@ impl RunRecord {
     /// source bytes and verdicts this campaign already observed. Post-campaign commands validate
     /// their affected source sites when they consume this ledger.
     #[cfg_attr(coverage_nightly, coverage(off))]
-    pub(crate) fn store_completed(&self, base: &Utf8Path) -> crate::Result<Self> {
+    pub fn store_completed(&self, base: &Utf8Path) -> crate::Result<Self> {
+        self.store_completed_with_scope(base, false)
+    }
+
+    /// Publishes a name-filtered campaign while retaining valid evidence for unselected IDs.
+    pub(crate) fn store_completed_partial(&self, base: &Utf8Path) -> crate::Result<Self> {
+        self.store_completed_with_scope(base, true)
+    }
+
+    fn store_completed_with_scope(&self, base: &Utf8Path, retain_unselected: bool) -> crate::Result<Self> {
         let earlier = Self::load_for_update(base, FILE)
             .map_err(|failure| crate::error::error!("refusing to overwrite campaign state `{}`", base.join(FILE)).caused_by(failure))?
             .unwrap_or_default();
-        let merged = self.absorbing(&earlier);
+        let merged = self.absorbing(&earlier, retain_unselected);
+        // #[gamma::skip(try.propagate_to_unwrap, reason = "RunRecord serializes only strings, integer/bool fields, sequences, and maps with string keys; its custom serializers also emit only those JSON-compatible values")]
         let text = serde_json::to_string(&merged)
             .map_err(|cause| crate::error::error!("could not serialize completed campaign state").caused_by(cause))?;
 
@@ -1831,10 +1969,13 @@ impl RunRecord {
         Ok(merged)
     }
 
-    /// This cache, plus the entries of `earlier` for files this run never visited.
+    /// This cache, plus eligible earlier entries outside this run's measured scope.
+    ///
+    /// Name-filtered runs may select only some mutants in an unchanged file, so they retain
+    /// unselected IDs from that file after the same context and source checks used elsewhere.
     // #[gamma::skip(all, reason = "absorption is covered by exact record merge fixtures, including changed inputs and verdict-tier admission")]
     #[cfg_attr(coverage_nightly, coverage(off))]
-    fn absorbing(&self, earlier: &Self) -> Self {
+    fn absorbing(&self, earlier: &Self, retain_unselected: bool) -> Self {
         let workspace_unchanged = earlier.inputs == self.inputs;
         let unviability = Tier::Unviability.admits(&earlier.context, &self.context);
         let verdicts = Tier::Verdict.admits(&earlier.context, &self.context) && workspace_unchanged;
@@ -1868,7 +2009,19 @@ impl RunRecord {
         for file in &self.files {
             let _ = seen.insert(&file.path);
             if !file.mutants.is_empty() {
-                files.push(file.clone());
+                let mut current = file.clone();
+                if retain_unselected
+                    && let Some(previous) = carried_map.get(&file.path)
+                    && previous.package == file.package
+                    && is_unchanged(previous, &self.inputs)
+                {
+                    let selected: HashSet<MutantId> = current.mutants.iter().map(|entry| entry.id.clone()).collect();
+                    current
+                        .mutants
+                        .extend(previous.mutants.iter().filter(|entry| !selected.contains(&entry.id)).cloned());
+                    current.mutants.sort_by(|left, right| left.id.cmp(&right.id));
+                }
+                files.push(current);
             } else if let Some(earlier_file) = carried_map.get(&file.path) {
                 if !earlier_file.mutants.is_empty() && is_unchanged(earlier_file, &self.inputs) {
                     files.push(RecordedFile {
@@ -1903,6 +2056,15 @@ impl RunRecord {
             }
         }
 
+        let hints = self.absorbed_hints(earlier, retain_unselected);
+        let generalized = if retain_unselected {
+            super::hints::merge_generalized(&earlier.generalized, &self.generalized).unwrap_or_else(|_unsupported| self.generalized.clone())
+        } else if !self.replace_knowledge && self.generalized.is_empty() {
+            earlier.generalized.clone()
+        } else {
+            self.generalized.clone()
+        };
+
         Self {
             version: VERSION,
             context: self.context.clone(),
@@ -1910,18 +2072,28 @@ impl RunRecord {
             population: self.population.clone(),
             inputs: self.inputs.clone(),
             compilation_roots,
-            hints: if !self.replace_knowledge && self.hints.is_empty() {
-                earlier.hints.clone()
-            } else {
-                self.hints.clone()
-            },
-            generalized: if !self.replace_knowledge && self.generalized.is_empty() {
-                earlier.generalized.clone()
-            } else {
-                self.generalized.clone()
-            },
+            hints,
+            generalized,
             replace_knowledge: false,
         }
+    }
+
+    /// Retains exact killer hints outside the latest selected population and replaces selected hints.
+    fn absorbed_hints(&self, earlier: &Self, retain_unselected: bool) -> HashMap<MutantId, Killer> {
+        let mut hints = if !self.replace_knowledge && self.hints.is_empty() {
+            earlier.hints.clone()
+        } else {
+            self.hints.clone()
+        };
+        if retain_unselected {
+            let selected: HashSet<&MutantId> = self.population.iter().flatten().collect();
+            for (id, killer) in &earlier.hints {
+                if !selected.contains(id) {
+                    hints.entry(id.clone()).or_insert_with(|| killer.clone());
+                }
+            }
+        }
+        hints
     }
 
     /// How many mutants this record holds.
@@ -2142,9 +2314,6 @@ pub struct Context<'a> {
     /// Whether to test the whole workspace.
     pub test_workspace: bool,
 
-    /// Whether to collect case-level reachability before testing mutants.
-    pub optimize_test_execution: bool,
-
     /// Whether to run reachable test binaries whole instead of selecting individual test cases.
     pub whole_test_binaries: bool,
 
@@ -2270,19 +2439,17 @@ fn context_in(of: &Context<'_>, build_target: Option<&str>, environment: &[(Vec<
     for exc in of.exclude_tests {
         test_parts.push(exc.as_bytes());
     }
-    // The tag differs from the bit spelling that preceded it so that records written under the
-    // opposite default are invalidated rather than believed.
-    test_parts.push(b":case-reachability-default:");
+    test_parts.push(b":active-reach-only:");
     let test_flags = [
         u8::from(of.test_workspace),
         u8::from(of.test_lib),
-        u8::from(of.optimize_test_execution),
         u8::from(of.whole_test_binaries),
         u8::from(of.nextest),
     ];
     test_parts.push(&test_flags);
 
     let mut policy_parts: Vec<&[u8]> = Vec::new();
+    policy_parts.push(b":exact-first-adaptive-sweep-v2:");
     policy_parts.push(b":cargo-test:");
     policy_parts.extend(of.cargo_test_args.iter().map(String::as_bytes));
     policy_parts.push(b":post--:");
@@ -2318,13 +2485,8 @@ fn context_in(of: &Context<'_>, build_target: Option<&str>, environment: &[(Vec<
     );
     policy_parts.push(policy.as_bytes());
 
-    let mut environment_parts = Vec::with_capacity(environment.len().saturating_mul(2));
-    for (name, value) in environment {
-        environment_parts.push(name.as_slice());
-        environment_parts.push(value.as_slice());
-    }
-
     let identity_version = MUTANT_ID_VERSION.to_le_bytes();
+    let compiler_policy = COMPILER_EVIDENCE_POLICY_EPOCH.to_le_bytes();
 
     Some(ContextDigest {
         features: term(Term::Features, &features),
@@ -2334,11 +2496,28 @@ fn context_in(of: &Context<'_>, build_target: Option<&str>, environment: &[(Vec<
         config: None,
         extra: term(Term::Extra, &of.extra.iter().map(String::as_bytes).collect::<Vec<&[u8]>>()),
         toolchain: term(Term::Toolchain, &[toolchain.as_bytes()]),
-        tool: term(Term::Tool, &[env!("CARGO_PKG_VERSION").as_bytes(), &identity_version]),
+        tool: term(
+            Term::Tool,
+            &[
+                env!("CARGO_PKG_VERSION").as_bytes(),
+                &identity_version,
+                b"compiler-evidence-policy",
+                &compiler_policy,
+            ],
+        ),
         tests: term(Term::Tests, &test_parts),
         policy: term(Term::Policy, &policy_parts),
-        environment: Some(term(Term::Environment, &environment_parts)),
+        environment: Some(environment_digest(environment)),
     })
+}
+
+fn environment_digest(environment: &[(Vec<u8>, Vec<u8>)]) -> String {
+    let mut parts = Vec::with_capacity(environment.len().saturating_mul(2));
+    for (name, value) in environment {
+        parts.push(name.as_slice());
+        parts.push(value.as_slice());
+    }
+    term(Term::Environment, &parts)
 }
 
 /// The process environment that reaches a test binary without gamma naming it.
@@ -2408,6 +2587,10 @@ fn term(name: Term, parts: &[&[u8]]) -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod source_generation_tests;
+
+#[cfg(test)]
 #[cfg(not(miri))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -2416,6 +2599,729 @@ mod tests {
 
     use super::*;
     use crate::fixtures;
+
+    #[test]
+    fn context_difference_table_ignores_unstated_axes_and_reports_every_changed_axis_in_order() {
+        let baseline = ContextDigest {
+            target: Some(String::new()),
+            config: Some(String::new()),
+            environment: Some(String::new()),
+            ..ContextDigest::default()
+        };
+        let mut all = serde_json::to_value(&baseline).expect("context JSON");
+        for term in Term::ALL {
+            let mut value = serde_json::to_value(&baseline).expect("context JSON");
+            value[term.name()] = serde_json::json!("changed");
+            let changed: ContextDigest = serde_json::from_value(value).expect("same context schema");
+            assert_eq!(baseline.differences(&changed), [*term]);
+            assert_eq!(changed.differences(&baseline), [*term]);
+            all[term.name()] = serde_json::json!("changed");
+        }
+        let changed: ContextDigest = serde_json::from_value(all).expect("all stated axes changed");
+        assert_eq!(baseline.differences(&changed), Term::ALL);
+        assert!(baseline.differences(&baseline).is_empty());
+        for term in [Term::Target, Term::Config, Term::Environment] {
+            let mut value = serde_json::to_value(&baseline).expect("context JSON");
+            value[term.name()] = serde_json::Value::Null;
+            let unstated: ContextDigest = serde_json::from_value(value).expect("optional term");
+            let mut different = serde_json::to_value(&baseline).expect("context JSON");
+            different[term.name()] = serde_json::json!("changed");
+            let stated: ContextDigest = serde_json::from_value(different).expect("stated term");
+            assert!(unstated.differences(&stated).is_empty());
+            assert!(stated.differences(&unstated).is_empty());
+        }
+    }
+
+    #[test]
+    fn rustflag_precedence_and_target_encodings_preserve_each_delimiter_and_name() {
+        for encoded in [None, Some("encoded".to_owned())] {
+            for plain in [None, Some("plain".to_owned())] {
+                for configured in [None, Some("configured".to_owned())] {
+                    let chosen = encoded.clone().or_else(|| plain.clone()).or_else(|| configured.clone());
+                    assert_eq!(rustflags_in(encoded.clone(), plain.clone(), configured.clone(), &[]), chosen);
+                    let targets = [
+                        ("target.a".to_owned(), "one two".to_owned()),
+                        ("target.b".to_owned(), "three".to_owned()),
+                    ];
+                    assert_eq!(
+                        rustflags_in(encoded.clone(), plain.clone(), configured.clone(), &targets),
+                        Some(format!("{}\ntarget.a=one two\ntarget.b=three", chosen.unwrap_or_default()))
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            rustflags_in(Some(String::new()), Some("ignored".to_owned()), None, &[]),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn site_identity_schema_errors_and_update_errors_preserve_exact_explanations_and_sources() {
+        let base = serde_json::json!({"file":"src/lib.rs", "item":"subject::answer", "mutator":"literal.int_to_zero", "occurrence":0});
+        for (digest, normalized, expected) in [
+            (None, None, "site identity contains neither digest nor normalizedText"),
+            (Some("digest"), Some("42"), "site identity contains both digest and normalizedText"),
+        ] {
+            let mut value = base.clone();
+            if let Some(digest) = digest {
+                value["digest"] = serde_json::json!(digest);
+            }
+            if let Some(normalized) = normalized {
+                value["normalizedText"] = serde_json::json!(normalized);
+            }
+            assert_eq!(
+                serde_json::from_value::<SiteIdentity>(value)
+                    .expect_err("invalid identity schema")
+                    .to_string(),
+                expected
+            );
+        }
+        serde_json::from_str::<SiteIdentity>("[]").unwrap_err();
+        let path = Utf8PathBuf::from("state.json");
+        let unsupported = UpdateLoadError::UnsupportedVersion {
+            path: path.clone(),
+            version: 99,
+        };
+        assert_eq!(
+            unsupported.to_string(),
+            format!(
+                "`state.json` has unsupported version 99; expected {VERSION}; move this file to a separate archive path \
+                     to preserve its evidence, then retry (use `--resume-testing` if testing already finished), \
+                     or use a compatible cargo-gamma version"
+            )
+        );
+        assert!(unsupported.source().is_none());
+        let large = UpdateLoadError::TooLarge { path: path.clone() };
+        assert_eq!(
+            large.to_string(),
+            format!("`state.json` is larger than the {} bytes cargo-gamma will retain", input::MAX_BYTES)
+        );
+        assert!(large.source().is_none());
+        let read = UpdateLoadError::Read {
+            path,
+            cause: io::Error::new(io::ErrorKind::PermissionDenied, "fixture denied"),
+        };
+        assert_eq!(read.to_string(), "`state.json` could not be read: fixture denied");
+        let source = read.source().expect("read failures retain their original I/O cause");
+        assert_eq!(
+            source.downcast_ref::<io::Error>().expect("I/O source").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "the table keeps all persisted-input refusal cases together")]
+    fn loading_tables_distinguish_missing_invalid_oversize_foreign_and_unsafe_artifacts() {
+        let (_dir, root) = workspace("record-loading-table-", "");
+        RunRecord::load_required(&root).unwrap_err();
+        assert!(RunRecord::load_raw(&root).is_none());
+        assert!(RunRecord::load_for_update(&root, FILE).expect("missing state").is_none());
+        for invalid in [b"not JSON".as_slice(), b"\xff".as_slice()] {
+            fs::write(root.join(FILE), invalid).expect("invalid state bytes");
+            RunRecord::load_required(&root).unwrap_err();
+            assert!(RunRecord::load_raw(&root).is_none());
+            let update = RunRecord::load_for_update(&root, FILE);
+            if invalid == b"not JSON" {
+                assert!(update.expect("corrupt JSON may be replaced").is_none());
+            } else {
+                assert!(matches!(update, Err(UpdateLoadError::Read { .. })));
+            }
+        }
+        File::create(root.join(FILE))
+            .expect("oversize file")
+            .set_len(input::MAX_BYTES + 1)
+            .expect("oversize length");
+        assert!(
+            RunRecord::load_required(&root)
+                .expect_err("oversize explicit input")
+                .to_string()
+                .contains("exceeds the supported size")
+        );
+        assert!(RunRecord::load_raw(&root).is_none());
+        assert!(matches!(
+            RunRecord::load_for_update(&root, FILE),
+            Err(UpdateLoadError::TooLarge { .. })
+        ));
+        let valid = RunRecord {
+            version: VERSION,
+            ..RunRecord::default()
+        };
+        fs::write(root.join(FILE), serde_json::to_vec(&valid).expect("record JSON")).expect("valid state");
+        RunRecord::load_required(&root).unwrap();
+        assert!(RunRecord::load_raw(&root).is_some());
+        assert!(RunRecord::load_for_update(&root, FILE).expect("valid update").is_some());
+        let foreign = RunRecord {
+            version: VERSION + 1,
+            ..RunRecord::default()
+        };
+        fs::write(root.join(FILE), serde_json::to_vec(&foreign).expect("foreign JSON")).expect("foreign state");
+        assert!(
+            RunRecord::load_required(&root)
+                .expect_err("unsupported explicit version")
+                .to_string()
+                .contains("unsupported version")
+        );
+        assert!(RunRecord::load_raw(&root).is_none());
+        assert!(matches!(
+            RunRecord::load_for_update(&root, FILE),
+            Err(UpdateLoadError::UnsupportedVersion { .. })
+        ));
+        for path in ["", "../outside.rs", "src/../outside.rs"] {
+            assert!(!safe_relative_path(Utf8Path::new(path)));
+            let unsafe_record = RunRecord {
+                version: VERSION,
+                files: vec![RecordedFile {
+                    path: path.into(),
+                    package: "subject".to_owned(),
+                    digest: String::new(),
+                    size: 0,
+                    mutants: Vec::new(),
+                }],
+                ..RunRecord::default()
+            };
+            fs::write(root.join(FILE), serde_json::to_vec(&unsafe_record).expect("unsafe JSON")).expect("unsafe state");
+            RunRecord::load_required(&root).unwrap_err();
+            assert!(RunRecord::load_raw(&root).is_none());
+            assert!(
+                RunRecord::load_for_update(&root, FILE)
+                    .expect("unsafe state can be replaced")
+                    .is_none()
+            );
+        }
+        assert!(safe_relative_path(Utf8Path::new("src/answer.rs")));
+        let mut entry: Entry = serde_json::from_value(
+            serde_json::json!({"id":"0123456789abcdef0123456789abcdef","outcome":"Killed","killer_file":"../outside.rs"}),
+        )
+        .expect("entry schema");
+        entry.killer_file = Some("../outside.rs".into());
+        let unsafe_killer = RunRecord {
+            version: VERSION,
+            files: vec![RecordedFile {
+                path: "src/lib.rs".into(),
+                package: "subject".to_owned(),
+                digest: String::new(),
+                size: 0,
+                mutants: vec![entry],
+            }],
+            ..valid
+        };
+        assert!(!unsafe_killer.paths_are_workspace_relative());
+        fs::write(root.join(FILE), serde_json::to_vec(&unsafe_killer).expect("unsafe killer JSON")).expect("unsafe killer state");
+        assert!(RunRecord::load_raw(&root).is_none());
+        assert!(
+            RunRecord::load_for_update(&root, FILE)
+                .expect("unsafe killer can be replaced")
+                .is_none()
+        );
+    }
+
+    fn ranked<T>(candidate: T) -> RankedHint<T> {
+        RankedHint {
+            candidate,
+            seeds: 0,
+            hits: 4,
+            misses: 3,
+            measured_ms: 120,
+            samples: 7,
+            order: 2,
+        }
+    }
+
+    #[test]
+    fn compact_hint_pools_preserve_multiple_identities_order_and_reject_out_of_bounds_indexes() {
+        let first = Killer {
+            package: "a".to_owned(),
+            target: "lib".to_owned(),
+            test: "first".to_owned(),
+        };
+        let second = Killer {
+            package: "b".to_owned(),
+            target: "test".to_owned(),
+            test: "second".to_owned(),
+        };
+        let first_binary = BinaryHint {
+            package: "a".to_owned(),
+            target: "lib".to_owned(),
+        };
+        let second_binary = BinaryHint {
+            package: "b".to_owned(),
+            target: "test".to_owned(),
+        };
+        let hints = GeneralizedHints {
+            version: GENERALIZED_HINTS_VERSION,
+            items: vec![ItemHints {
+                file: "src/lib.rs".into(),
+                item: "subject::answer".to_owned(),
+                candidates: vec![ranked(second.clone()), ranked(first.clone()), ranked(second.clone())],
+            }],
+            binaries: vec![FileBinaryHints {
+                file: "src/lib.rs".into(),
+                candidates: vec![
+                    ranked(second_binary.clone()),
+                    ranked(first_binary.clone()),
+                    ranked(second_binary.clone()),
+                ],
+            }],
+            test_sets: vec![vec![second.clone(), first.clone()]],
+            reach: Vec::new(),
+        };
+        let compact = CompactGeneralizedHints::from(&hints);
+        assert_eq!(compact.killers, [first, second]);
+        assert_eq!(compact.binary_identities, [first_binary, second_binary]);
+        assert_eq!(
+            compact.items[0].candidates.iter().map(|hint| hint.candidate).collect::<Vec<_>>(),
+            [1, 0, 1]
+        );
+        assert_eq!(
+            compact.binaries[0].candidates.iter().map(|hint| hint.candidate).collect::<Vec<_>>(),
+            [1, 0, 1]
+        );
+        assert_eq!(compact.test_sets, [vec![1, 0]]);
+        assert_eq!(GeneralizedHints::try_from(compact).expect("valid pool references"), hints);
+        for target in ["items", "binaries", "testSets"] {
+            let mut value = serde_json::to_value(&hints).expect("compact JSON");
+            if target == "testSets" {
+                value[target][0][0] = serde_json::json!(2);
+            } else {
+                value[target][0]["candidates"][0]["candidate"] = serde_json::json!(2);
+            }
+            let failure = serde_json::from_value::<GeneralizedHints>(value).expect_err("pool-length index is out of bounds");
+            assert_eq!(failure.to_string(), "generalized hints reference an identity outside their pool");
+        }
+    }
+
+    #[test]
+    fn compact_hint_encoding_is_byte_identical_to_linear_pool_resolution() {
+        fn linear_index<T: PartialEq>(pool: &[T], entry: &T) -> u32 {
+            u32::try_from(
+                pool.iter()
+                    .position(|known| known == entry)
+                    .expect("fixture pools contain each reference"),
+            )
+            .expect("fixture indexes fit in u32")
+        }
+        let killers = (0..512)
+            .rev()
+            .map(|index| Killer {
+                package: format!("package-{}", index % 3),
+                target: format!("test:target-{}", index % 5),
+                test: format!("tests::case_{index}"),
+            })
+            .collect::<Vec<_>>();
+        let binaries = killers.iter().map(|killer| BinaryHint {
+            package: killer.package.clone(),
+            target: killer.target.clone(),
+        });
+        let hints = GeneralizedHints {
+            version: GENERALIZED_HINTS_VERSION,
+            items: vec![ItemHints {
+                file: "src/lib.rs".into(),
+                item: "subject".to_owned(),
+                candidates: killers.iter().cycle().take(1024).cloned().map(ranked).collect(),
+            }],
+            binaries: vec![FileBinaryHints {
+                file: "src/lib.rs".into(),
+                candidates: binaries.map(ranked).collect(),
+            }],
+            test_sets: killers.chunks(16).map(<[Killer]>::to_vec).collect(),
+            reach: Vec::new(),
+        };
+        let mut expected = CompactGeneralizedHints::from(&hints);
+        expected
+            .killers
+            .sort_by(|left, right| (&left.package, &left.target, &left.test).cmp(&(&right.package, &right.target, &right.test)));
+        expected
+            .binary_identities
+            .sort_by(|left, right| (&left.package, &left.target).cmp(&(&right.package, &right.target)));
+        for (encoded, source) in expected.items.iter_mut().zip(&hints.items) {
+            encoded.candidates = source
+                .candidates
+                .iter()
+                .map(|hint| hint.map_candidate(linear_index(&expected.killers, &hint.candidate)))
+                .collect();
+        }
+        for (encoded, source) in expected.binaries.iter_mut().zip(&hints.binaries) {
+            encoded.candidates = source
+                .candidates
+                .iter()
+                .map(|hint| hint.map_candidate(linear_index(&expected.binary_identities, &hint.candidate)))
+                .collect();
+        }
+        expected.test_sets = hints
+            .test_sets
+            .iter()
+            .map(|tests| tests.iter().map(|killer| linear_index(&expected.killers, killer)).collect())
+            .collect();
+        assert_eq!(
+            serde_json::to_vec(&hints).expect("indexed encoding"),
+            serde_json::to_vec(&expected).expect("linear encoding")
+        );
+        assert_eq!(
+            serde_json::to_vec(&GeneralizedHints::default()).expect("empty hints"),
+            br#"{"version":0,"killers":[],"binaryIdentities":[],"items":[],"binaries":[],"testSets":[],"reach":[]}"#
+        );
+    }
+
+    #[test]
+    fn compact_pool_lookup_uses_logarithmic_comparisons() {
+        let pool = (0..65_536).collect::<Vec<u32>>();
+        for entry in [0, 1, 32_767, 32_768, 65_535] {
+            let comparisons = std::cell::Cell::new(0);
+            assert_eq!(
+                index_of(&pool, &entry, |left, right| {
+                    comparisons.set(comparisons.get() + 1);
+                    left.cmp(right)
+                }),
+                entry
+            );
+            assert!(comparisons.get() <= 17, "pool lookup must not scan the population");
+        }
+    }
+
+    #[test]
+    fn migration_resets_both_hint_tiers_and_reach_support_uses_an_exclusive_pool_bound() {
+        for version in [1, 2, GENERALIZED_HINTS_VERSION, 99] {
+            let mut hints = GeneralizedHints {
+                version,
+                items: vec![ItemHints {
+                    file: "src/lib.rs".into(),
+                    item: "answer".to_owned(),
+                    candidates: vec![ranked(Killer {
+                        package: "a".to_owned(),
+                        target: "lib".to_owned(),
+                        test: "first".to_owned(),
+                    })],
+                }],
+                binaries: vec![FileBinaryHints {
+                    file: "src/lib.rs".into(),
+                    candidates: vec![ranked(BinaryHint {
+                        package: "a".to_owned(),
+                        target: "lib".to_owned(),
+                    })],
+                }],
+                test_sets: vec![vec![]],
+                reach: vec![ReachCluster {
+                    site: SiteIdentity::from_mutant(&fixtures::mutant()),
+                    test_set: 0,
+                }],
+            }
+            .migrated();
+            assert_eq!(hints.version, if version <= 2 { GENERALIZED_HINTS_VERSION } else { version });
+            let item = &hints.items[0].candidates[0];
+            let binary = &hints.binaries[0].candidates[0];
+            let expected = if version == 1 { (1, 0, 0, 0, 0, 2) } else { (0, 4, 3, 120, 7, 2) };
+            assert_eq!(
+                (item.seeds, item.hits, item.misses, item.measured_ms, item.samples, item.order),
+                expected
+            );
+            assert_eq!(
+                (
+                    binary.seeds,
+                    binary.hits,
+                    binary.misses,
+                    binary.measured_ms,
+                    binary.samples,
+                    binary.order
+                ),
+                expected
+            );
+            assert_eq!(hints.supported().is_some(), version != 99);
+            hints.reach[0].test_set = 1;
+            assert!(hints.supported().is_none());
+        }
+    }
+
+    #[test]
+    fn survivor_identical_test_bytes_at_a_different_current_source_path_cannot_revalidate_a_recorded_kill() {
+        let root = Utf8PathBuf::from("workspace");
+        let body = "#[test] fn caught() {}\n";
+        let original = root.join("src/tests.rs");
+        let original_index = Killers::scan_complete_with(core::slice::from_ref(&original), true, |path| {
+            assert_eq!(path, original);
+            Ok(body.as_bytes().to_vec())
+        });
+        let relocated = root.join("src/relocated_tests.rs");
+        let inputs: WorkspaceSnapshot = serde_json::from_value(serde_json::json!({
+            "complete": true,
+            "files": [
+                {"path": "src/lib.rs", "digest": digest(b"pub fn answer() {}\n"), "size": 19},
+                {"path": "src/relocated_tests.rs", "digest": digest(body.as_bytes()), "size": body.len()},
+                {"path": "src/tests.rs", "digest": digest(body.as_bytes()), "size": body.len()},
+            ]
+        }))
+        .expect("controlled source generations form a complete snapshot");
+        let context = context_in(&plain(), None, &[]).expect("the scripted toolchain gives a context");
+        let record = RunRecord::from_snapshot_with_roots(
+            &root,
+            &[killed("relocated-killer", Some("caught"))],
+            &context,
+            inputs.clone(),
+            &original_index,
+            HashMap::default(),
+            false,
+        )
+        .expect("the original killer is bound to the controlled source generation");
+        let entry = record
+            .files
+            .iter()
+            .flat_map(|file| &file.mutants)
+            .find(|entry| entry.id.as_str() == "relocated-killer")
+            .expect("the recorded mutant exists");
+        let recorded_files = record.files.iter().map(|file| (file.path.as_path(), file)).collect();
+        assert!(still_killed(entry, &original_index, &recorded_files, &root, &inputs));
+        let relocated_index = Killers::scan_complete_with(std::slice::from_ref(&relocated), true, |path| {
+            assert_eq!(path, relocated);
+            Ok(body.as_bytes().to_vec())
+        });
+        assert_eq!(
+            relocated_index.file_digest(&relocated),
+            original_index.file_digest(&root.join("src/tests.rs")),
+            "content equality alone must not erase source identity",
+        );
+        assert!(!still_killed(entry, &relocated_index, &recorded_files, &root, &inputs));
+    }
+
+    #[test]
+    fn survivor_compilation_root_normalization_sorts_interleaved_paths_before_deduplicating() {
+        let root = Utf8Path::new("workspace");
+        let first = root.join("crates/a");
+        let second = root.join("crates/b");
+        let mut roots = vec![second.clone(), first.clone(), second.clone(), first.clone()];
+        normalize_compilation_roots(&mut roots);
+        assert_eq!(roots, [first, second]);
+    }
+
+    #[test]
+    fn checked_plan_snapshot_sorts_deduplicates_roots_and_honors_current_generation_requirement() {
+        let (_dir, root) = cache_workspace("record-plan-root-table-");
+        let mut plan = cache_plan(
+            &root,
+            vec![package_mutant("a-unviable", "a", "crates/a/src/lib.rs", Outcome::CompileError)],
+            true,
+        );
+        plan.specs
+            .insert("alias".to_owned(), (Utf8PathBuf::from("crates/b"), "0.1.0".to_owned()));
+        plan.reach.get_mut("a").expect("package a reach").insert("alias".to_owned());
+        let inputs = RunRecord::snapshot(&root, &root.join(FILE));
+        let record = RunRecord::from_plan_snapshot_checked(&plan, &envelope(), inputs.clone(), &Killers::default(), true)
+            .expect("unchanged generation");
+        assert_eq!(
+            record.compilation_roots["a"],
+            [Utf8PathBuf::from("crates/a"), Utf8PathBuf::from("crates/b")]
+        );
+        fs::write(root.join("crates/a/src/lib.rs"), "pub fn changed() {}\n").expect("different source generation");
+        assert!(RunRecord::from_plan_snapshot_checked(&plan, &envelope(), inputs.clone(), &Killers::default(), true).is_none());
+        assert!(RunRecord::from_plan_snapshot_checked(&plan, &envelope(), inputs, &Killers::default(), false).is_some());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the matrix exercises every persisted-verdict provenance condition"
+    )]
+    fn killed_revalidation_requires_every_provenance_and_snapshot_condition() {
+        let (_dir, root) = workspace("record-killed-revalidation-", "pub fn answer() {}\n");
+        let index = killers(&root, "mod tests { #[test] fn caught() {} }\n");
+        let record = from_run(&root, &[killed("caught-mutant", Some("tests::caught"))], &envelope());
+        let entry = record
+            .files
+            .iter()
+            .flat_map(|file| &file.mutants)
+            .next()
+            .expect("recorded killed mutant")
+            .clone();
+        assert_eq!(entry.killer_file.as_deref(), Some(Utf8Path::new("src/tests.rs")));
+        let inputs = record.inputs.clone();
+        let files: HashMap<&Utf8Path, &RecordedFile> = record.files.iter().map(|file| (file.path.as_path(), file)).collect();
+        assert!(still_killed(&entry, &index, &files, &root, &inputs));
+        let nested_root = root.join("nested");
+        for missing in [
+            "name",
+            "recorded-path",
+            "unknown-test",
+            "outside-root",
+            "moved-path",
+            "missing-file",
+        ] {
+            let mut changed = entry.clone();
+            match missing {
+                "name" => changed.killed_by = None,
+                "recorded-path" => changed.killer_file = None,
+                "unknown-test" => changed.killed_by = Some("tests::absent".to_owned()),
+                "moved-path" => changed.killer_file = Some("src/other.rs".into()),
+                _ => {}
+            }
+            let empty = HashMap::default();
+            assert!(
+                !still_killed(
+                    &changed,
+                    &index,
+                    if missing == "missing-file" { &empty } else { &files },
+                    if missing == "outside-root" { nested_root.as_path() } else { &root },
+                    &inputs
+                ),
+                "{missing}"
+            );
+        }
+        let file = record
+            .files
+            .iter()
+            .find(|file| file.path == "src/tests.rs")
+            .expect("recorded test source");
+        assert!(is_unchanged(file, &inputs));
+        for dimension in ["missing", "size", "digest"] {
+            let mut changed_inputs = inputs.clone();
+            match dimension {
+                "missing" => changed_inputs.files.retain(|current| current.path != file.path),
+                "size" => {
+                    changed_inputs
+                        .files
+                        .iter_mut()
+                        .find(|current| current.path == file.path)
+                        .expect("current source")
+                        .size += 1;
+                }
+                _ => {
+                    changed_inputs
+                        .files
+                        .iter_mut()
+                        .find(|current| current.path == file.path)
+                        .expect("current source")
+                        .digest = "different".to_owned();
+                }
+            }
+            assert!(!is_unchanged(file, &changed_inputs), "{dimension}");
+            assert!(!still_killed(&entry, &index, &files, &root, &changed_inputs), "{dimension}");
+        }
+        let mut changed_file = file.clone();
+        changed_file.digest = "new digest".to_owned();
+        let mut changed_inputs = inputs;
+        changed_inputs
+            .files
+            .iter_mut()
+            .find(|current| current.path == file.path)
+            .expect("current source")
+            .digest = changed_file.digest.clone();
+        let mut changed_files = files.clone();
+        changed_files.insert(changed_file.path.as_path(), &changed_file);
+        assert!(is_unchanged(&changed_file, &changed_inputs));
+        assert!(
+            !still_killed(&entry, &index, &changed_files, &root, &changed_inputs),
+            "matching current bytes do not replace the killer index's observed digest"
+        );
+        let mut legacy_reusable = from_run(&root, &[killed("caught-mutant", Some("tests::caught"))], &envelope());
+        legacy_reusable
+            .files
+            .iter_mut()
+            .flat_map(|file| &mut file.mutants)
+            .for_each(|entry| entry.reusable = true);
+        assert!(legacy_reusable.settled(&root, Trust::Free, &index, &record.context).0.is_empty());
+        assert_eq!(
+            legacy_reusable
+                .settled(&root, Trust::Settled, &index, &record.context)
+                .0
+                .get(&entry.id),
+            Some(&Outcome::Killed)
+        );
+    }
+
+    #[test]
+    fn untracked_build_inputs_make_the_snapshot_incomplete_even_when_every_known_file_is_readable() {
+        let (_dir, root) = workspace("record-untracked-snapshot-", "pub fn answer() {}\n");
+        assert!(RunRecord::snapshot_with_external(&root, &root.join(FILE), &[], false).is_complete());
+        assert!(!RunRecord::snapshot_with_external(&root, &root.join(FILE), &[], true).is_complete());
+    }
+
+    #[test]
+    fn record_publication_error_stages_preserve_prior_bytes_and_raise_their_owned_notes() {
+        let (_dir, root) = workspace("record-publication-error-table-", "pub fn answer() {}\n");
+        let record = from_run(&root, &[unviable("compiler")], &envelope());
+        let foreign = RunRecord {
+            version: VERSION + 1,
+            ..from_run(&root, &[unviable("compiler")], &envelope())
+        };
+        let bytes = serde_json::to_vec(&foreign).expect("foreign JSON");
+        fs::write(root.join(FILE), &bytes).expect("foreign completed record");
+        fs::write(root.join(INCOMPLETE_FILE), &bytes).expect("foreign partial record");
+        assert!(
+            record
+                .store_completed(&root)
+                .expect_err("foreign completed record is not overwritten")
+                .to_string()
+                .contains("refusing to overwrite campaign state")
+        );
+        assert!(
+            record
+                .store_incomplete_convergence(&root)
+                .expect_err("foreign partial record is not overwritten")
+                .to_string()
+                .contains("refusing to overwrite incomplete campaign learning")
+        );
+        assert_eq!(fs::read(root.join(FILE)).expect("prior completed bytes"), bytes);
+        assert_eq!(fs::read(root.join(INCOMPLETE_FILE)).expect("prior partial bytes"), bytes);
+        let notes = crate::notes::Run::new();
+        let _scope = crate::notes::enter(Some(&notes));
+        RunRecord::store_probes(&root, &HashMap::default());
+        let raised = crate::notes::drain();
+        assert_eq!(raised.len(), 1);
+        assert!(raised[0].starts_with("did not overwrite campaign state:"));
+        fs::remove_file(root.join(FILE)).expect("remove foreign completed record");
+        fs::remove_file(root.join(INCOMPLETE_FILE)).expect("remove foreign partial record");
+        let blocked = root.join(".blocked-stage");
+        fs::create_dir(&blocked).expect("blocked staging destination");
+        crate::elements::next_scratch_path(blocked.clone());
+        RunRecord::store_probes(&root, &HashMap::default());
+        let raised = crate::notes::drain();
+        assert_eq!(raised.len(), 1);
+        assert!(raised[0].starts_with("could not save run-record hints:"));
+        assert!(!root.join(FILE).exists());
+        crate::elements::next_scratch_path(blocked.clone());
+        assert!(
+            record
+                .store_incomplete_convergence(&root)
+                .expect_err("partial publication staging fails")
+                .to_string()
+                .contains("could not save incomplete compiler learning")
+        );
+        assert!(!root.join(INCOMPLETE_FILE).exists());
+        crate::elements::next_scratch_path(blocked);
+        assert!(
+            record
+                .store_completed(&root)
+                .expect_err("completed publication staging fails")
+                .to_string()
+                .contains("could not save completed campaign state")
+        );
+        assert!(!root.join(FILE).exists());
+        fs::create_dir(root.join(INCOMPLETE_FILE)).expect("directory cannot be cleared by remove_file");
+        assert!(
+            record
+                .store_completed(&root)
+                .expect_err("failed partial-state removal is reported")
+                .to_string()
+                .contains("could not clear incomplete campaign learning")
+        );
+    }
+
+    #[test]
+    fn incomplete_convergence_retains_only_nonempty_compiler_evidence_files() {
+        let (_dir, root) = workspace("record-incomplete-file-retention-", "pub fn answer() {}\n");
+        fs::write(root.join("src/other.rs"), "pub fn other() {}\n").expect("test-derived file");
+        let record = from_run(
+            &root,
+            &[unviable("compiler"), mutant("survivor", "src/other.rs", Outcome::Survived)],
+            &envelope(),
+        );
+        let stored = record.store_incomplete_convergence(&root).expect("partial compiler evidence");
+        assert_eq!(stored.files.len(), 1);
+        assert_eq!(stored.files[0].path.as_str(), "src/lib.rs");
+        assert_eq!(stored.files[0].mutants.len(), 1);
+        assert_eq!(stored.files[0].mutants[0].outcome, Outcome::CompileError);
+        let loaded = RunRecord::load_incomplete(&root);
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[0].mutants[0].id.as_str(), "compiler");
+    }
 
     #[test]
     fn record_iteration_skips_empty_files_and_visits_every_later_entry() {
@@ -2582,6 +3488,31 @@ mod tests {
         });
 
         assert_eq!(loaded, current);
+    }
+
+    #[test]
+    fn supported_generalized_hints_replace_an_unsupported_collection() {
+        let mut earlier = GeneralizedHints {
+            version: GENERALIZED_HINTS_VERSION + 1,
+            items: vec![ItemHints {
+                file: "src/old.rs".into(),
+                item: "old".to_owned(),
+                candidates: Vec::new(),
+            }],
+            ..GeneralizedHints::default()
+        };
+        let newer = GeneralizedHints {
+            items: vec![ItemHints {
+                file: "src/new.rs".into(),
+                item: "new".to_owned(),
+                candidates: Vec::new(),
+            }],
+            ..GeneralizedHints::empty_supported()
+        };
+
+        earlier.merge_from(newer.clone());
+
+        assert_eq!(earlier, newer);
     }
 
     #[test]
@@ -2931,6 +3862,19 @@ mod tests {
     }
 
     #[test]
+    fn compiler_policy_epoch_distinguishes_same_version_compiler_evidence() {
+        let current = context_in(&plain(), None, &[]).expect("the controlled context supplies a compiler identity");
+        let legacy = ContextDigest {
+            tool: term(
+                Term::Tool,
+                &[env!("CARGO_PKG_VERSION").as_bytes(), &MUTANT_ID_VERSION.to_le_bytes()],
+            ),
+            ..current.clone()
+        };
+        assert_eq!(legacy.differences(&current), [Term::Tool]);
+    }
+
+    #[test]
     fn a_cached_mutant_is_settled_when_its_file_is_unchanged() {
         let (_dir, root) = workspace("record-hit-", "fn add() {}");
         let cache = from_run(&root, &[mutant("abc", "src/lib.rs", Outcome::CompileError)], &envelope());
@@ -2997,12 +3941,166 @@ mod tests {
         let fresh = package_mutant("fresh", "b", "crates/b/src/lib.rs", Outcome::CompileError);
         let current_plan = cache_plan(&root, vec![fresh], false);
         let current = from_plan(&current_plan);
-        let merged = current.absorbing(&earlier);
+        let merged = current.absorbing(&earlier, false);
         let settled = merged.settled(&root, Trust::Settled, &Killers::default(), &envelope()).0;
 
         assert_eq!(settled.get("unviable"), Some(&Outcome::CompileError));
         assert_eq!(settled.get("fresh"), Some(&Outcome::CompileError));
         assert!(!settled.contains_key("survived"));
+    }
+
+    /// Builds a controlled single-file campaign with matching context and complete source inputs.
+    fn memory_record(source: &str, mutants: &[Mutant]) -> RunRecord {
+        let digest = digest(source.as_bytes());
+        let size = u64::try_from(source.len()).expect("the short source fixture fits u64");
+        RunRecord {
+            version: VERSION,
+            context: ContextDigest {
+                target: Some("target".to_owned()),
+                config: Some("config".to_owned()),
+                environment: Some("environment".to_owned()),
+                ..ContextDigest::default()
+            },
+            files: vec![RecordedFile {
+                path: "src/lib.rs".into(),
+                package: "subject".to_owned(),
+                digest: digest.clone(),
+                size,
+                mutants: mutants
+                    .iter()
+                    .map(|mutant| Entry {
+                        id: mutant.id.clone(),
+                        outcome: mutant.outcome,
+                        compiler_reason: None,
+                        reusable: settled_verdict(mutant.outcome),
+                        killed_by: None,
+                        killer: None,
+                        killer_file: None,
+                        elapsed_ms: 0,
+                        suppression: None,
+                        site: None,
+                    })
+                    .collect(),
+            }],
+            population: Some(mutants.iter().map(|mutant| mutant.id.clone()).collect()),
+            inputs: serde_json::from_value(serde_json::json!({
+                "complete": true,
+                "files": [{ "path": "src/lib.rs", "digest": digest, "size": size }]
+            }))
+            .expect("the in-memory snapshot supplies a complete source file"),
+            compilation_roots: std::iter::once(("subject".to_owned(), vec![Utf8PathBuf::new()])).collect(),
+            ..RunRecord::default()
+        }
+    }
+
+    #[test]
+    fn name_filtered_campaign_retains_unselected_same_file_evidence() {
+        let source = "fn first() {} fn second() {}";
+        let selected = Mutant {
+            item_path: "subject::first".to_owned().into(),
+            ..mutant("selected", "src/lib.rs", Outcome::CompileError)
+        };
+        let unselected = Mutant {
+            item_path: "subject::second".to_owned().into(),
+            ..mutant("unselected", "src/lib.rs", Outcome::CompileError)
+        };
+        let selected_killer = Killer {
+            package: "subject".to_owned(),
+            target: "lib".to_owned(),
+            test: "tests::selected".to_owned(),
+        };
+        let unselected_killer = Killer {
+            test: "tests::unselected".to_owned(),
+            ..selected_killer.clone()
+        };
+        let mut earlier = memory_record(source, &[selected.clone(), unselected.clone()]);
+        let mut generalized = GeneralizedHints::empty_supported();
+        generalized.items.push(ItemHints {
+            file: "src/lib.rs".into(),
+            item: "second".to_owned(),
+            candidates: Vec::new(),
+        });
+        generalized.test_sets = vec![vec![unselected_killer.clone()]];
+        generalized.reach = vec![ReachCluster {
+            site: SiteIdentity::from_mutant(&unselected),
+            test_set: 0,
+        }];
+        earlier.replace_knowledge(
+            [
+                (selected.id.clone(), selected_killer),
+                (unselected.id.clone(), unselected_killer.clone()),
+            ]
+            .into_iter()
+            .collect(),
+            generalized.clone(),
+        );
+        let mut current = memory_record(
+            source,
+            &[Mutant {
+                outcome: Outcome::Survived,
+                ..selected.clone()
+            }],
+        );
+        let mut new_generalized = GeneralizedHints::empty_supported();
+        new_generalized.test_sets = vec![vec![unselected_killer.clone()]];
+        new_generalized.reach = vec![ReachCluster {
+            site: SiteIdentity::from_mutant(&selected),
+            test_set: 0,
+        }];
+        current.replace_knowledge(HashMap::default(), new_generalized);
+        let merged = current.absorbing(&earlier, true);
+        let entries = &merged
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("source record")
+            .mutants;
+
+        assert_eq!(
+            entries.iter().map(|entry| (&entry.id, entry.outcome)).collect::<Vec<_>>(),
+            [(&selected.id, Outcome::Survived), (&unselected.id, Outcome::CompileError)]
+        );
+        assert_eq!(merged.population, Some(vec![selected.id.clone()]));
+        assert!(
+            !merged.hints.contains_key(&selected.id),
+            "the new verdict clears stale selected learning"
+        );
+        assert_eq!(merged.hints.get(&unselected.id), Some(&unselected_killer));
+        assert_eq!(merged.generalized.items, generalized.items);
+        assert_eq!(merged.generalized.reach.len(), 2, "reach hints from both functions survive");
+
+        let full = current.absorbing(&earlier, false);
+        assert_eq!(
+            full.files
+                .iter()
+                .find(|file| file.path == "src/lib.rs")
+                .expect("source record")
+                .mutants
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn name_filtered_campaign_does_not_carry_same_file_outcomes_after_source_changes() {
+        let earlier = memory_record(
+            "fn first() {} fn second() {}",
+            &[mutant("unselected", "src/lib.rs", Outcome::CompileError)],
+        );
+
+        let current = memory_record(
+            "fn first() { 1; } fn second() {}",
+            &[mutant("selected", "src/lib.rs", Outcome::Survived)],
+        );
+        let merged = current.absorbing(&earlier, true);
+        let entries = &merged
+            .files
+            .iter()
+            .find(|file| file.path == "src/lib.rs")
+            .expect("source record")
+            .mutants;
+
+        assert_eq!(entries.iter().map(|entry| entry.id.as_ref()).collect::<Vec<_>>(), ["selected"]);
     }
 
     /// The denominator safety property behind fine-grained invalidation: a source edit that makes
@@ -3658,6 +4756,60 @@ mod tests {
     }
 
     #[test]
+    fn resume_requires_a_recorded_and_unchanged_inherited_environment() {
+        let before = [(b"SUBJECT_MODE".to_vec(), b"before".to_vec())];
+        let after = [(b"SUBJECT_MODE".to_vec(), b"after".to_vec())];
+        let mut saved = context_in(&plain(), None, &before).unwrap();
+        assert_eq!(environment_digest(&before), term(Term::Environment, &[b"SUBJECT_MODE", b"before"]));
+        saved.validate_environment(&environment_digest(&before)).unwrap();
+        let failure = saved.validate_environment(&environment_digest(&after)).unwrap_err();
+        assert!(failure.to_string().contains("restore the original environment"), "{failure}");
+        saved.environment = None;
+        let failure = saved.validate_environment(&environment_digest(&before)).unwrap_err();
+        assert!(
+            failure.to_string().contains("did not record its inherited environment"),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn environment_only_context_is_resumable_without_a_named_toolchain_but_not_reusable() {
+        let environment = [(b"SUBJECT_MODE".to_vec(), b"before".to_vec())];
+        assert!(
+            context_in(
+                &Context {
+                    toolchain: None,
+                    ..plain()
+                },
+                None,
+                &environment
+            )
+            .is_none(),
+            "an unknown compiler must still disable incremental reuse"
+        );
+        let saved = ContextDigest::from_environment(&environment);
+        let restored: ContextDigest = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(saved, restored);
+        assert!(restored.toolchain.is_empty());
+        restored.validate_environment(&environment_digest(&environment)).unwrap();
+        assert!(
+            restored
+                .validate_environment(&environment_digest(&[(b"SUBJECT_MODE".to_vec(), b"after".to_vec())]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn environment_digest_preserves_names_values_and_pair_order() {
+        let environment = [(b"FIRST".to_vec(), b"one".to_vec()), (b"SECOND".to_vec(), b"two".to_vec())];
+        assert_eq!(
+            environment_digest(&environment),
+            term(Term::Environment, &[b"FIRST", b"one", b"SECOND", b"two"]),
+        );
+        assert_eq!(environment_digest(&[]), term(Term::Environment, &[]));
+    }
+
+    #[test]
     fn resource_capacity_order_does_not_change_the_context() {
         let cargo = crate::exec::ResourceLimit::new("cargo", 2).expect("valid resource");
         let network = crate::exec::ResourceLimit::new("network", 1).expect("valid resource");
@@ -3718,7 +4870,6 @@ mod tests {
             include_tests: _it,
             exclude_tests: _et,
             test_workspace: _tw,
-            optimize_test_execution: _ote,
             whole_test_binaries: _wtb,
             nextest: _nx,
             cargo_test_args: _cta,
@@ -3819,13 +4970,6 @@ mod tests {
                 },
             ),
             ("library-only testing", Context { test_lib: true, ..plain() }),
-            (
-                "test execution optimization",
-                Context {
-                    optimize_test_execution: true,
-                    ..plain()
-                },
-            ),
             (
                 "whole test binaries",
                 Context {
@@ -3994,7 +5138,15 @@ mod tests {
         );
         assert_eq!(
             current.term(Term::Tool),
-            term(Term::Tool, &[env!("CARGO_PKG_VERSION").as_bytes(), &identity_version])
+            term(
+                Term::Tool,
+                &[
+                    env!("CARGO_PKG_VERSION").as_bytes(),
+                    &identity_version,
+                    b"compiler-evidence-policy",
+                    &COMPILER_EVIDENCE_POLICY_EPOCH.to_le_bytes(),
+                ]
+            )
         );
     }
 

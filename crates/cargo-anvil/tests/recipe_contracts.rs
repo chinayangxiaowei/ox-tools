@@ -10,7 +10,7 @@
     reason = "panic-on-failure idioms are appropriate in tests"
 )]
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
@@ -160,9 +160,7 @@ fn developer_options_are_explicit_and_cloud_defaults_stay_non_interactive() {
     assert!(BUILD.contains("anvil-build package=\"\" profile=\"\""));
     assert!(BUILD.contains("--all-features --all-targets --locked"));
     assert!(DOC_BUILD.contains("[arg(\"open\", long, value=\"true\")]"));
-    assert!(EXAMPLES.contains("[arg(\"run\", long, value=\"true\")]"));
     assert!(EXAMPLES.contains(".'no-run'"));
-    assert!(EXAMPLES.contains("if (-not $run) { exit 0 }"));
     assert!(FMT.contains("[arg(\"fix\", long, value=\"true\")]"));
     assert!(MIRI.contains("[arg(\"test\", long"));
     assert!(MIRI.contains("[arg(\"example\", long"));
@@ -399,24 +397,6 @@ if ($args -contains 'semver-checks') {
 if ($args -contains 'bolero' -and $args -contains 'list') {
     exit [int]$env:FAKE_BOLERO_LIST_EXIT
 }
-if ($args -contains 'llvm-cov' -and $args -contains 'report' -and $env:FAKE_LLVM_COV_REPORT_206) {
-    $quote = if ($env:FAKE_LLVM_COV_SINGLE_QUOTES) { [char]39 } else { [char]34 }
-    $arguments = if ($env:FAKE_LLVM_COV_SINGLE_QUOTES) {
-        "'-format=lcov' '-instr-profile=fake.profdata' '-object' 'fake-object.exe'"
-    } else {
-        '-format=lcov -instr-profile=fake.profdata -object fake-object.exe'
-    }
-    $command = "$quote$($env:FAKE_LLVM_COV_PATH)$quote export $arguments"
-    if ($env:FAKE_LLVM_COV_MULTILINE) {
-        $objectArgument = if ($env:FAKE_LLVM_COV_SINGLE_QUOTES) { " '-object'" } else { ' -object' }
-        $command = $command.Replace($objectArgument, "`n$($objectArgument.TrimStart())")
-    }
-    Write-Output (
-        "error: failed to generate report: could not execute process $([char]96)$command$([char]96) " +
-        "(never executed): The filename or extension is too long. (os error 206)"
-    )
-    exit 1
-}
 if ($args -contains 'nextest') {
     if ($env:FAKE_NEXTEST_EXIT -eq '4' -and $args -contains '--no-tests=pass') {
         exit 0
@@ -502,7 +482,7 @@ fn fixture(imports: &[(&str, &str)], dependency_recipes: &[&str]) -> TempDir {
         justfile.push_str(
             r#"
 [script("pwsh", "-NoProfile")]
-_anvil-impact-include tier:
+_anvil-impact-exclude tier:
     Write-Output $(if ($env:FAKE_INCLUDE) { $env:FAKE_INCLUDE } else { '--workspace' })
 
 "#,
@@ -576,6 +556,105 @@ exit 0
     tmp
 }
 
+struct RecipeDeclaration<'a> {
+    visibility: Vec<&'a str>,
+    signature: String,
+}
+
+fn declared_anvil_recipes(catalog: &cargo_anvil::Catalog) -> BTreeMap<&str, RecipeDeclaration<'_>> {
+    let mut recipes = BTreeMap::new();
+    for artifact in catalog.artifacts() {
+        let cargo_anvil::Artifact::OwnedFile(spec) = artifact else {
+            continue;
+        };
+        if !spec.path.starts_with("justfiles/anvil/") {
+            continue;
+        }
+        let lines: Vec<_> = spec.body.lines().collect();
+        for (index, line) in lines.iter().enumerate().filter(|(_, line)| line.starts_with("anvil-")) {
+            let name = line.split([' ', ':']).next().unwrap();
+            let visibility = lines[..index]
+                .iter()
+                .rev()
+                .take_while(|line| line.starts_with('['))
+                .copied()
+                .filter(|line| *line == "[private]" || line.starts_with("[group("))
+                .collect();
+            let mut end = index;
+            while lines[end].ends_with('\\') {
+                end += 1;
+            }
+            let signature = lines[index..=end].join("\n");
+            assert!(
+                recipes.insert(name, RecipeDeclaration { visibility, signature }).is_none(),
+                "duplicate recipe declaration: {name}"
+            );
+        }
+    }
+    recipes
+}
+
+#[test]
+fn generated_recipe_visibility_exposes_only_grouped_public_entry_points() {
+    let catalog = cargo_anvil::Catalog::anvil();
+    let recipes = declared_anvil_recipes(&catalog);
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
+    for (name, recipe) in &recipes {
+        if !recipe.visibility.contains(&"[private]") {
+            groups.entry(&recipe.visibility).or_default().push(*name);
+        }
+    }
+    let surface = groups
+        .iter()
+        .map(|(attributes, names)| format!("{}\n{}", attributes.join("\n"), names.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        surface.lines().collect::<Vec<_>>(),
+        include_str!("fixtures/recipe-public-surface.txt").lines().collect::<Vec<_>>()
+    );
+
+    let aliases: Vec<_> = catalog
+        .artifacts()
+        .iter()
+        .filter_map(|artifact| match artifact {
+            cargo_anvil::Artifact::OwnedFile(spec) if spec.path.starts_with("justfiles/anvil/") => Some(&spec.body),
+            _ => None,
+        })
+        .flat_map(|body| body.lines().filter(|line| line.starts_with("alias ")))
+        .collect();
+    assert_eq!(aliases, ["alias anvil := anvil-pr"]);
+    assert_eq!(recipes["anvil-pr"].visibility, ["[group(\"anvil\")]"]);
+}
+
+#[test]
+fn private_prerequisite_recipes_preserve_their_definitions() {
+    let catalog = cargo_anvil::Catalog::anvil();
+    let recipes = declared_anvil_recipes(&catalog);
+    let mut signatures = Vec::new();
+    for recipe in [
+        "anvil-build-setup",
+        "anvil-clippy-setup",
+        "anvil-pr-fast-setup",
+        "anvil-pr-setup",
+        "anvil-tool-cargo-audit-install",
+        "anvil-component-default-clippy-install",
+        "anvil-toolchain-stable-install",
+        "anvil-clippy-validate-prereqs",
+        "anvil-pr-fast-validate-prereqs",
+        "anvil-pr-validate-prereqs",
+        "anvil-tool-cargo-audit-validate-prereqs",
+    ] {
+        let declaration = &recipes[recipe];
+        assert_eq!(declaration.visibility, ["[private]"], "{recipe}");
+        signatures.push(declaration.signature.as_str());
+    }
+    assert_eq!(
+        signatures.join("\n\n").lines().collect::<Vec<_>>(),
+        include_str!("fixtures/recipe-private-definitions.txt").lines().collect::<Vec<_>>()
+    );
+}
+
 /// `anvil-container-tag` resolves the declared root MSRV through
 /// `_anvil-resolve-stable`, which the container fixtures do not import. Stubbing
 /// it keeps them focused on the digest, and lets a case vary the value the tag
@@ -616,6 +695,8 @@ fn just_command(root: &Path, arguments: &[&str], environment: &[(&str, &OsStr)])
     // or output-backend markers from the process running the test suite. Tests
     // that exercise those contracts pass the relevant values explicitly.
     command.env_remove("ANVIL_IMPACT");
+    command.env_remove("ANVIL_IMPACT_INPUT_DIR");
+    command.env_remove("ANVIL_IN_CONTAINER");
     command.env_remove("ANVIL_MIRI_JOBS");
     command.env_remove("GITHUB_ACTIONS");
     command.env_remove("TF_BUILD");
@@ -749,9 +830,11 @@ fn all_targets_checks_packages_in_both_configurations_and_preserves_exit_codes()
         assert_eq!(
             fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
             [
-                format!("+stable-test each {selection} --keep-going -- cargo +stable-test check --package {{spec}} --all-targets --locked"),
                 format!(
-                    "+stable-test each {selection} --keep-going -- cargo +stable-test check --package {{spec}} --all-targets --no-default-features --locked"
+                    "+stable-test each {selection} --keep-going -- cargo +stable-test check --package {{cargo-spec}} --all-targets --locked"
+                ),
+                format!(
+                    "+stable-test each {selection} --keep-going -- cargo +stable-test check --package {{cargo-spec}} --all-targets --no-default-features --locked"
                 ),
             ],
             "both configurations must check packages independently, with both Cargo processes selecting stable"
@@ -788,8 +871,8 @@ fn all_targets_checks_packages_in_both_configurations_and_preserves_exit_codes()
     assert_eq!(
         fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
         [
-            "+stable-test each --workspace --keep-going -- cargo +stable-test check --package {spec} --all-targets --locked",
-            "+stable-test each --workspace --keep-going -- cargo +stable-test check --package {spec} --all-targets --no-default-features --locked",
+            "+stable-test each --workspace --keep-going -- cargo +stable-test check --package {cargo-spec} --all-targets --locked",
+            "+stable-test each --workspace --keep-going -- cargo +stable-test check --package {cargo-spec} --all-targets --no-default-features --locked",
         ]
     );
 }
@@ -1090,12 +1173,13 @@ fn miri_runner_preserves_impact_filtering() {
         tmp.path(),
         &["anvil-miri-tree-borrows"],
         &[
-            ("FAKE_INCLUDE", OsStr::new("--package fixture@0.1.0 --package excluded@0.1.0")),
+            ("FAKE_INCLUDE", OsStr::new("--workspace --exclude other")),
             ("FAKE_CARGO_LOG", cargo_log.as_os_str()),
             ("FAKE_MIRI_ARTIFACTS", OsStr::new(artifacts)),
             ("FAKE_MIRI_RUN_LOG", run_log.as_os_str()),
             ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("excluded")),
             ("FAKE_SECOND_MIRI_EXCLUDE", OsStr::new("1")),
+            ("FAKE_THIRD_PACKAGE_NAME", OsStr::new("other")),
         ],
     );
 
@@ -1111,12 +1195,8 @@ fn miri_runner_preserves_impact_filtering() {
         .find(|call| call.contains("miri test"))
         .expect("the profile must compile its selected Miri targets");
     assert!(
-        build_call.contains("--package fixture@0.1.0"),
-        "impact-selected included packages must be forwarded:\n{build_call}"
-    );
-    assert!(
-        !build_call.contains("excluded@0.1.0"),
-        "impact-selected opted-out packages must be filtered:\n{build_call}"
+        build_call.ends_with("--workspace --exclude other --exclude excluded"),
+        "impact exclusions must be forwarded and opted-out packages added:\n{build_call}"
     );
 }
 
@@ -1207,8 +1287,9 @@ fn miri_runner_handles_no_work_and_aggregates_failures() {
         tmp.path(),
         &["_anvil-miri-test", "standard"],
         &[
-            ("FAKE_INCLUDE", OsStr::new("--package fixture@0.1.0")),
+            ("FAKE_INCLUDE", OsStr::new("--workspace --exclude other")),
             ("FAKE_MIRI_EXCLUDE", OsStr::new("1")),
+            ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("other")),
         ],
     );
     assert!(all_excluded.status.success());
@@ -1329,7 +1410,7 @@ fn msrv_test_propagates_nested_just_failures() {
         return;
     }
     let helper_recipes = "\n[script(\"pwsh\", \"-NoProfile\")]\n\
-         _anvil-impact-include tier:\n\
+         _anvil-impact-exclude tier:\n\
          \x20   if ($env:FAKE_IMPACT_HELPER_OUTPUT) { Write-Output $env:FAKE_IMPACT_HELPER_OUTPUT }\n\
          \x20   exit [int]$env:FAKE_IMPACT_HELPER_EXIT\n\
          \n[script(\"pwsh\", \"-NoProfile\")]\n\
@@ -1364,10 +1445,16 @@ fn msrv_test_propagates_nested_just_failures() {
         &["anvil-msrv-test"],
         &[
             ("FAKE_IMPACT_HELPER_EXIT", OsStr::new("31")),
+            ("FAKE_RESOLVER_OUTPUT", OsStr::new("test-msrv")),
             ("FAKE_CARGO_LOG", cargo_log.as_os_str()),
         ],
     );
     assert_failed(&impact_failure, "failed impact helper");
+    assert_eq!(
+        impact_failure.status.code(),
+        Some(31),
+        "the impact helper's exit code must propagate"
+    );
     assert!(
         fs::read_to_string(&cargo_log).unwrap_or_default().is_empty(),
         "Cargo must not run after impact helper failure"
@@ -1383,9 +1470,34 @@ fn msrv_test_propagates_nested_just_failures() {
         ],
     );
     assert_failed(&resolver_failure, "failed MSRV resolver");
+    assert_eq!(
+        resolver_failure.status.code(),
+        Some(32),
+        "the MSRV resolver's exit code must propagate"
+    );
+    assert!(
+        fs::read_to_string(&cargo_log).unwrap_or_default().is_empty(),
+        "Cargo must not run after resolver failure"
+    );
+
+    let no_msrv = run_just(
+        tmp.path(),
+        &["anvil-msrv-test"],
+        &[
+            ("FAKE_IMPACT_HELPER_EXIT", OsStr::new(ARBITRARY_FAILURE_EXIT)),
+            ("FAKE_METADATA_EXIT", OsStr::new(ARBITRARY_FAILURE_EXIT)),
+            ("FAKE_CARGO_LOG", cargo_log.as_os_str()),
+        ],
+    );
+    assert!(
+        no_msrv.status.success(),
+        "missing MSRV must skip even when package discovery is unavailable:\n{}",
+        String::from_utf8_lossy(&no_msrv.stderr)
+    );
+    assert!(String::from_utf8_lossy(&no_msrv.stdout).contains("no root MSRV declared; skipping"));
     assert!(
         fs::read_to_string(cargo_log).unwrap_or_default().is_empty(),
-        "Cargo must not run after resolver failure"
+        "missing MSRV must skip before any Cargo invocation"
     );
 }
 
@@ -1547,6 +1659,106 @@ fn the_image_names_its_default_toolchain() {
         "the MSRV is read from the root manifest, so the default must be set before the setup \
          deletes it"
     );
+}
+
+#[test]
+fn container_rejects_impact_input_override_only_in_consume_mode() {
+    if !tools_available() {
+        return;
+    }
+    let _powershell = powershell_process_lock();
+    let tmp = fixture(&[("container.just", CONTAINER)], &[]);
+    let root = tmp.path();
+    let justfile_path = root.join("Justfile");
+    let mut justfile = fs::read_to_string(&justfile_path).unwrap();
+    justfile.push_str(
+        r#"
+[script("pwsh", "-NoProfile")]
+_anvil-container-engine:
+    Write-Output $env:FAKE_CONTAINER_ENGINE
+
+[script("pwsh", "-NoProfile")]
+_anvil-container-image:
+    Write-Output 'example.invalid/anvil:test'
+
+[script("pwsh", "-NoProfile")]
+_anvil-container-path path:
+    Write-Output '{{path}}'
+"#,
+    );
+    write(&justfile_path, &justfile);
+
+    let engine = root.join("fake-container-engine.ps1");
+    write(
+        &engine,
+        r#"
+($args -join "`n") | Set-Content -LiteralPath $env:FAKE_CONTAINER_LOG
+exit 0
+"#,
+    );
+    let engine_log = root.join("container-engine.log");
+    let input = TempDir::new().unwrap();
+
+    let run = |mode: Option<&str>, input_override: &OsStr| {
+        let mut command = just_command(
+            root,
+            &["anvil-container", "echo", "ok"],
+            &[
+                ("ANVIL_IMPACT_INPUT_DIR", input_override),
+                ("FAKE_CONTAINER_ENGINE", engine.as_os_str()),
+                ("FAKE_CONTAINER_LOG", engine_log.as_os_str()),
+            ],
+        );
+        if let Some(mode) = mode {
+            command.env("ANVIL_IMPACT", mode);
+        }
+        command.output().expect("just is required to verify generated recipe behavior")
+    };
+
+    let consume = run(Some("consume"), input.path().as_os_str());
+    assert_failed(&consume, "running a container with an injected consume cache");
+    let consume_stderr = String::from_utf8_lossy(&consume.stderr);
+    assert!(
+        consume_stderr.contains("ANVIL_IMPACT=consume")
+            && consume_stderr.contains("ANVIL_IMPACT_INPUT_DIR")
+            && consume_stderr.contains("cannot honor"),
+        "the refusal must identify the unsupported consume override\nstderr:\n{consume_stderr}"
+    );
+    assert!(
+        !engine_log.exists(),
+        "consume mode must reject the override before invoking the container engine"
+    );
+
+    for (mode, input_override) in [
+        (Some("off"), input.path().as_os_str()),
+        (None, input.path().as_os_str()),
+        (Some("consume"), OsStr::new("")),
+    ] {
+        let output = run(mode, input_override);
+        assert!(
+            output.status.success(),
+            "an ignored or empty impact-cache override must not block container execution in mode {mode:?} with input {input_override:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let arguments = fs::read_to_string(&engine_log).unwrap();
+        let args: Vec<_> = arguments.lines().collect();
+        let forwards_impact = args.windows(2).any(|pair| pair == ["-e", "ANVIL_IMPACT"]);
+        assert_eq!(
+            forwards_impact,
+            mode.is_some(),
+            "unexpected impact-mode forwarding for {mode:?}:\n{arguments}"
+        );
+        assert!(
+            !arguments.contains("ANVIL_IMPACT_INPUT_DIR"),
+            "the host-only cache path must never be forwarded to the container engine:\n{arguments}"
+        );
+        assert!(
+            !arguments.contains(input.path().to_string_lossy().as_ref()),
+            "the impact-cache host path must never be forwarded to the container engine:\n{arguments}"
+        );
+        fs::remove_file(&engine_log).unwrap();
+    }
 }
 
 /// `anvil-setup` must not reach workspace MSRV validation: the image runs it
@@ -1848,6 +2060,8 @@ fn bolero_discovery_failure_propagates() {
             "anvil-tool-cargo-bolero-validate-prereqs",
             "anvil-toolchain-nightly-install",
             "anvil-tool-cargo-bolero-install installer",
+            "anvil-tool-cargo-each-validate-prereqs",
+            "anvil-tool-cargo-each-install installer",
             "anvil-impact",
         ],
     );
@@ -1856,10 +2070,15 @@ fn bolero_discovery_failure_propagates() {
     let output = run_just(
         tmp.path(),
         &["anvil-bolero"],
-        &[("FAKE_BOLERO_LIST_EXIT", OsStr::new("9")), ("FAKE_CARGO_LOG", log.as_os_str())],
+        &[("FAKE_EACH_EXIT", OsStr::new("9")), ("FAKE_CARGO_LOG", log.as_os_str())],
     );
 
     assert_failed(&output, "cargo bolero target discovery failure");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("target discovery failed for package 'fixture@0.1.0'"),
+        "the failure must come from target discovery:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1882,6 +2101,8 @@ fn bolero_full_workspace_discovery_enumerates_every_member() {
             "anvil-tool-cargo-bolero-validate-prereqs",
             "anvil-toolchain-nightly-install",
             "anvil-tool-cargo-bolero-install installer",
+            "anvil-tool-cargo-each-validate-prereqs",
+            "anvil-tool-cargo-each-install installer",
             "anvil-impact",
         ],
     );
@@ -1916,11 +2137,11 @@ fn bolero_full_workspace_discovery_enumerates_every_member() {
         "full-workspace discovery must enumerate members via `cargo metadata`, got:\n{calls}"
     );
     assert!(
-        calls.contains("bolero list --profile release --package fixture"),
+        calls.contains("each --package fixture@0.1.0 -- cargo +nightly-test bolero list --profile release --package {cargo-spec}"),
         "the first workspace member must be discovered, got:\n{calls}"
     );
     assert!(
-        calls.contains("bolero list --profile release --package other-package"),
+        calls.contains("each --package other-package@0.1.0 -- cargo +nightly-test bolero list --profile release --package {cargo-spec}"),
         "every workspace member must be discovered, not just the first, got:\n{calls}"
     );
     assert!(
@@ -2143,6 +2364,8 @@ fn metadata_consuming_checks_fail_when_discovery_fails() {
                 "anvil-toolchain-nightly-external-types-validate-prereqs",
                 "anvil-tool-cargo-check-external-types-install installer",
                 "anvil-toolchain-nightly-external-types-install",
+                "anvil-tool-cargo-each-validate-prereqs",
+                "anvil-tool-cargo-each-install installer",
                 "anvil-impact",
             ][..],
         ),
@@ -2155,6 +2378,26 @@ fn metadata_consuming_checks_fail_when_discovery_fails() {
     ] {
         let tmp = fixture(&[(recipe_file, contents), ("impact.just", IMPACT)], dependencies);
         seed_include(tmp.path(), "affected", "--package fixture@0.1.0");
+        if recipe == "anvil-external-types" {
+            let cargo_log = tmp.path().join("cargo.log");
+            let output = run_just(
+                tmp.path(),
+                &[recipe],
+                &[
+                    ("FAKE_EACH_EXIT", OsStr::new(ARBITRARY_FAILURE_EXIT)),
+                    ("FAKE_CARGO_LOG", cargo_log.as_os_str()),
+                ],
+            );
+            assert_failed(&output, "external-types cargo-each discovery failure");
+            assert!(
+                fs::read_to_string(cargo_log)
+                    .unwrap()
+                    .contains("each --package fixture@0.1.0 --filter lib --keep-going -- cargo +nightly-test check-external-types --manifest-path {manifest}"),
+                "external-types must reach its cargo-each invocation"
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("anvil-external-types: failed."));
+            continue;
+        }
         let output = run_just(tmp.path(), &[recipe], &[("FAKE_METADATA_EXIT", OsStr::new(ARBITRARY_FAILURE_EXIT))]);
         assert_failed(&output, &format!("{recipe} cargo metadata failure"));
         if recipe == "anvil-doc-test" {
@@ -2305,7 +2548,9 @@ fn miri_target_options_preserve_the_default_and_select_examples_explicitly() {
         &["anvil-miri"],
         &[
             ("FAKE_CARGO_LOG", log.as_os_str()),
-            ("FAKE_INCLUDE", OsStr::new("--package fixture@0.1.0")),
+            ("FAKE_INCLUDE", OsStr::new("--workspace --exclude other-package")),
+            ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("other-package")),
+            ("FAKE_SECOND_PACKAGE_DIR_LEAF", OsStr::new("other-package")),
         ],
     );
     assert!(
@@ -2338,7 +2583,7 @@ fn miri_target_options_preserve_the_default_and_select_examples_explicitly() {
     let commands = fs::read_to_string(log).unwrap();
     assert!(
         commands.contains(
-            "+nightly-test miri test --all-features --tests --no-run --message-format=json-render-diagnostics --package fixture@0.1.0"
+            "+nightly-test miri test --all-features --tests --no-run --message-format=json-render-diagnostics --workspace --exclude other-package"
         ),
         "default Miri target selection was not preserved:\n{commands}"
     );
@@ -2360,7 +2605,7 @@ fn miri_target_options_preserve_the_default_and_select_examples_explicitly() {
 }
 
 #[test]
-fn examples_run_honors_default_exclusions_and_explicit_selection() {
+fn examples_skip_when_no_packages_are_affected() {
     if !tools_available() {
         return;
     }
@@ -2372,8 +2617,43 @@ fn examples_run_honors_default_exclusions_and_explicit_selection() {
             "anvil-impact",
         ],
     );
+    seed_include(tmp.path(), "affected", "--skip");
+    let log = tmp.path().join("cargo.log");
+    let output = run_just(
+        tmp.path(),
+        &["anvil-examples"],
+        &[("ANVIL_IMPACT", OsStr::new("consume")), ("FAKE_CARGO_LOG", log.as_os_str())],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "empty example selection failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace("\r\n", "\n"),
+        "anvil-examples: no affected packages; skipping\n"
+    );
+    assert!(
+        !log.exists(),
+        "an empty selection must not invoke Cargo for build, metadata, or execution"
+    );
+}
+
+/// Creates a two-package workspace for example-selection tests.
+///
+/// The root package excludes `blocked` and `sleeping` from default execution.
+fn examples_workspace() -> TempDir {
+    let workspace = fixture(
+        &[("examples.just", EXAMPLES), ("impact.just", IMPACT)],
+        &[
+            "anvil-tool-rustc-validate-prereqs",
+            "anvil-toolchain-stable-install",
+            "anvil-impact",
+        ],
+    );
     write(
-        &tmp.path().join("Cargo.toml"),
+        &workspace.path().join("Cargo.toml"),
         r#"[package]
 name = "fixture"
 version = "0.1.0"
@@ -2381,61 +2661,133 @@ edition = "2024"
 
 [package.metadata.anvil.examples]
 no-run = ["blocked", "sleeping"]
+
+[workspace]
+members = ["other"]
 "#,
     );
-    write(&tmp.path().join("src/lib.rs"), "");
-    write(
-        &tmp.path().join("examples/ok.rs"),
-        r#"fn main() {
+    write(&workspace.path().join("src/lib.rs"), "");
+    let example = r#"fn main() {
     assert_eq!(std::env::var("ANVIL_EXAMPLE").as_deref(), Ok("1"));
-    std::fs::write("example-ran", "yes").unwrap();
+    println!("example-ran: {}", env!("CARGO_PKG_NAME"));
 }
-"#,
-    );
-    write(&tmp.path().join("examples/blocked.rs"), "fn main() { std::process::exit(7); }\n");
+"#;
+    write(&workspace.path().join("examples/ok.rs"), example);
     write(
-        &tmp.path().join("examples/sleeping.rs"),
+        &workspace.path().join("examples/blocked.rs"),
+        "fn main() { std::process::exit(7); }\n",
+    );
+    write(
+        &workspace.path().join("examples/sleeping.rs"),
         "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n",
     );
+    write(
+        &workspace.path().join("other/Cargo.toml"),
+        "[package]\nname = \"other\"\nversion = \"0.2.0\"\nedition = \"2024\"\n",
+    );
+    write(&workspace.path().join("other/examples/other.rs"), example);
     let lock = Command::new("cargo")
         .arg("generate-lockfile")
-        .current_dir(tmp.path())
+        .current_dir(workspace.path())
         .output()
         .expect("cargo is required to prepare the example fixture");
     assert!(lock.status.success(), "failed to create fixture lockfile");
-    seed_include(tmp.path(), "affected", "--workspace");
+    workspace
+}
 
-    let default_run = run_just_with_real_cargo(tmp.path(), &["anvil-examples", "--run"]);
-    assert!(
-        default_run.status.success(),
-        "default example run failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&default_run.stdout),
-        String::from_utf8_lossy(&default_run.stderr)
-    );
-    assert_eq!(
-        fs::read_to_string(tmp.path().join("example-ran")).unwrap(),
-        "yes",
-        "the runnable example must execute with ANVIL_EXAMPLE=1"
-    );
+/// Cached impact scope selects packages, while explicit `--package` overrides it,
+/// including when the affected set is empty (`--skip`).
+#[test]
+fn examples_run_eligible_examples_in_selected_packages() {
+    if !tools_available() {
+        return;
+    }
+    let workspace = examples_workspace();
+    let target = workspace.path().join("target");
+    for (scope, arguments, expected) in [
+        ("--workspace", &["anvil-examples"][..], &["fixture", "other"][..]),
+        ("--package fixture@0.1.0", &["anvil-examples"], &["fixture"]),
+        (
+            "--package fixture@0.1.0 --package other@0.2.0",
+            &["anvil-examples"],
+            &["fixture", "other"],
+        ),
+        ("--skip", &["anvil-examples"], &[]),
+        ("--package other@0.2.0", &["anvil-examples", "--package", "fixture"], &["fixture"]),
+        ("--skip", &["anvil-examples", "--package", "fixture"], &["fixture"]),
+    ] {
+        seed_include(workspace.path(), "affected", scope);
+        let output = run_just_with_real_cargo_env(
+            workspace.path(),
+            arguments,
+            &[("ANVIL_IMPACT", OsStr::new("consume")), ("CARGO_TARGET_DIR", target.as_os_str())],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "example run failed for scope {scope:?} and arguments {arguments:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut actual = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("example-ran: "))
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "wrong examples executed for scope {scope:?} and arguments {arguments:?}"
+        );
+    }
+}
+
+/// Reporting the excluded example's exit code proves explicit selection ran it despite `no-run`.
+#[test]
+fn examples_explicit_selection_overrides_no_run() {
+    if !tools_available() {
+        return;
+    }
+    let workspace = examples_workspace();
     let explicit = run_just_with_real_cargo(
-        tmp.path(),
-        &["anvil-examples", "--run", "--package", "fixture", "--example", "blocked"],
+        workspace.path(),
+        &["anvil-examples", "--package", "fixture", "--example", "blocked"],
     );
     assert_failed(&explicit, "explicitly selected excluded example");
+    assert!(
+        String::from_utf8_lossy(&explicit.stderr).contains("fixture::blocked exited with code 7"),
+        "the explicitly selected example must run despite no-run\nstderr:\n{}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+}
 
-    let started = std::time::Instant::now();
-    let timeout = run_just_with_real_cargo(
-        tmp.path(),
-        &[
-            "anvil-examples",
-            "--run",
+/// An example exceeding its execution timeout must be terminated and identified in the diagnostic.
+#[test]
+fn examples_timeout_terminates_example() {
+    if !tools_available() {
+        return;
+    }
+    let workspace = examples_workspace();
+    // Build first so the elapsed-time bound measures the timeout, not compilation.
+    let build = Command::new("cargo")
+        .args([
+            "build",
             "--package",
             "fixture",
             "--example",
             "sleeping",
-            "--timeout",
-            "1",
-        ],
+            "--all-features",
+            "--locked",
+        ])
+        .current_dir(workspace.path())
+        .output()
+        .expect("cargo is required to prepare the example fixture");
+    assert!(build.status.success(), "failed to build the sleeping example");
+
+    let started = std::time::Instant::now();
+    let timeout = run_just_with_real_cargo(
+        workspace.path(),
+        &["anvil-examples", "--package", "fixture", "--example", "sleeping", "--timeout", "1"],
     );
     assert_failed(&timeout, "sleeping example timeout");
     assert!(
@@ -2491,7 +2843,13 @@ fn doc_test_selects_only_doctest_capable_affected_packages() {
     let output = run_just(
         tmp.path(),
         &["anvil-doc-test"],
-        &[("ANVIL_IMPACT", OsStr::new("consume")), ("FAKE_CARGO_LOG", log.as_os_str())],
+        &[
+            ("ANVIL_IMPACT", OsStr::new("consume")),
+            ("FAKE_CARGO_LOG", log.as_os_str()),
+            ("FAKE_PACKAGE_NAME", OsStr::new("Foo")),
+            ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("foo")),
+            ("FAKE_THIRD_PACKAGE_NAME", OsStr::new("macro-package")),
+        ],
     );
     assert!(
         output.status.success(),
@@ -2500,11 +2858,11 @@ fn doc_test_selects_only_doctest_capable_affected_packages() {
         String::from_utf8_lossy(&output.stderr)
     );
     let commands = fs::read_to_string(&log).unwrap();
-    assert_exact_doc_test_commands(&commands, "--package Foo@0.1.0 --package macro-package@0.1.0");
+    assert_exact_doc_test_commands(&commands, "--workspace --exclude foo");
     assert_eq!(
-        commands.lines().count(),
-        2,
-        "a consumed impact projection must launch only the two doctest Cargo children and no metadata process:\n{commands}"
+        commands.lines().filter(|line| line.starts_with("metadata ")).collect::<Vec<_>>(),
+        ["metadata --locked --no-deps --format-version 1"],
+        "a consumed impact projection needs only the member query that builds the exclude list:\n{commands}"
     );
 
     fs::remove_file(&log).unwrap();
@@ -2561,16 +2919,11 @@ fn doc_test_workspace_scope_enumerates_only_doctest_capable_members() {
         String::from_utf8_lossy(&output.stderr)
     );
     let commands = fs::read_to_string(&log).unwrap();
-    assert_exact_doc_test_commands(&commands, "--package Foo@0.1.0 --package macro-package@0.1.0");
-    assert!(
-        !commands.lines().any(|line| line.contains("--package outside@0.1.0")),
-        "workspace selection must exclude doctest-capable non-members:\n{commands}"
-    );
+    assert_exact_doc_test_commands(&commands, "--workspace --exclude foo");
     let metadata_commands = commands.lines().filter(|line| line.starts_with("metadata ")).collect::<Vec<_>>();
     assert_eq!(
-        metadata_commands,
-        ["metadata --locked --no-deps --format-version 1"],
-        "unscoped capability discovery must issue exactly one locked metadata query:\n{commands}"
+        metadata_commands, ["metadata --locked --no-deps --format-version 1"; 2],
+        "unscoped runs issue one locked query for capability discovery and one for the exclude list:\n{commands}"
     );
 }
 
@@ -2612,7 +2965,7 @@ fn doc_test_locked_capability_discovery_rejects_a_stale_lockfile() {
 }
 
 #[test]
-fn external_types_checks_every_library_including_non_publishable_ones() {
+fn external_types_runs_once_per_library_through_cargo_each() {
     if !tools_available() {
         return;
     }
@@ -2623,22 +2976,14 @@ fn external_types_checks_every_library_including_non_publishable_ones() {
             "anvil-toolchain-nightly-external-types-validate-prereqs",
             "anvil-tool-cargo-check-external-types-install installer",
             "anvil-toolchain-nightly-external-types-install",
+            "anvil-tool-cargo-each-validate-prereqs",
+            "anvil-tool-cargo-each-install installer",
             "anvil-impact",
         ],
     );
     seed_include(tmp.path(), "affected", "--workspace");
     let log = tmp.path().join("cargo.log");
-    let output = run_just(
-        tmp.path(),
-        &["anvil-external-types"],
-        &[
-            ("FAKE_CARGO_LOG", log.as_os_str()),
-            ("FAKE_PUBLISH_FALSE", OsStr::new("1")),
-            ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("public-default")),
-            ("FAKE_SECOND_PACKAGE_DIR_LEAF", OsStr::new("public-default")),
-            ("FAKE_THIRD_PACKAGE_NAME", OsStr::new("named-registry")),
-        ],
-    );
+    let output = run_just(tmp.path(), &["anvil-external-types"], &[("FAKE_CARGO_LOG", log.as_os_str())]);
     assert!(
         output.status.success(),
         "library selection failed\nstdout:\n{}\nstderr:\n{}",
@@ -2646,29 +2991,12 @@ fn external_types_checks_every_library_including_non_publishable_ones() {
         String::from_utf8_lossy(&output.stderr)
     );
     let commands = fs::read_to_string(log).unwrap();
-    assert!(commands.contains("metadata --no-deps --format-version 1"));
-    let expected_manifests = [
-        tmp.path().join("Cargo.toml").to_string_lossy().into_owned(),
-        tmp.path()
-            .join("nested")
-            .join("public-default")
-            .join("Cargo.toml")
-            .to_string_lossy()
-            .into_owned(),
-        tmp.path()
-            .join("nested")
-            .join("named-registry")
-            .join("Cargo.toml")
-            .to_string_lossy()
-            .into_owned(),
-    ];
+    // cargo-each selects every library member, publishable or not, and
+    // passes the tool each member's manifest path.
     assert_eq!(
-        commands
-            .lines()
-            .filter_map(|command| { command.strip_prefix("+nightly-test check-external-types --manifest-path ") })
-            .map(str::to_owned)
-            .collect::<HashSet<_>>(),
-        expected_manifests.into_iter().collect()
+        commands.lines().collect::<Vec<_>>(),
+        ["each --workspace --filter lib --keep-going -- cargo +nightly-test check-external-types --manifest-path {manifest}"],
+        "external-types must run once per library through cargo-each:\n{commands}"
     );
 }
 
@@ -2741,264 +3069,41 @@ fn semver_includes_libraries_restricted_to_named_registries() {
 }
 
 #[test]
-fn all_coverage_opted_out_packages_run_both_test_configurations() {
-    if !tools_available() {
-        return;
+fn coverage_recipe_delegation_contract_is_exact() {
+    let normalized = LLVM_COV.replace("\r\n", "\n");
+    let start = normalized
+        .find("anvil-llvm-cov: anvil-llvm-cov-validate-prereqs anvil-impact\n")
+        .expect("coverage recipe declaration");
+    let end = normalized.find("# --- pr-test members").expect("coverage recipe footer");
+    let actual = &normalized[start..end];
+    let expected = r#"anvil-llvm-cov: anvil-llvm-cov-validate-prereqs anvil-impact
+    $ErrorActionPreference = 'Stop'
+    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
+    $impactExit = $LASTEXITCODE
+    if ($impactExit -ne 0) { exit $impactExit }
+    if ($include -eq '--skip') {
+        Write-Host 'anvil-llvm-cov: no affected packages; skipping'
+        exit 0
     }
-    let tmp = fixture(
-        &[("llvm-cov.just", LLVM_COV), ("impact.just", IMPACT)],
-        &[
-            "anvil-component-nightly-llvm-tools-validate-prereqs",
-            "anvil-tool-cargo-llvm-cov-validate-prereqs",
-            "anvil-tool-cargo-nextest-validate-prereqs",
-            "anvil-tool-cargo-coverage-gate-validate-prereqs",
-            "anvil-component-nightly-llvm-tools-install",
-            "anvil-tool-cargo-llvm-cov-install installer",
-            "anvil-tool-cargo-nextest-install installer",
-            "anvil-tool-cargo-coverage-gate-install installer",
-            "anvil-impact",
-        ],
-    );
-    let log = tmp.path().join("cargo.log");
-    seed_include(tmp.path(), "affected", "--package fixture@0.1.0");
-    let output = run_just(
-        tmp.path(),
-        &["anvil-llvm-cov"],
-        &[("FAKE_NEXTEST_EXIT", OsStr::new("0")), ("FAKE_CARGO_LOG", log.as_os_str())],
-    );
-    assert!(
-        output.status.success(),
-        "all-opted-out coverage path should succeed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let calls = fs::read_to_string(&log).unwrap();
-    assert_eq!(calls.matches("nextest run").count(), 2, "calls:\n{calls}");
-    assert!(calls.contains("--all-features"), "calls:\n{calls}");
-    assert!(calls.contains("--no-default-features"), "calls:\n{calls}");
-    assert_eq!(calls.matches("--no-tests=pass").count(), 2, "calls:\n{calls}");
-    assert!(!calls.contains("llvm-cov"), "coverage commands must not run:\n{calls}");
-    assert!(!calls.contains("coverage-gate"), "the coverage gate must not run:\n{calls}");
+    # An empty selector list is cargo-coverage-gate's full-workspace mode.
+    # Impact-selected values remain version-qualified (`name@version`) so
+    # collection resolves the intended workspace member unambiguously.
+    $packageArgs = @(if ($include -and $include -ne '--workspace') { -split $include })
+    $collectionArgs = @(
+        '--configuration', 'all-features',
+        '--configuration', 'no-default-features',
+        '--coverage-dir', 'target/coverage',
+        # LLVM produces unusable coverage profiles on Windows ARM, so
+        # coverage-gate runs that target's tests without measuring coverage.
+        '--no-coverage-target', 'aarch64-pc-windows-msvc'
+    )
+    & cargo '+{{ rust_nightly }}' coverage-gate run @packageArgs @collectionArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    let no_tests = run_just(tmp.path(), &["anvil-llvm-cov"], &[("FAKE_NEXTEST_EXIT", OsStr::new("4"))]);
-    assert!(
-        no_tests.status.success(),
-        "opted-out packages with no runnable tests should succeed:\n{}",
-        String::from_utf8_lossy(&no_tests.stderr)
-    );
-
-    let failed = run_just(
-        tmp.path(),
-        &["anvil-llvm-cov"],
-        &[("FAKE_NEXTEST_EXIT", OsStr::new("7")), ("FAKE_CARGO_LOG", log.as_os_str())],
-    );
-    assert_failed(&failed, "plain nextest failure for an opted-out package");
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[test]
-fn coverage_reports_use_requested_package_scope() {
-    if !tools_available() {
-        return;
-    }
-
-    for (scope, expected, include_second_package) in [
-        ("--package measured@0.1.0", "llvm-cov report --package measured@0.1.0 --lcov", true),
-        ("--workspace", "llvm-cov report --workspace --lcov", false),
-    ] {
-        let tmp = fixture(
-            &[("llvm-cov.just", LLVM_COV), ("impact.just", IMPACT)],
-            &[
-                "anvil-component-nightly-llvm-tools-validate-prereqs",
-                "anvil-tool-cargo-llvm-cov-validate-prereqs",
-                "anvil-tool-cargo-nextest-validate-prereqs",
-                "anvil-tool-cargo-coverage-gate-validate-prereqs",
-                "anvil-component-nightly-llvm-tools-install",
-                "anvil-tool-cargo-llvm-cov-install installer",
-                "anvil-tool-cargo-nextest-install installer",
-                "anvil-tool-cargo-coverage-gate-install installer",
-                "anvil-impact",
-            ],
-        );
-        let log = tmp.path().join("cargo.log");
-        seed_include(tmp.path(), "affected", scope);
-        let mut environment = vec![("FAKE_CARGO_LOG", log.as_os_str())];
-        if include_second_package {
-            environment.push(("FAKE_SECOND_PACKAGE_NAME", OsStr::new("measured")));
-        }
-        let output = run_just(tmp.path(), &["anvil-llvm-cov"], &environment);
-        assert!(
-            output.status.success(),
-            "coverage path for {scope} should succeed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let calls = fs::read_to_string(&log).unwrap();
-        let reports: Vec<_> = calls.lines().filter(|call| call.contains("llvm-cov report")).collect();
-        assert_eq!(reports.len(), 2, "calls for {scope}:\n{calls}");
-        assert!(
-            reports.iter().all(|call| call.contains(expected)),
-            "coverage reports must match the requested {scope} scope:\n{calls}"
-        );
-    }
-}
-
-#[cfg(all(windows, not(target_arch = "aarch64")))]
-#[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one end-to-end fixture covers successful and failed response-file retries"
-)]
-fn windows_coverage_report_retries_error_206_with_response_file() {
-    if !tools_available() {
-        return;
-    }
-    let tmp = fixture(
-        &[("llvm-cov.just", LLVM_COV), ("impact.just", IMPACT)],
-        &[
-            "anvil-component-nightly-llvm-tools-validate-prereqs",
-            "anvil-tool-cargo-llvm-cov-validate-prereqs",
-            "anvil-tool-cargo-nextest-validate-prereqs",
-            "anvil-tool-cargo-coverage-gate-validate-prereqs",
-            "anvil-component-nightly-llvm-tools-install",
-            "anvil-tool-cargo-llvm-cov-install installer",
-            "anvil-tool-cargo-nextest-install installer",
-            "anvil-tool-cargo-coverage-gate-install installer",
-            "anvil-impact",
-        ],
-    );
-    let llvm_cov = tmp.path().join("fake-bin/llvm-cov.ps1");
-    let llvm_cov_log = tmp.path().join("llvm-cov.log");
-    let response_log = tmp.path().join("response.log");
-    write(
-        &llvm_cov,
-        "param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Remaining)\n\
-         Add-Content -LiteralPath $env:FAKE_LLVM_COV_LOG -Value ($Remaining -join ' ')\n\
-         $response = $Remaining | Where-Object { $_.StartsWith('@') } | Select-Object -First 1\n\
-         if (-not $response) { exit 2 }\n\
-         $responseContent = Get-Content -LiteralPath $response.Substring(1) -Raw\n\
-         if ($responseContent -match \"'\") { exit 3 }\n\
-         if ($responseContent -notmatch '-instr-profile=fake.profdata') { exit 4 }\n\
-         Add-Content -LiteralPath $env:FAKE_LLVM_COV_RESPONSE_LOG -Value $responseContent\n\
-         Write-Output 'TN:'\n\
-         if ($env:FAKE_LLVM_COV_EXIT) { exit [int]$env:FAKE_LLVM_COV_EXIT }\n\
-         exit 0\n",
-    );
-    seed_include(tmp.path(), "affected", "--package measured@0.1.0");
-    let output = run_just(
-        tmp.path(),
-        &["anvil-llvm-cov"],
-        &[
-            ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("measured")),
-            ("FAKE_LLVM_COV_REPORT_206", OsStr::new("1")),
-            ("FAKE_LLVM_COV_MULTILINE", OsStr::new("1")),
-            ("FAKE_LLVM_COV_SINGLE_QUOTES", OsStr::new("1")),
-            ("FAKE_LLVM_COV_PATH", llvm_cov.as_os_str()),
-            ("FAKE_LLVM_COV_LOG", llvm_cov_log.as_os_str()),
-            ("FAKE_LLVM_COV_RESPONSE_LOG", response_log.as_os_str()),
-        ],
-    );
-
-    assert!(
-        output.status.success(),
-        "response-file fallback failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let invocations = fs::read_to_string(&llvm_cov_log).unwrap();
-    assert_eq!(invocations.lines().count(), 2, "invocations:\n{invocations}");
-    assert_eq!(invocations.matches("export @").count(), 2, "invocations:\n{invocations}");
-    let responses = fs::read_to_string(&response_log).unwrap();
-    assert_eq!(
-        responses.matches("\n\"-object\" \"fake-object.exe\"").count(),
-        2,
-        "both reports must preserve the multiline command shape:\n{responses}"
-    );
-    for config in ["all-features", "no-default"] {
-        let report = tmp.path().join(format!("target/coverage/lcov-{config}.info"));
-        assert_eq!(fs::read_to_string(report).unwrap().trim(), "TN:");
-    }
-    assert!(
-        fs::read_dir(tmp.path().join("target/coverage")).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("llvm-cov.rsp")),
-        "response-file fallback must remove temporary files"
-    );
-
-    let failed = run_just(
-        tmp.path(),
-        &["anvil-llvm-cov"],
-        &[
-            ("FAKE_SECOND_PACKAGE_NAME", OsStr::new("measured")),
-            ("FAKE_LLVM_COV_REPORT_206", OsStr::new("1")),
-            ("FAKE_LLVM_COV_PATH", llvm_cov.as_os_str()),
-            ("FAKE_LLVM_COV_LOG", llvm_cov_log.as_os_str()),
-            ("FAKE_LLVM_COV_RESPONSE_LOG", response_log.as_os_str()),
-            ("FAKE_LLVM_COV_EXIT", OsStr::new("7")),
-        ],
-    );
-    assert_failed(&failed, "failed response-file fallback");
-    let invocations = fs::read_to_string(&llvm_cov_log).unwrap();
-    assert_eq!(
-        invocations.lines().count(),
-        3,
-        "both quote styles must reach llvm-cov:\n{invocations}"
-    );
-    let failed_report = tmp.path().join("target/coverage/lcov-all-features.info");
-    assert!(!failed_report.exists(), "failed response-file fallback must remove partial report");
-    assert!(
-        fs::read_dir(tmp.path().join("target/coverage")).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("llvm-cov.rsp")),
-        "failed response-file fallback must remove temporary files"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_arm64_fallback_accepts_empty_nextest_sets_in_both_configurations() {
-    if !tools_available() {
-        return;
-    }
-    let tmp = fixture(
-        &[("llvm-cov.just", LLVM_COV), ("impact.just", IMPACT)],
-        &[
-            "anvil-component-nightly-llvm-tools-validate-prereqs",
-            "anvil-tool-cargo-llvm-cov-validate-prereqs",
-            "anvil-tool-cargo-nextest-validate-prereqs",
-            "anvil-tool-cargo-coverage-gate-validate-prereqs",
-            "anvil-component-nightly-llvm-tools-install",
-            "anvil-tool-cargo-llvm-cov-install installer",
-            "anvil-tool-cargo-nextest-install installer",
-            "anvil-tool-cargo-coverage-gate-install installer",
-            "anvil-impact",
-        ],
-    );
-    let log = tmp.path().join("cargo.log");
-    seed_include(tmp.path(), "affected", "--package fixture@0.1.0");
-    let output = run_just(
-        tmp.path(),
-        &["anvil-llvm-cov"],
-        &[
-            ("PROCESSOR_ARCHITECTURE", OsStr::new("ARM64")),
-            ("FAKE_NEXTEST_EXIT", OsStr::new("4")),
-            ("FAKE_CARGO_LOG", log.as_os_str()),
-        ],
-    );
-    assert!(
-        output.status.success(),
-        "Windows ARM64 fallback should accept empty nextest sets:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let calls = fs::read_to_string(&log).unwrap();
-    assert_eq!(calls.matches("nextest run").count(), 2, "calls:\n{calls}");
-    assert!(calls.contains("--all-features"), "calls:\n{calls}");
-    assert!(calls.contains("--no-default-features"), "calls:\n{calls}");
-    assert_eq!(calls.matches("--no-tests=pass").count(), 2, "calls:\n{calls}");
-    assert!(!calls.contains("llvm-cov"), "coverage commands must not run:\n{calls}");
+"#;
+    assert_eq!(actual, expected);
+    assert!(!normalized.contains("Invoke-AnvilLcovReport"));
+    assert!(!normalized.contains("min-lines-percent"));
 }
 
 // --- container-specific behaviour ------------------------------------------
@@ -3504,54 +3609,6 @@ fn unscoped_wrapper_exports_impact_off_before_dependencies_run() {
         "without the wrapper the dependency must see no setting, or this test proves nothing\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&direct.stdout),
         String::from_utf8_lossy(&direct.stderr)
-    );
-}
-
-/// `just --dry-run` reports the bodies just runs itself, not the body of a
-/// recipe that one of them launches as a child process. The unscoped wrapper
-/// launches its tier that way, so a plan of the public tier name reveals the
-/// wrapper alone.
-///
-/// The container driver decides whether to mint a GitHub token by matching the
-/// plan for `GITHUB_TOKEN`, so this is why it has to follow each nested target
-/// rather than reading one plan. If this test ever fails because a plan now
-/// reaches through the child process, that expansion can be deleted.
-#[test]
-fn a_wrapped_tier_hides_its_checks_from_a_plan() {
-    const PROBE: &str = "[private]\n[script(\"pwsh\", \"-NoProfile\")]\n_anvil-probe:\n    \
-        if (-not $env:GITHUB_TOKEN) { exit 1 }\n\n\
-        probe: (_anvil-unscoped \"probe\")\n";
-
-    if !tools_available() {
-        return;
-    }
-    let tmp = fixture(&[("helpers.just", HELPERS), ("probe.just", PROBE)], &[]);
-    let root = tmp.path();
-
-    let wrapped = run_just(root, &["--dry-run", "probe"], &[]);
-    let wrapped_plan = format!(
-        "{}{}",
-        String::from_utf8_lossy(&wrapped.stdout),
-        String::from_utf8_lossy(&wrapped.stderr)
-    );
-    assert!(
-        !wrapped_plan.contains("GITHUB_TOKEN"),
-        "a wrapped tier's plan must not reach the recipe it launches, or the driver's expansion is dead code\n{wrapped_plan}"
-    );
-    assert!(
-        wrapped_plan.contains("_anvil-probe"),
-        "the wrapper must still name the recipe it launches, which is what the driver follows\n{wrapped_plan}"
-    );
-
-    let direct = run_just(root, &["--dry-run", "_anvil-probe"], &[]);
-    let direct_plan = format!(
-        "{}{}",
-        String::from_utf8_lossy(&direct.stdout),
-        String::from_utf8_lossy(&direct.stderr)
-    );
-    assert!(
-        direct_plan.contains("GITHUB_TOKEN"),
-        "planning the launched recipe directly must reveal the variable, or this test proves nothing\n{direct_plan}"
     );
 }
 

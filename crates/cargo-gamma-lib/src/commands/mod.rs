@@ -39,6 +39,7 @@ struct CanonicalMutantId(crate::model::MutantId);
 
 impl CanonicalMutantId {
     fn parse(value: &str) -> Result<Self, InvalidMutantId> {
+        // #[gamma::skip(cond.always_true, tag = "outofmemory", reason = "accepting every subject as a canonical mutant id exhausted memory during campaign discovery")]
         if value.len() == crate::model::MUTANT_ID_HEX_LEN
             && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
@@ -79,16 +80,11 @@ impl core::error::Error for InvalidMutantId {}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::CanonicalMutantId;
+mod tests;
 
-    #[test]
-    fn invalid_mutant_ids_encode_terminal_controls() {
-        let error = CanonicalMutantId::parse("bad\n\u{1b}[2K").expect_err("control-bearing ID must be rejected");
-
-        assert_eq!(
-            error.to_string(),
-            "`bad\\n\\e[2K` has an invalid format; expected 12 lowercase hexadecimal characters"
-        );
-    }
-}
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub use run::recovery_test_util;
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+pub use suppress::native_test_util as suppression_test_util;

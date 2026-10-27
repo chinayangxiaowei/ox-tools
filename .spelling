@@ -15,6 +15,13 @@ accessor
 accessors
 bitset
 catchable
+Ctrl
+unanalyzable
+journaled
+quiesces
+unmerged
+unselected
+unvalidated
 acyclic
 addrs
 ado
@@ -199,6 +206,7 @@ IP
 io
 jitter
 JSON
+JSONC
 JSON's
 JSON5
 Justfile
@@ -863,6 +871,7 @@ syn's
 teardown
 tokenising
 tokenized
+tokenizer
 tradeoff
 unannotated
 unapplied
@@ -892,6 +901,7 @@ VCS
 wasm
 weakenings
 worklist
+Kahn
 XFS
 ~
 Baselining
@@ -947,3 +957,5 @@ reparsing
 multiline
 precomputed
 subspan
+substrings
+unselected

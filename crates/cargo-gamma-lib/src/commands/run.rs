@@ -18,13 +18,18 @@ use super::when::When;
 use crate::config::Config;
 use crate::discover::Plan;
 use crate::error::{Error, error};
-use crate::exec;
+use crate::exec::{self, RecordPreparation};
 use crate::model::{Mutant, Outcome};
 use crate::report::{Listings, Progress, Stats, Styler, encode_controls, quantity};
 #[cfg(any(test, feature = "internals"))]
 use crate::testing::pause_after_cache_adoption;
 
 const GITHUB_ACTIONS: &str = "GITHUB_ACTIONS";
+
+#[cfg(feature = "internals")]
+#[doc(hidden)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub mod recovery_test_util;
 
 #[cfg(test)]
 fn missing_hints(mode: exec::IncrementalMode, root: &Utf8Path) -> bool {
@@ -50,12 +55,16 @@ fn stats(session: &exec::Session, elapsed: Duration) -> Stats {
         elapsed,
         binaries: session.binaries.len(),
         launches: sweep.map_or(0, |cost| cost.launches),
-        successful_hints: sweep.map_or(0, |cost| cost.exact_hits + cost.generalized_hits),
+        successful_hints: sweep.map_or(0, |cost| cost.exact_hits + cost.inferred_hits),
     }
 }
 
 /// Loads `gamma.toml` and folds it into `args`.
 pub(super) fn configure<H: Host>(host: &mut H, args: &mut RunArgs, styler: Styler) -> crate::Result<()> {
+    if args.resume_testing {
+        Config::resolve_reporting_gates(&args.select)?.apply_reporting_gates(args);
+        return Ok(());
+    }
     // Said before anything is loaded, because the settings in that file are about to not happen and
     // the run would otherwise look like it honoured them.
     if Config::foreign_present(&args.select.dir) && !args.select.config.no_config && args.select.config.path.is_none() {
@@ -108,11 +117,22 @@ pub(super) fn memory_policy(args: &RunArgs) -> exec::MemoryPolicy {
 /// convention and this has to survive being copied into an artifact bucket by someone who does not
 /// know the convention.
 fn run_info(args: &RunArgs, tests: Option<usize>, dropped: &[String]) -> crate::elements::RunInfo {
+    run_info_at(args, tests, dropped, SystemTime::now())
+}
+
+fn run_info_at(args: &RunArgs, tests: Option<usize>, dropped: &[String], now: SystemTime) -> crate::elements::RunInfo {
     crate::elements::RunInfo {
         tests,
-        started_at: seconds_since_epoch(SystemTime::now()),
+        started_at: seconds_since_epoch(now),
         mutant_id_version: Some(crate::model::MUTANT_ID_VERSION),
         merged: false,
+        population_complete: args.select.in_diff.is_none()
+            && args.select.mutators.is_none()
+            && args.select.shard_count.is_none()
+            && args.select.name_patterns.is_empty()
+            && args.mutants.is_empty()
+            && !args.only_survivors,
+        name_filtered: !args.select.name_patterns.is_empty(),
         shard: args
             .select
             .shard_count
@@ -124,6 +144,33 @@ fn run_info(args: &RunArgs, tests: Option<usize>, dropped: &[String]) -> crate::
         dropped_test_packages: dropped.to_vec(),
         merge_provenance: None,
     }
+}
+
+fn report_info(
+    args: &RunArgs,
+    retained: Option<&crate::elements::RunInfo>,
+    tests: Option<usize>,
+    dropped: &[String],
+) -> crate::elements::RunInfo {
+    let mut info = retained.cloned().unwrap_or_else(|| run_info(args, tests, dropped));
+    info.tests = tests;
+    info.dropped_test_packages = dropped.to_vec();
+    info
+}
+
+fn resumed_report_info(retained: Option<&crate::elements::RunInfo>) -> crate::elements::RunInfo {
+    retained.cloned().unwrap_or_else(|| crate::elements::RunInfo {
+        started_at: 0,
+        mutant_id_version: Some(crate::model::MUTANT_ID_VERSION),
+        merged: true,
+        population_complete: false,
+        name_filtered: false,
+        shard: None,
+        tests: None,
+        not_built: None,
+        dropped_test_packages: Vec::new(),
+        merge_provenance: None,
+    })
 }
 
 fn seconds_since_epoch(at: SystemTime) -> u64 {
@@ -196,6 +243,7 @@ fn emit_reports<H: Host>(
         args,
         plan,
         &ReportContents {
+            retained_info: None,
             source_root: None,
             advice,
             tests,
@@ -206,6 +254,7 @@ fn emit_reports<H: Host>(
 }
 
 struct ReportContents<'a> {
+    retained_info: Option<&'a crate::elements::RunInfo>,
     source_root: Option<&'a Utf8Path>,
     advice: Option<&'a str>,
     tests: Option<usize>,
@@ -225,7 +274,7 @@ fn emit_reports_from<H: Host>(
         plan,
         contents.source_root,
         crate::elements::Thresholds::default(),
-        Some(run_info(args, contents.tests, contents.dropped)),
+        Some(report_info(args, contents.retained_info, contents.tests, contents.dropped)),
     )?;
     let mut stream = host.error();
 
@@ -344,7 +393,7 @@ fn broken_expectations(mutants: &[Mutant]) -> Vec<(&Mutant, &'static str)> {
 /// Fails a run whose gate never got a population to judge.
 ///
 /// A gate that cannot fail is worse than no gate. Every route to an empty population — an exclude
-/// pattern that matched everything, a shard that held nothing but suppressions, a diff that named
+/// pattern or name regex that matched nothing, a shard that held nothing but suppressions, a diff that named
 /// no code, an incremental run that had already settled the lot — would otherwise end in a
 /// summary that said nothing was tested and an exit code that said everything was fine. A job that
 /// asked for `--min-score 100` or `--max-flaky 0` would then pass on the strength of having tested
@@ -372,7 +421,7 @@ fn ungraded<H: Host>(host: &mut H, args: &RunArgs, styler: Styler, flaky_outcome
     let _ = writeln!(
         host.error(),
         "{} no mutant counted toward {gate}, so it was never evaluated; \
-         check that the selection — `--in-diff`, `--exclude-file`, `--shard-count`/`--shard-index`, `--incremental` — leaves something to test",
+         check that the selection — `--in-diff`, `--exclude-file`, `--re`, `--shard-count`/`--shard-index`, `--incremental` — leaves something to test",
         styler.error("error:")
     );
 
@@ -404,6 +453,12 @@ pub(super) fn distinguish(score: f64, minimum: f64) -> (String, String) {
 // #[gamma::skip(all, reason = "exit-code gating is covered end-to-end through the injected Host; private branch mutants duplicate the directly tested gate predicates and rendered diagnostics")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(super) fn run_session<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: Styler) -> crate::Result<i32> {
+    #[cfg(target_os = "linux")]
+    if args.resume_testing
+        && let Some(code) = resume_relaunch(host, args)?
+    {
+        return Ok(code);
+    }
     let Executed { plan, stuck } = measured(host, args, progress_when, styler)?;
 
     // A build the tool could not make compile is not a run that passed, whatever the mutants it did
@@ -516,6 +571,46 @@ pub(super) fn run_session<H: Host>(host: &mut H, args: &RunArgs, progress_when: 
     }
 
     Ok(EXIT_OK)
+}
+
+#[cfg(target_os = "linux")]
+fn resume_relaunch<H: Host>(host: &H, args: &RunArgs) -> crate::Result<Option<i32>> {
+    resume_relaunch_with(
+        args,
+        host.may_replace_process(),
+        exec::relaunch::relaunched(),
+        || exec::memory_support().is_ok(),
+        || {
+            let selected = crate::paths::physical(&args.select.dir)?;
+            let (_, base, lock) = exec::claim_testing_state(&selected, args.measure.cache_dir.as_deref())?;
+            let (state, _) = exec::TestingState::load(&base)?;
+            drop(lock);
+            Ok(!state.is_settled() && state.session.metered)
+        },
+        || {
+            exec::relaunch::relaunch().map_err(|refusal| {
+                error!(
+                    "cannot resume the campaign's memory-controlled tests without cgroup delegation ({refusal:?}); \
+                 run cargo-gamma inside a delegated systemd user scope"
+                )
+            })
+        },
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resume_relaunch_with(
+    args: &RunArgs,
+    may_replace: bool,
+    relaunched: bool,
+    supported: impl FnOnce() -> bool,
+    saved_metered: impl FnOnce() -> crate::Result<bool>,
+    relaunch: impl FnOnce() -> crate::Result<Option<i32>>,
+) -> crate::Result<Option<i32>> {
+    if !may_replace || args.measure.no_relaunch || relaunched || supported() || !saved_metered()? {
+        return Ok(None);
+    }
+    relaunch()
 }
 
 fn flaky_excess(args: &RunArgs, flaky: u32) -> Option<usize> {
@@ -636,7 +731,6 @@ fn cache_context(args: &RunArgs) -> Option<crate::discover::ContextDigest> {
         include_tests: &args.measure.include_tests,
         exclude_tests: &args.measure.exclude_tests,
         test_workspace: args.measure.test_workspace,
-        optimize_test_execution: args.measure.optimize_test_execution,
         whole_test_binaries: args.measure.whole_test_binaries,
         nextest: args.measure.nextest,
         cargo_test_args: &args.measure.cargo_test_args,
@@ -661,13 +755,6 @@ fn cache_context(args: &RunArgs) -> Option<crate::discover::ContextDigest> {
     })
 }
 
-struct RecordPreparation {
-    base: Utf8PathBuf,
-    context: crate::discover::ContextDigest,
-    inputs: crate::discover::WorkspaceSnapshot,
-    killers: crate::discover::Killers,
-}
-
 impl RecordPreparation {
     fn for_run(args: &RunArgs, survey: &crate::discover::Survey, context: crate::discover::ContextDigest) -> Self {
         let base = exec::campaign_base(&survey.root, &survey.target, args.measure.cache_dir.as_deref());
@@ -679,10 +766,12 @@ impl RecordPreparation {
         );
 
         Self {
+            report_info: Some(run_info(args, None, &[])),
             base,
             context,
             inputs,
             killers: survey.killers(),
+            name_filtered: !args.select.name_patterns.is_empty(),
         }
     }
 }
@@ -704,7 +793,10 @@ fn postprocessing_contexts(
 ) -> Option<(crate::discover::ContextDigest, Option<crate::discover::ContextDigest>)> {
     (!args.dry_run).then(|| {
         let reusable = incremental_enabled(args).then(|| observed.clone()).flatten();
-        (observed.unwrap_or_default(), reusable)
+        (
+            observed.unwrap_or_else(crate::discover::ContextDigest::from_inherited_environment),
+            reusable,
+        )
     })
 }
 
@@ -713,6 +805,17 @@ fn store_completed_record(
     plan: &Plan,
     learning: Option<&crate::exec::Killers>,
 ) -> crate::Result<(bool, bool)> {
+    let (base, stored) = publish_completed_record(prepared, plan, learning)?;
+    let reachable =
+        exec::remember_campaign_base(&plan.root, &base) && exec::campaign_base_from_state(&plan.root, None).as_ref() == Some(&base);
+    Ok(postprocessing_advice(&plan.root, &stored, reachable))
+}
+
+fn publish_completed_record(
+    prepared: RecordPreparation,
+    plan: &Plan,
+    learning: Option<&crate::exec::Killers>,
+) -> crate::Result<(Utf8PathBuf, crate::discover::RunRecord)> {
     let Some(mut record) =
         crate::discover::RunRecord::from_completed_plan_snapshot(plan, &prepared.context, prepared.inputs, &prepared.killers)
     else {
@@ -725,11 +828,13 @@ fn store_completed_record(
         learning.stage(&mut record, &plan.mutants);
     }
 
-    let stored = record.store_completed(&prepared.base)?;
-    let reachable = exec::remember_campaign_base(&plan.root, &prepared.base)
-        && exec::campaign_base_from_state(&plan.root, None).as_ref() == Some(&prepared.base);
-
-    Ok(postprocessing_advice(&plan.root, &stored, reachable))
+    let stored = if prepared.name_filtered {
+        record.store_completed_partial(&prepared.base)?
+    } else {
+        record.store_completed(&prepared.base)?
+    };
+    exec::finish_testing_record(&prepared.base)?;
+    Ok((prepared.base, stored))
 }
 
 fn store_incomplete_convergence(prepared: &RecordPreparation, plan: &Plan) -> crate::Result<()> {
@@ -807,7 +912,6 @@ pub(super) fn run_config(args: &RunArgs, styler: Styler) -> exec::Config {
         include_tests: args.measure.include_tests.clone(),
         exclude_tests: args.measure.exclude_tests.clone(),
         test_workspace: args.measure.test_workspace,
-        optimize_test_execution: args.measure.optimize_test_execution,
         whole_test_binaries: args.measure.whole_test_binaries,
         nextest: args.measure.nextest,
         resources: args.measure.resource_concurrency.clone(),
@@ -924,6 +1028,13 @@ fn adopt(
 // #[gamma::skip(all, reason = "the command orchestrator coordinates subprocesses, cache locks, terminal state, and cleanup; its externally observable branches are covered by integration tests, while isolated mutations are platform/resource dependent")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: Styler) -> crate::Result<Executed> {
+    if args.resume_testing {
+        return resumed_testing(host, args, progress_when, styler);
+    }
+    campaign_preflight(args, || {
+        let metadata = crate::discover::load_metadata(&args.select.dir, &args.select.features)?;
+        Ok(exec::campaign_base(&metadata.workspace_root, &metadata.target_directory, None))
+    })?;
     let started = Instant::now();
     let selection = args.select.selection()?;
     let shard = args.select.shard()?;
@@ -1009,6 +1120,9 @@ fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: 
     } else {
         None
     };
+    if let Some(prepared) = record.as_ref() {
+        crate::discover::RunRecord::validate_update(&prepared.base)?;
+    }
     #[cfg(any(test, feature = "internals"))]
     let cache_lock_identity = cache_locks.as_ref().map(exec::cache_lock_identity);
     let (cached, _declined, _moved) = reusable_context.as_ref().zip(record.as_ref()).map_or_else(
@@ -1020,7 +1134,9 @@ fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: 
     // package sequence to interleave the scan with; it is simply scanned.
     if args.dry_run {
         let mut ordinals = 0;
-        let scanned = survey.scan(None, &selection, &mut ordinals)?;
+        let base = exec::campaign_base(&survey.root, &survey.target, args.measure.cache_dir.as_deref());
+        let exclusions = crate::discover::CompilerExclusions::load(&base, &survey.root)?;
+        let scanned = survey.scan_excluding(None, &selection, &mut ordinals, Some(&exclusions))?;
         let plan = survey.into_plan(scanned);
 
         progress.finish(host);
@@ -1062,7 +1178,10 @@ fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: 
         pause_after_cache_adoption(&survey.root, lock_identity);
     }
     let mut failed = exec::FailedMeasurement::default();
-    let mut outcome = exec::run_with_locks(&survey, &selection, &config, &mut events, cache_locks, &mut failed);
+    if let Some(record) = &record {
+        exec::invalidate_testing(&record.base)?;
+    }
+    let mut outcome = exec::run_with_locks(&survey, &selection, &config, &mut events, cache_locks, &mut failed, record.as_ref());
 
     // A phase that failed never got to say what it found, so the line it opened is still waiting
     // for an ending. Close it before the error is printed, or the error arrives as the rest of
@@ -1115,6 +1234,7 @@ fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: 
     // only ever cost the next run some time.
     let mut promotable = false;
     let mut suppressible = false;
+    let retained_info = record.as_ref().and_then(|record| record.report_info.clone());
     if let Some(prepared) = record {
         let record_locks = if built.is_none() {
             match exec::claim_cache(&plan.root, &survey.target, args.measure.cache_dir.as_deref()) {
@@ -1192,6 +1312,7 @@ fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: 
         args,
         &plan,
         &ReportContents {
+            retained_info: retained_info.as_ref(),
             source_root: Some(&built.work.report_source_root()),
             advice: Some(&panel),
             tests: built.session.tests,
@@ -1219,6 +1340,271 @@ fn measured<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: 
 
 fn should_claim_cache(persisting_record: bool, dry_run: bool) -> bool {
     persisting_record && !dry_run
+}
+
+fn campaign_preflight(args: &RunArgs, resolve_default: impl FnOnce() -> crate::Result<Utf8PathBuf>) -> crate::Result<()> {
+    if args.dry_run {
+        return Ok(());
+    }
+    let base = match args.measure.cache_dir.as_deref() {
+        Some(cache) => exec::gamma_base(&args.select.dir, Some(cache)),
+        None => resolve_default()?,
+    };
+    crate::discover::RunRecord::validate_update(&base)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn resumed_testing<H: Host>(host: &mut H, args: &RunArgs, progress_when: When, styler: Styler) -> crate::Result<Executed> {
+    resumed_testing_with_support(host, args, progress_when, styler, exec::memory_support, |_| {})
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "resume keeps execution and publication-only recovery in one ordered reporting and lock-cleanup path"
+)]
+fn resumed_testing_with_support<H: Host, E: std::error::Error + Send + Sync + 'static>(
+    host: &mut H,
+    args: &RunArgs,
+    progress_when: When,
+    styler: Styler,
+    support: impl FnOnce() -> Result<(), E>,
+    configure_log: impl FnOnce(&mut VerdictLog),
+) -> crate::Result<Executed> {
+    let started = Instant::now();
+    let selected = crate::paths::physical(&args.select.dir)?;
+    let (root, base, lock) = exec::claim_testing_state(&selected, args.measure.cache_dir.as_deref())?;
+    let (state, valid_bytes) = exec::TestingState::load(&base)?;
+    // Settled replay needs no execution capabilities, prepared artifacts, or testing workspace.
+    // Frozen evidence and captured-source provenance remain mandatory, and publication keeps the lock.
+    let publication_only = state.is_settled();
+    if !publication_only && state.session.metered {
+        support().map_err(|cause| {
+            error!(
+                "cannot resume the campaign's memory-controlled tests on this host; restore memory-control support or start a new campaign"
+            )
+            .caused_by(cause)
+        })?;
+    }
+    if !exec::same_existing_path(&state.plan.root, &root) {
+        return Err(error!(
+            "cannot resume testing: the saved campaign belongs to a different workspace; start a new campaign"
+        ));
+    }
+    validate_resumed_environment(&state.plan.mutants, || state.record.context.validate_inherited_environment())?;
+    crate::discover::RunRecord::validate_update(&base)?;
+    if !publication_only {
+        state.validate_artifacts()?;
+    }
+    let record = state.record.clone();
+    let retained_info = resumed_report_info(record.report_info.as_ref());
+    let retained_session = publication_only.then(|| state.session.clone());
+    let (work, _publication_lock) = if publication_only {
+        (None, Some(lock))
+    } else {
+        (
+            Some(exec::Workspace::resume_testing(
+                &state.plan.root,
+                &state.record.base,
+                state.workspace.clone(),
+                lock,
+                valid_bytes,
+                exec::TestingResumeIo::FILESYSTEM,
+            )?),
+            None,
+        )
+    };
+    let profile = match work.as_ref() {
+        Some(work) => work.reporting_profile(),
+        None => state
+            .workspace
+            .get("cargo")
+            .and_then(|cargo| cargo.get("profile"))
+            .and_then(serde_json::Value::as_str),
+    };
+    let reporting_args = prepare_resumed_reporting(host, args, &state, profile, styler)?;
+    let visible = progress_when.resolve(host.is_terminal());
+    let mut verdict_log = VerdictLog::default();
+    verdict_log.resume(&base)?;
+    configure_log(&mut verdict_log);
+    let mut events = ConsoleEvents {
+        progress: Progress::new(visible, styler, host.terminal_width()),
+        dashboard: Dashboard::new(visible && args.dashboard, host.terminal_width(), styler),
+        host,
+        styler,
+        show_build: false,
+        verdict_log,
+    };
+    let settled = events
+        .progress
+        .restore_outcomes(state.plan.mutants.iter().map(|mutant| mutant.outcome));
+    writeln!(
+        events.host.error(),
+        "{} testing with {} retained",
+        styler.verb("Resuming"),
+        quantity(settled, "settled mutant")
+    )?;
+    let outcome = match work {
+        Some(work) => exec::resume_testing(state, work, &mut events),
+        None => state.complete_testing().map(|()| exec::Measured {
+            plan: state.plan,
+            built: None,
+            learning: Some(state.killers),
+            stuck: state.stuck,
+            dropped: state.dropped,
+        }),
+    };
+    let log_failure = events.finish_verdict_log().err();
+    if outcome.is_err() {
+        events.abandon();
+    }
+    let exec::Measured {
+        plan,
+        built,
+        stuck,
+        dropped,
+        learning,
+    } = outcome?;
+    events.dashboard.finish(events.host);
+    events.progress.finish(events.host);
+    let announced = events.progress.is_enabled();
+    let host = events.host;
+    let (base, stored) = publish_completed_record(record, &plan, learning.as_ref())?;
+    let reachable = exec::remember_campaign_base(&plan.root, &base);
+    let (promotable, suppressible) = postprocessing_advice(&plan.root, &stored, reachable);
+    let mut built = built;
+    let (session, source_root) = if let Some(built) = built.as_mut() {
+        built.work.snapshot_report_sources(&plan)?;
+        (built.session.clone(), built.work.report_source_root())
+    } else {
+        (
+            retained_session.expect("only publication-only recovery completes without a built session"),
+            snapshot_captured_report_sources(&base, &plan)?,
+        )
+    };
+    let wall = started.elapsed();
+    let mut footer = listings(args, announced, Some(promotable), Some(suppressible));
+    footer.stats = Some(stats(&session, wall));
+    crate::report::summarize(host, &plan, styler, footer)?;
+    crate::report::session_notes(host, &session, false, false, styler)?;
+    let panel = summary_panel(&reporting_args, &plan, &session, &stuck, &dropped, wall);
+    emit_reports_from(
+        host,
+        args,
+        &plan,
+        &ReportContents {
+            retained_info: Some(&retained_info),
+            source_root: Some(&source_root),
+            advice: Some(&panel),
+            tests: session.tests,
+            dropped: &dropped,
+        },
+        styler,
+    )?;
+    emit_advice(host, &reporting_args, &plan, &session, wall, styler)?;
+    emit_diag(host, &reporting_args, &plan, Some(&session), started, styler)?;
+    report_dropped(host, &dropped, styler)?;
+    report_stuck(host, &stuck, styler)?;
+    warn_auxiliary(host, log_failure.as_ref(), styler);
+    if let Some(built) = built.as_mut()
+        && let Err(failure) = built.work.teardown()
+    {
+        writeln!(host.error(), "{} {failure}", styler.warning())?;
+    }
+    Ok(Executed { plan: Some(plan), stuck })
+}
+
+fn validate_resumed_environment(mutants: &[Mutant], validate: impl FnOnce() -> crate::Result<()>) -> crate::Result<()> {
+    if mutants.iter().any(|mutant| mutant.outcome == Outcome::Pending) {
+        validate()?;
+    }
+    Ok(())
+}
+
+/// Materializes frozen campaign sources for publication-only recovery, independently of the
+/// current checkout and execution artifacts.
+fn snapshot_captured_report_sources(base: &Utf8Path, plan: &Plan) -> crate::Result<Utf8PathBuf> {
+    let root = base.join(".cargo-gamma-report-source");
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(error!("report source directory `{root}` is a link"));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            fs::remove_dir_all(&root).map_err(|cause| error!("could not clear report source directory `{root}`").caused_by(cause))?;
+        }
+        Ok(_) => return Err(error!("report source path `{root}` is not a directory")),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cause) => return Err(error!("could not inspect report source directory `{root}`").caused_by(cause)),
+    }
+    fs::create_dir(&root).map_err(|cause| error!("could not create report source directory `{root}`").caused_by(cause))?;
+    for file in &plan.files {
+        if let Some(source) = &file.source {
+            crate::elements::write(&root.join(&file.path), source)?;
+        }
+    }
+    Ok(root)
+}
+
+fn prepare_resumed_reporting<H: Host>(
+    host: &mut H,
+    args: &RunArgs,
+    state: &exec::TestingState,
+    profile: Option<&str>,
+    styler: Styler,
+) -> crate::Result<RunArgs> {
+    if state.record.report_info.is_none() {
+        writeln!(
+            host.error(),
+            "{} the legacy checkpoint has no report provenance; its report uses an unknown timestamp and cannot withdraw other report populations",
+            styler.warning()
+        )?;
+    }
+    if state.settings.mutators.is_none() {
+        writeln!(
+            host.error(),
+            "{} the legacy checkpoint has no original mutator selection; diagnostics list the frozen population's mutators instead",
+            styler.warning()
+        )?;
+    }
+    Ok(resumed_reporting_args(
+        args,
+        state.settings.jobs,
+        state.settings.mutators.as_deref(),
+        &state.plan.mutants,
+        state.record.report_info.as_ref().and_then(|info| info.shard.as_ref()),
+        profile,
+    ))
+}
+
+fn resumed_reporting_args(
+    args: &RunArgs,
+    jobs: usize,
+    selection: Option<&str>,
+    population: &[crate::model::Mutant],
+    shard: Option<&crate::elements::ShardInfo>,
+    profile: Option<&str>,
+) -> RunArgs {
+    let mut reporting = RunArgs {
+        artifact_dir: args.artifact_dir.clone(),
+        diag: args.diag,
+        diag_names: args.diag_names,
+        ..RunArgs::default()
+    };
+    reporting.measure.jobs = Some(jobs);
+    reporting.measure.profile = profile.map(str::to_owned);
+    reporting.select.mutators = Some(selection.map_or_else(
+        || {
+            let mut mutators: Vec<_> = population.iter().map(|mutant| mutant.mutator.as_ref()).collect();
+            mutators.sort_unstable();
+            mutators.dedup();
+            mutators.join(",")
+        },
+        str::to_owned,
+    ));
+    if let Some(shard) = shard {
+        reporting.select.shard_count = Some(shard.count);
+        reporting.select.shard_index = Some(shard.index);
+    }
+    reporting
 }
 
 fn clear_baseline_failures(artifact_dir: &Utf8Path) -> crate::Result<()> {
@@ -1563,6 +1949,50 @@ mod miri_tests {
     use super::*;
 
     #[test]
+    fn resumed_reporting_uses_frozen_execution_and_live_reporting_options() {
+        let mut live = RunArgs {
+            artifact_dir: Some("reports".into()),
+            diag: true,
+            diag_names: crate::diag::Redaction::Names,
+            ..RunArgs::default()
+        };
+        live.measure.jobs = Some(99);
+        live.measure.profile = Some("test".to_owned());
+        live.select.mutators = Some("invalid-live-selection".to_owned());
+        live.select.shard_count = Some(0);
+        live.select.shard_index = Some(99);
+        let shard = crate::elements::ShardInfo { count: 3, index: 1 };
+        let frozen = resumed_reporting_args(&live, 7, Some("relational.lt_to_le"), &[], Some(&shard), Some("gamma"));
+        assert_eq!(frozen.measure.jobs, Some(7));
+        assert_eq!(frozen.measure.profile.as_deref(), Some("gamma"));
+        assert_eq!(frozen.select.selection().unwrap().sorted(), ["relational.lt_to_le"]);
+        assert_eq!(frozen.select.shard().unwrap(), Some((3, 1)));
+        assert_eq!(frozen.artifact_dir, live.artifact_dir);
+        assert!(frozen.diag);
+        assert!(matches!(frozen.diag_names, crate::diag::Redaction::Names));
+        assert_eq!(live.measure.jobs, Some(99));
+    }
+
+    #[test]
+    fn legacy_resumed_reporting_uses_population_without_live_selection_or_shards() {
+        let mut live = RunArgs::default();
+        live.select.mutators = Some("relational".to_owned());
+        live.select.shard_count = Some(5);
+        live.select.shard_index = Some(2);
+        let first = crate::fixtures::mutant_at("first", "src/lib.rs", 1, "relational.lt_to_le", Outcome::Pending);
+        let second = crate::fixtures::mutant_at("second", "src/lib.rs", 2, "arith.add_to_sub", Outcome::Killed);
+        let frozen = resumed_reporting_args(&live, 4, None, &[first.clone(), second, first], None, None);
+        assert_eq!(frozen.measure.jobs, Some(4));
+        assert_eq!(frozen.measure.profile, None);
+        assert_eq!(
+            frozen.select.selection().unwrap().sorted(),
+            ["arith.add_to_sub", "relational.lt_to_le"]
+        );
+        assert_eq!(frozen.select.shard().unwrap(), None);
+        assert!(!frozen.diag);
+    }
+
+    #[test]
     fn exact_mutant_ids_are_validated_and_deduplicated() {
         let selected = requested_mutants(&["deadbeefcafe".to_owned(), "0123456789ab".to_owned()]).expect("valid IDs");
 
@@ -1579,6 +2009,106 @@ mod miri_tests {
         assert!(incremental_enabled(&args));
         args.mutants.push("deadbeefcafe".to_owned());
         assert!(!incremental_enabled(&args));
+    }
+
+    #[test]
+    fn population_authority_is_explicit_and_filtered_runs_cannot_claim_it() {
+        let mut args = RunArgs::default();
+        assert!(run_info(&args, None, &[]).population_complete);
+        args.mutants.push("deadbeefcafe".into());
+        assert!(!run_info(&args, None, &[]).population_complete);
+        args.mutants.clear();
+        args.only_survivors = true;
+        assert!(!run_info(&args, None, &[]).population_complete);
+        args.only_survivors = false;
+        args.select.in_diff = Some("changes.patch".into());
+        assert!(!run_info(&args, None, &[]).population_complete);
+        args.select.in_diff = None;
+        args.select.shard_count = Some(2);
+        args.select.shard_index = Some(0);
+        assert!(!run_info(&args, None, &[]).population_complete);
+        args.select.shard_count = None;
+        args.select.shard_index = None;
+        args.select.files.push("src/*.rs".into());
+        args.select.exclude_files.push("src/generated.rs".into());
+        args.select.packages.push("included-package".into());
+        assert!(run_info(&args, None, &[]).population_complete);
+        for mutators in ["arith.add_to_sub", "all", "@all"] {
+            args.select.mutators = Some(mutators.into());
+            assert!(!run_info(&args, None, &[]).population_complete, "{mutators}");
+        }
+        assert!(!resumed_report_info(None).population_complete);
+    }
+
+    #[test]
+    fn legacy_frozen_run_info_defaults_to_non_authoritative_population_on_resume() {
+        let mut frozen = serde_json::to_value(run_info(&RunArgs::default(), None, &[])).unwrap();
+        assert!(frozen.as_object_mut().unwrap().remove("populationComplete").is_some());
+        let decoded: crate::elements::RunInfo = serde_json::from_value(frozen).unwrap();
+        assert!(!decoded.population_complete);
+        let resumed = resumed_report_info(Some(&decoded));
+        assert!(!resumed.population_complete);
+        let reported = report_info(&RunArgs::default(), Some(&resumed), Some(3), &[]);
+        assert!(!reported.population_complete);
+    }
+
+    #[test]
+    fn exact_id_and_diff_report_metadata_preserve_unchanged_historical_survivors_through_the_wire() {
+        let exact = RunArgs {
+            mutants: vec!["deadbeefcafe".into()],
+            ..RunArgs::default()
+        };
+        let mut diff = RunArgs::default();
+        diff.select.in_diff = Some("changes.patch".into());
+        for args in [exact, diff] {
+            let old = crate::fixtures::report_with(
+                None,
+                100,
+                vec![
+                    crate::fixtures::mutant_result_at("a", 1, "Survived"),
+                    crate::fixtures::mutant_result_at("b", 2, "Survived"),
+                ],
+            );
+            let mut newer = crate::fixtures::report_with(None, 200, vec![crate::fixtures::mutant_result_at("a", 1, "Killed")]);
+            let mut info = run_info(&args, None, &[]);
+            info.started_at = 200;
+            newer.config = Some(info);
+            let wire = crate::elements::to_json(&newer).unwrap();
+            let decoded = serde_json::from_str(&wire).unwrap();
+            let merged = crate::merge::merge(&[("old".into(), old), ("new".into(), decoded)], 300, None);
+            assert_eq!((merged.withdrawn, merged.valid, merged.detected), (0, 2, 1));
+        }
+    }
+
+    #[test]
+    fn mutator_filtered_reports_preserve_other_mutator_survivors_in_the_same_file_through_the_wire() {
+        for selector in ["arith.add_to_sub", "all", "@all"] {
+            let mut args = RunArgs::default();
+            args.select.mutators = Some(selector.into());
+            let mut arithmetic = crate::fixtures::mutant_result_at("arithmetic", 1, "Survived");
+            arithmetic.mutator_name = "arith.add_to_sub".into();
+            let mut relational = crate::fixtures::mutant_result_at("relational", 1, "Survived");
+            relational.mutator_name = "relational.lt_to_le".into();
+            let old = crate::fixtures::report_with(None, 100, vec![arithmetic.clone(), relational]);
+            arithmetic.status = "Killed".into();
+            let mut newer = crate::fixtures::report_with(None, 200, vec![arithmetic]);
+            let mut info = run_info(&args, None, &[]);
+            info.started_at = 200;
+            newer.config = Some(info);
+            let wire = crate::elements::to_json(&newer).unwrap();
+            let decoded: crate::elements::Report = serde_json::from_str(&wire).unwrap();
+            assert!(!decoded.config.as_ref().unwrap().population_complete, "{selector}");
+            let merged = crate::merge::merge(&[("old".into(), old), ("new".into(), decoded)], 300, None);
+            assert_eq!((merged.withdrawn, merged.valid, merged.detected), (0, 2, 1), "{selector}");
+            let report = merged.report.unwrap();
+            let retained = report.files["src/lib.rs"]
+                .mutants
+                .iter()
+                .find(|mutant| mutant.id == "relational")
+                .unwrap();
+            assert_eq!(retained.mutator_name, "relational.lt_to_le");
+            assert_eq!(retained.status, "Survived");
+        }
     }
 
     #[test]
@@ -1613,11 +2143,78 @@ mod miri_tests {
 #[cfg(not(miri))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::super::cli::MeasureArgs;
     use super::*;
-    use crate::discover::TargetFile;
+    use crate::discover::{RunRecord, TargetFile};
     use crate::exec::Session;
     use crate::fixtures;
+
+    #[test]
+    fn resume_delegation_uses_frozen_metering_and_preserves_child_exit_status() {
+        let mut args = RunArgs::default();
+        args.measure.memory = Some(exec::MemoryControl::Off);
+        let code = resume_relaunch_with(&args, true, false, || false, || Ok(true), || Ok(Some(73))).unwrap();
+        assert_eq!(code, Some(73), "live settings must not disable a metered checkpoint's delegation");
+        assert_eq!(
+            resume_relaunch_with(
+                &args,
+                true,
+                false,
+                || false,
+                || Ok(false),
+                || panic!("an unmetered checkpoint needs no delegated scope")
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resume_relaunch_with(&args, true, false, || false, || Ok(true), || Err(error!("delegation unavailable")))
+                .unwrap_err()
+                .to_string(),
+            "delegation unavailable"
+        );
+        assert_eq!(
+            resume_relaunch_with(
+                &args,
+                true,
+                false,
+                || false,
+                || Err(error!("checkpoint unreadable")),
+                || panic!("invalid state must not relaunch")
+            )
+            .unwrap_err()
+            .to_string(),
+            "checkpoint unreadable"
+        );
+    }
+
+    #[test]
+    fn resume_delegation_skips_relaunch_for_supported_disabled_or_recursive_invocations() {
+        for (may_replace, no_relaunch, relaunched, supported) in [
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+        ] {
+            let mut args = RunArgs::default();
+            args.measure.no_relaunch = no_relaunch;
+            assert_eq!(
+                resume_relaunch_with(
+                    &args,
+                    may_replace,
+                    relaunched,
+                    || supported,
+                    || panic!("the skip path must not claim or read campaign state"),
+                    || panic!("the skip path must not relaunch")
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
 
     /// Lays out an empty single-package `subject` workspace in `dir` and returns its root.
     ///
@@ -1637,6 +2234,1101 @@ mod tests {
     }
 
     use crate::testing::{Broken, Sink, fails_at_every_line, private_system_tempdir, workdir};
+
+    #[test]
+    fn survivor_ungraded_gate_matrix_names_only_the_gates_that_were_not_evaluated() {
+        for (score, flaky, observed_flaky, expectations, expected) in [
+            (false, false, false, false, None),
+            (true, false, false, false, Some("the `--min-score` gate")),
+            (false, true, false, false, Some("the `--max-flaky` gate")),
+            (true, true, false, false, Some("the `--min-score` and `--max-flaky` gates")),
+            (true, true, true, false, Some("the `--min-score` gate")),
+            (false, true, true, false, None),
+            (false, false, false, true, Some("the expectations this run carried")),
+        ] {
+            let args = RunArgs {
+                min_score: score.then_some(80.0),
+                max_flaky: flaky.then_some(0),
+                ..RunArgs::default()
+            };
+            let mut host = Sink::default();
+            assert_eq!(
+                ungraded(&mut host, &args, Styler::new(false), observed_flaky, expectations),
+                if expected.is_some() { EXIT_GATE_FAILED } else { EXIT_OK }
+            );
+            assert_eq!(host.out(), "");
+            assert_eq!(host.err(), expected.map_or_else(String::new, |gate| format!(
+                "error: no mutant counted toward {gate}, so it was never evaluated; check that the selection — `--in-diff`, `--exclude-file`, `--re`, `--shard-count`/`--shard-index`, `--incremental` — leaves something to test\n"
+            )));
+        }
+    }
+
+    #[test]
+    fn survivor_expectation_scan_continues_past_unexpected_and_pending_entries() {
+        let mutants = [
+            mutant(0, Outcome::Survived, 0),
+            expecting(Outcome::Pending, true),
+            expecting(Outcome::Survived, true),
+            expecting(Outcome::Killed, false),
+            expecting(Outcome::Killed, true),
+        ];
+        let broken = broken_expectations(&mutants);
+        assert_eq!(broken.len(), 2);
+        assert!(core::ptr::eq(broken[0].0, &raw const mutants[2]));
+        assert!(core::ptr::eq(broken[1].0, &raw const mutants[3]));
+    }
+
+    #[test]
+    fn survivor_run_metadata_and_empty_sweep_statistics_keep_unknowns_distinct_from_measurements() {
+        let mut args = RunArgs::default();
+        args.select.shard_count = Some(7);
+        args.select.shard_index = Some(3);
+        let now = UNIX_EPOCH + Duration::from_secs(1_234_567);
+        let info = run_info_at(&args, Some(19), &["omitted".to_owned()], now);
+        assert_eq!(info.started_at, 1_234_567);
+        assert_eq!(info.tests, Some(19));
+        assert_eq!(info.dropped_test_packages, ["omitted"]);
+        assert_eq!(info.shard.map(|shard| (shard.count, shard.index)), Some((7, 3)));
+        let mut session = session();
+        session.phases.sweep = None;
+        let stats = stats(&session, Duration::from_millis(37));
+        assert_eq!(stats.elapsed, Duration::from_millis(37));
+        assert_eq!(stats.binaries, session.binaries.len());
+        assert_eq!(stats.launches, 0);
+        assert_eq!(stats.successful_hints, 0);
+    }
+
+    #[test]
+    fn survivor_platform_paths_and_postprocessing_context_reuse_preserve_the_supplied_values() {
+        let path = Utf8Path::new("artifacts/sub/report.json");
+        #[cfg(windows)]
+        assert_eq!(platform_path(path), r"artifacts\sub\report.json");
+        #[cfg(not(windows))]
+        assert_eq!(platform_path(path), "artifacts/sub/report.json");
+        let observed = crate::discover::record_context(&crate::discover::RecordContext {
+            toolchain: Some("distinct-survivor-toolchain"),
+            ..crate::discover::RecordContext::default()
+        })
+        .unwrap();
+        let mut args = RunArgs::default();
+        let (actual, reusable) = postprocessing_contexts(&args, Some(observed.clone())).unwrap();
+        assert_eq!(actual, observed);
+        assert_eq!(reusable, Some(observed.clone()));
+        args.incremental = Some(exec::IncrementalMode::No);
+        let (actual, reusable) = postprocessing_contexts(&args, Some(observed.clone())).unwrap();
+        assert_eq!(actual, observed);
+        assert!(reusable.is_none());
+        args.dry_run = true;
+        assert!(postprocessing_contexts(&args, Some(observed)).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_artifact_failures_remain_errors_and_do_not_print_success_messages() {
+        let directory = workdir("run-artifact-survivors-");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap();
+        let plan = plan_at(root.clone());
+        let blocked = root.join("not-a-directory");
+        fs::write(&blocked, "preserved").unwrap();
+        let args = RunArgs {
+            artifact_dir: Some(blocked.clone()),
+            ..RunArgs::default()
+        };
+        let mut host = Sink::default();
+        let styler = Styler::new(false);
+        let started = Instant::now();
+        let session = session();
+        assert!(emit_reports(&mut host, &args, &plan, None, None, &[], styler).is_err());
+        assert!(emit_ci(&mut host, &args, &plan, None, styler).is_err());
+        assert!(emit_diag_bundle(&mut host, &args, &plan, Some(&session), started, styler).is_err());
+        assert!(emit_diag_bundle_to(&mut host, &args, &plan, None, started, styler, &blocked.join("diag")).is_err());
+        assert!(emit_advice(&mut host, &args, &plan, &session, Duration::from_secs(1), styler).is_err());
+        assert!(host.err.is_empty());
+        assert!(host.out.is_empty());
+        assert_eq!(fs::read_to_string(blocked).unwrap(), "preserved");
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_artifact_diagnostic_errors_propagate_after_each_written_document() {
+        let directory = workdir("run-diagnostic-survivors-");
+        let plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        let args = RunArgs::default();
+        let session = session();
+        let styler = Styler::new(false);
+        crate::testing::fails_at_every_line(3, |host| emit_reports(host, &args, &plan, None, Some(19), &[], styler));
+        crate::testing::fails_at_every_line(1, |host| emit_ci(host, &args, &plan, None, styler));
+        crate::testing::fails_at_every_line(1, |host| {
+            emit_diag_bundle(host, &args, &plan, Some(&session), Instant::now(), styler)
+        });
+        crate::testing::fails_at_every_line(1, |host| emit_advice(host, &args, &plan, &session, Duration::from_secs(1), styler));
+        crate::testing::fails_at_every_line(2, |host| report_stuck(host, &["first build".into(), "second build".into()], styler));
+        let report = crate::merge::read_limited(&Documents::resolve(&args, &plan.root).json, u64::MAX)
+            .unwrap()
+            .report;
+        assert_eq!(report.config.unwrap().tests, Some(19));
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_ci_summary_separates_advice_and_respects_explicitly_disabled_annotations() {
+        let directory = workdir("run-summary-survivors-");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap();
+        let plan = plan_at(root.clone());
+        let path = root.join("step-summary.md");
+        let mut host = Sink::default().with_env("GITHUB_STEP_SUMMARY", path.as_str());
+        let mut args = RunArgs {
+            annotations: crate::ci::Annotations::Github,
+            ..RunArgs::default()
+        };
+        emit_ci(&mut host, &args, &plan, Some("DISTINCT ADVICE"), Styler::new(true)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{}\nDISTINCT ADVICE", crate::ci::summary(&plan.mutants, &plan.root))
+        );
+        assert!(host.err().contains('\u{1b}'));
+        assert!(!host.out.is_empty());
+        fs::remove_file(&path).unwrap();
+        host.out.clear();
+        args.annotations = crate::ci::Annotations::None;
+        emit_ci(&mut host, &args, &plan, Some("SHOULD NOT BE APPENDED"), Styler::new(false)).unwrap();
+        assert!(host.out.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn survivor_configuration_preserves_nondefault_execution_fields_and_fine_score_precision() {
+        let mut args = RunArgs::default();
+        args.measure.test_lib = true;
+        args.measure.whole_test_binaries = true;
+        args.measure.resource_concurrency = vec![exec::ResourceLimit::new("survivor-resource", 2).unwrap()];
+        let config = run_config(&args, Styler::new(true));
+        assert!(config.test_lib);
+        assert!(config.whole_test_binaries);
+        assert_eq!(config.resources, args.measure.resource_concurrency);
+        assert!(config.cargo.color);
+        assert_eq!(
+            distinguish(1.0, 1.000_000_000_001),
+            ("1.000000000000".to_owned(), "1.000000000001".to_owned())
+        );
+        assert_eq!(
+            distinguish(1.0, 1.000_000_000_000_1),
+            ("1".to_owned(), "1.0000000000001".to_owned())
+        );
+    }
+
+    #[test]
+    fn survivor_ci_annotations_propagate_non_broken_pipe_result_errors() {
+        struct Denied;
+        impl Write for Denied {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "results denied"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Debug, Default)]
+        struct DeniedResults {
+            diagnostics: Vec<u8>,
+        }
+        impl Host for DeniedResults {
+            fn output(&mut self) -> impl Write {
+                Denied
+            }
+            fn error(&mut self) -> impl Write {
+                &mut self.diagnostics
+            }
+            fn is_terminal(&self) -> bool {
+                false
+            }
+            fn terminal_width(&self) -> Option<u16> {
+                None
+            }
+        }
+        let directory = workdir("ci-denied-survivors-");
+        let plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        let args = RunArgs {
+            annotations: crate::ci::Annotations::Github,
+            ..RunArgs::default()
+        };
+        let failure = emit_ci(&mut DeniedResults::default(), &args, &plan, None, Styler::new(false)).unwrap_err();
+        assert!(failure.to_string().contains("results denied"));
+        assert!(Documents::resolve(&args, &plan.root).sarif.is_file());
+    }
+
+    #[cfg(feature = "system-tests")]
+    mod native_resume_acceptance {
+        use super::*;
+
+        #[test]
+        fn survivor_resumed_testing_returns_an_absent_selected_workspace_error_before_claiming_or_loading_state() {
+            let directory = workdir("resume-absent-selected-workspace-");
+            let root = Utf8Path::from_path(directory.path()).expect("fixture roots are UTF-8");
+            for (component, expected) in [("absent", "no previous campaign under"), ("\0", "could not resolve")] {
+                let args = RunArgs {
+                    select: crate::commands::SelectArgs {
+                        dir: root.join(component),
+                        ..crate::commands::SelectArgs::default()
+                    },
+                    resume_testing: true,
+                    ..RunArgs::default()
+                };
+                let mut host = Sink::default();
+                let Err(error) = resumed_testing(&mut host, &args, When::Never, Styler::new(false)) else {
+                    panic!("an absent or physically invalid selected workspace cannot load a resumable campaign");
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+                assert!(
+                    host.err().is_empty(),
+                    "no resume announcement may precede selected-workspace validation"
+                );
+            }
+        }
+
+        fn survivor_resume_checkpoint() -> (tempfile::TempDir, RunArgs, serde_json::Value) {
+            let directory = private_system_tempdir("resumed-command-checkpoint-");
+            let root = Utf8PathBuf::from_path_buf(fs::canonicalize(directory.path()).expect("fixture roots can be normalized"))
+                .expect("fixture roots are UTF-8");
+            let mut plan = plan_at(root.clone());
+            let text = fs::read_to_string(root.join("src/lib.rs")).expect("actual fixture source exists");
+            let parsed = crate::parse::SourceFile::parse("src/lib.rs", text).expect("actual fixture source parses");
+            let selection = crate::ops::Selection::parse("all").expect("the built-in selection is valid");
+            let candidates = crate::ops::collect_candidates(&parsed, &selection);
+            plan.mutants = crate::ops::into_mutants(&parsed, "subject", candidates)
+                .into_iter()
+                .take(3)
+                .collect();
+            assert_eq!(plan.mutants.len(), 3);
+            for (index, (mutant, outcome)) in plan
+                .mutants
+                .iter_mut()
+                .zip([Outcome::CompileError, Outcome::Timeout, Outcome::Survived])
+                .enumerate()
+            {
+                mutant.ordinal = u32::try_from(index + 1).expect("the fixture has only three mutants");
+                mutant.outcome = outcome;
+            }
+            let base = crate::paths::physical(&root.join("target").join("campaign"))
+                .expect("the fixture campaign uses normalized native path components");
+            let prepared = base.join("workspace");
+            let runtime = base.join("rt");
+            crate::exec::create_private_dir_all_for_test(&runtime);
+            fs::create_dir_all(base.join("target")).expect("compiled-output fixture directory can be created");
+            for file in ["Cargo.toml", "src/lib.rs"] {
+                let destination = prepared.join(file);
+                fs::create_dir_all(destination.parent().expect("fixture files have parents")).expect("prepared parents can be created");
+                fs::copy(root.join(file), &destination).expect("the prepared generation copies actual source");
+            }
+            crate::exec::mark_cache_owned_for_test(&root, &base);
+            let mut measured = session();
+            measured.tests = Some(3);
+            measured.scratch = base.clone();
+            measured.filtered = 1;
+            measured.widened = true;
+            let mut artifacts = Vec::new();
+            for name in ["Cargo.toml", "src/lib.rs"] {
+                let path = prepared.join(name);
+                #[cfg(unix)]
+                let executable = fs::metadata(&path).expect("prepared file exists").permissions().mode() & 0o111;
+                #[cfg(not(unix))]
+                let executable = 0;
+                artifacts.push(serde_json::json!({
+                    "path": path, "digest": crate::discover::digest(&fs::read(&path).expect("prepared bytes are readable")),
+                    "generated_output": false, "metadata": { "kind": "File", "executable": executable, "link": null }
+                }));
+            }
+            let state = survivor_resume_snapshot(&plan, &measured, &base, &prepared, &runtime, &artifacts);
+            let args = RunArgs {
+                select: crate::commands::SelectArgs {
+                    dir: root.clone(),
+                    ..crate::commands::SelectArgs::default()
+                },
+                measure: crate::commands::MeasureArgs {
+                    cache_dir: Some(base.clone()),
+                    ..crate::commands::MeasureArgs::default()
+                },
+                resume_testing: true,
+                artifact_dir: Some(root.join("reports")),
+                diag: true,
+                dashboard: true,
+                ..RunArgs::default()
+            };
+            survivor_write_resume_snapshot(&base, &state);
+            {
+                let (claimed_root, claimed_base, _lock) = exec::claim_testing_state(&root, Some(&base))
+                    .expect("the fixture's actual testing-state owner and native lock are valid");
+                assert!(
+                    exec::same_existing_path(&claimed_root, &root),
+                    "claimed root {claimed_root:?} differs from fixture root {root:?}"
+                );
+                assert!(
+                    exec::same_existing_path(&claimed_base, &base),
+                    "claimed base {claimed_base:?} differs from fixture base {base:?}"
+                );
+            }
+            let (loaded, _) =
+                exec::TestingState::load(&base).expect("the checkpoint passes the actual version, identity, confidence and journal reader");
+            loaded
+                .validate_artifacts()
+                .expect("the actual prepared files match the fixture's retained native metadata and bytes");
+            (directory, args, state)
+        }
+
+        fn survivor_resume_snapshot(
+            plan: &Plan,
+            measured: &Session,
+            base: &Utf8Path,
+            prepared: &Utf8Path,
+            runtime: &Utf8Path,
+            artifacts: &[serde_json::Value],
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "version": 2, "tool": env!("CARGO_PKG_VERSION"),
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "plan": plan, "confidences": {}, "session": measured,
+                "oracle": { "packages": ["subject"], "package_local": true, "whole_workspace": false },
+                "workspace": {
+                    "base": base, "root": prepared, "target": base.join("target"), "runtime": runtime,
+                    "libraries": [], "cargo": exec::CargoOptions::default(), "nextest": null, "test_environment": null,
+                    "scheduler_version": 2,
+                    "launch": { "loader": null, "stack": "2097152" }, "harness_threads": null,
+                    "resources": { "capacities": {}, "binaries": {} }
+                },
+                "settings": { "jobs": 1, "mutators": "all", "timeout_floor": Duration::from_secs(1),
+                    "confirm": false, "narrowed": false, "incremental": false },
+                "killers": exec::Killers::default(),
+                "record": {
+                    "report_info": fixtures::report_with(None, 77, Vec::new()).config,
+                    "base": base, "context": crate::discover::record_context(&crate::discover::RecordContext {
+                        toolchain: Some("fixture"), ..crate::discover::RecordContext::default()
+                    }).expect("the fixture names its compiler and captures the real inherited environment"),
+                    "inputs": RunRecord::snapshot_with_external(&plan.root, base, &[], false), "killers": crate::discover::Killers::default()
+                },
+                "stuck": [], "dropped": ["missing-fixture-package"], "artifact_roots": [prepared, runtime], "artifacts": artifacts
+            })
+        }
+
+        fn survivor_write_resume_snapshot(base: &Utf8Path, state: &serde_json::Value) {
+            let bytes = serde_json::to_vec(state).expect("the concrete checkpoint fixture serializes");
+            fs::write(base.join("testing-session.json"), &bytes).expect("checkpoint fixture is writable");
+            fs::write(base.join("testing-verdicts.jsonl"), "").expect("settled fixture has no uncommitted verdict");
+            fs::write(
+                base.join("testing-phase.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "phase": "Testing", "snapshot": crate::discover::digest(&bytes)
+                }))
+                .expect("phase fixture serializes"),
+            )
+            .expect("phase fixture is writable");
+        }
+
+        type SurvivorResumeHook = Option<(&'static str, Box<dyn FnOnce()>)>;
+
+        /// Diagnostic-driven fault injection using accumulated per-stream markers and a one-shot hook.
+        #[derive(Default)]
+        struct SurvivorResumeHost {
+            sink: Sink,
+            failure: Option<&'static str>,
+            failed: bool,
+            hook: SurvivorResumeHook,
+        }
+
+        impl Host for SurvivorResumeHost {
+            fn output(&mut self) -> impl Write {
+                SurvivorResumeWriter {
+                    bytes: &mut self.sink.out,
+                    failure: self.failure,
+                    failed: &mut self.failed,
+                    hook: &mut self.hook,
+                }
+            }
+
+            fn error(&mut self) -> impl Write {
+                SurvivorResumeWriter {
+                    bytes: &mut self.sink.err,
+                    failure: self.failure,
+                    failed: &mut self.failed,
+                    hook: &mut self.hook,
+                }
+            }
+
+            fn is_terminal(&self) -> bool {
+                self.sink.is_terminal()
+            }
+
+            fn terminal_width(&self) -> Option<u16> {
+                self.sink.terminal_width()
+            }
+
+            fn env(&self, name: &str) -> Option<String> {
+                self.sink.env(name)
+            }
+        }
+
+        /// Writer adapter implementing the host's accumulated-marker control plane.
+        struct SurvivorResumeWriter<'a> {
+            bytes: &'a mut Vec<u8>,
+            failure: Option<&'static str>,
+            failed: &'a mut bool,
+            hook: &'a mut SurvivorResumeHook,
+        }
+
+        impl Write for SurvivorResumeWriter<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                // Retain bytes before matching; run the hook once before returning any selected error.
+                // This fixes the observed resume phase without racing a concurrent filesystem edit.
+                self.bytes.extend_from_slice(buf);
+                let output = String::from_utf8_lossy(self.bytes);
+                if self.hook.as_ref().is_some_and(|(marker, _)| output.contains(*marker)) {
+                    let (_, callback) = self.hook.take().expect("the preceding presence check found this one-shot callback");
+                    callback();
+                }
+                if self.failure.is_some_and(|marker| output.contains(marker)) {
+                    *self.failed = true;
+                    return Err(std::io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "selected resumed-command output was denied",
+                    ));
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn survivor_actual_resumed_command_propagates_each_selected_output_failure_at_its_own_caller_boundary() {
+            for marker in [
+                "Resuming",
+                "Summary:",
+                "the narrowed build did not compile",
+                "gamma-report.json",
+                "gamma-perf-advice.md",
+                "gamma-diagnostics.json",
+                "these packages do not compile",
+            ] {
+                let (_directory, args, _) = survivor_resume_checkpoint();
+                let mut host = SurvivorResumeHost {
+                    failure: Some(marker),
+                    ..SurvivorResumeHost::default()
+                };
+                let Err(_error) = resumed_testing(&mut host, &args, When::Never, Styler::new(false)) else {
+                    panic!("the checked {marker:?} output boundary must return its writer error");
+                };
+                assert!(host.failed, "the native command must actually reach the selected {marker:?} caller");
+            }
+        }
+
+        #[test]
+        fn survivor_resumed_publication_failure_returns_the_actual_phase_error_without_starting_execution_progress() {
+            let (_directory, args, _) = survivor_resume_checkpoint();
+            let phase = args
+                .measure
+                .cache_dir
+                .as_ref()
+                .expect("fixture cache exists")
+                .join("testing-phase.json");
+            let blocked = phase.clone();
+            let mut host = SurvivorResumeHost {
+                hook: Some((
+                    "Resuming",
+                    Box::new(move || {
+                        fs::remove_file(&blocked).expect("the validated phase can disappear after the resume announcement");
+                        fs::create_dir(&blocked).expect("a native directory can prevent the next committed phase publication");
+                    }),
+                )),
+                ..SurvivorResumeHost::default()
+            };
+            let Err(error) = resumed_testing(&mut host, &args, When::Always, Styler::new(false)) else {
+                panic!("a failed FinishedTesting publication must propagate from actual resumed execution");
+            };
+            assert!(
+                phase.is_dir(),
+                "the actual callback performed its deterministic native filesystem race"
+            );
+            assert!(error.to_string().contains("testing-phase.json"), "{error}");
+            let diagnostics = host.sink.err();
+            assert!(
+                !diagnostics.contains("\x1b[?2026h"),
+                "publication does not start an execution dashboard"
+            );
+            assert!(diagnostics.contains("Resuming"), "the actual publication path announced recovery");
+            assert!(
+                !diagnostics.contains("\r\x1b[2K"),
+                "publication does not draw an execution progress bar"
+            );
+        }
+
+        #[test]
+        fn survivor_resumed_auxiliary_verdict_failure_is_warned_after_publishing_the_completed_population() {
+            let (_directory, args, mut state) = survivor_resume_checkpoint();
+            state["plan"]["mutants"][2]["outcome"] = serde_json::json!(Outcome::Pending);
+            let base = args.measure.cache_dir.as_ref().expect("fixture cache exists");
+            survivor_write_resume_snapshot(base, &state);
+            let mut host = Sink::default();
+            let result = resumed_testing_with_support(
+                &mut host,
+                &args,
+                When::Never,
+                Styler::new(false),
+                || Ok::<(), std::io::Error>(()),
+                |log| {
+                    let VerdictLog::Writing { file, path, .. } = log else {
+                        panic!("native resume installed the actual verdict file");
+                    };
+                    *file = fs::File::open(path).expect("the same native journal can be substituted with a read-only descriptor");
+                },
+            )
+            .expect("the verdict log is auxiliary, so the real no-binary NoCoverage outcome remains reportable");
+            let plan = result.plan.expect("the population survives an auxiliary logging failure");
+            assert_eq!(plan.mutants[2].outcome, Outcome::NoCoverage);
+            assert!(host.err().contains("could not write the campaign log"), "{}", host.err());
+            assert!(
+                base.join("last-gamma-run.json").is_file(),
+                "the warning is emitted only after durable completion publication"
+            );
+            assert!(
+                Documents::resolve(&args, &args.select.dir).json.is_file(),
+                "the checked report publication still completed"
+            );
+        }
+
+        #[test]
+        fn survivor_actual_resumed_command_preserves_settled_outcomes_and_publishes_frozen_report_metadata() {
+            let (_directory, args, _) = survivor_resume_checkpoint();
+            let summary = args.select.dir.join("step-summary.md");
+            let mut host = Sink::default()
+                .with_env("GITHUB_ACTIONS", "true")
+                .with_env("GITHUB_STEP_SUMMARY", summary.as_str());
+            let executed = resumed_testing(&mut host, &args, When::Never, Styler::new(false))
+                .expect("settled testing resumes without launching any build or test process");
+            let plan = executed
+                .plan
+                .expect("a successfully resumed command returns its completed population");
+            assert_eq!(
+                plan.mutants.iter().map(|mutant| mutant.outcome).collect::<Vec<_>>(),
+                [Outcome::CompileError, Outcome::Timeout, Outcome::Survived]
+            );
+            assert!(host.err().contains("testing with 2 settled mutants retained"), "{}", host.err());
+            assert!(
+                host.out().contains(&plan.mutants[2].describe()),
+                "an unannounced retained survivor must appear in the results listing: {}",
+                host.out()
+            );
+            assert!(host.err().contains("missing-fixture-package"), "{}", host.err());
+            let phase: serde_json::Value = serde_json::from_slice(
+                &fs::read(args.measure.cache_dir.as_ref().expect("fixture cache").join("testing-phase.json"))
+                    .expect("phase survives completion"),
+            )
+            .expect("phase remains valid JSON");
+            assert_eq!(phase["phase"], "Completed");
+            let reports = args.artifact_dir.as_ref().expect("fixture has an explicit report directory");
+            assert!(reports.is_dir(), "the actual postprocessing path creates its report artifacts");
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(reports.join("gamma-report.json")).expect("the actual JSON report was published"))
+                    .expect("the actual report is valid JSON");
+            assert_eq!(report["config"]["startedAt"], 77);
+            assert_eq!(report["config"]["tests"], 3);
+            let diagnostic: serde_json::Value = serde_json::from_slice(
+                &fs::read(reports.join("gamma-diagnostics.json")).expect("the actual diagnostic bundle was published"),
+            )
+            .expect("the actual diagnostic bundle is valid JSON");
+            assert_eq!(diagnostic["build"]["tests"], 3);
+            assert!(host.out().contains("Stats  :"), "{}", host.out());
+            assert!(host.out().contains("0 test processes launched"), "{}", host.out());
+            assert!(
+                fs::read_to_string(summary)
+                    .expect("the real CI summary was written")
+                    .contains("missing-fixture-package")
+            );
+        }
+
+        #[test]
+        fn survivor_resumed_memory_support_is_required_only_for_the_frozen_metered_session() {
+            for metered in [false, true] {
+                let (_directory, args, mut state) = survivor_resume_checkpoint();
+                state["session"]["metered"] = serde_json::Value::Bool(metered);
+                if metered {
+                    state["plan"]["mutants"][2]["outcome"] = serde_json::json!(Outcome::Pending);
+                }
+                let base = args.measure.cache_dir.as_ref().expect("fixture has a cache");
+                survivor_write_resume_snapshot(base, &state);
+                let called = std::cell::Cell::new(false);
+                let mut host = Sink::default();
+                let result = resumed_testing_with_support(
+                    &mut host,
+                    &args,
+                    When::Never,
+                    Styler::new(false),
+                    || {
+                        called.set(true);
+                        Err(std::io::Error::new(
+                            ErrorKind::Unsupported,
+                            "fixture host has no delegated memory boundary",
+                        ))
+                    },
+                    |_| {},
+                );
+                assert_eq!(called.get(), metered);
+                if metered {
+                    let Err(error) = result else {
+                        panic!("a memory-controlled checkpoint cannot silently lose its boundary")
+                    };
+                    assert!(
+                        error.to_string().contains("cannot resume the campaign's memory-controlled tests"),
+                        "{error}"
+                    );
+                    assert!(host.err().is_empty(), "host support is checked before the resume announcement");
+                } else {
+                    assert!(
+                        matches!(result, Ok(Executed { plan: Some(_), .. })),
+                        "unmetered settled work needs no host boundary"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn survivor_actual_resumed_terminal_matrix_does_not_start_execution_progress_for_publication_only() {
+            for visible in [false, true] {
+                for dashboard in [false, true] {
+                    let (_directory, mut args, _) = survivor_resume_checkpoint();
+                    args.dashboard = dashboard;
+                    args.show_unviable = true;
+                    let mut host = Sink::default();
+                    resumed_testing(
+                        &mut host,
+                        &args,
+                        if visible { When::Always } else { When::Never },
+                        Styler::new(true),
+                    )
+                    .expect("the settled terminal matrix never launches a process");
+                    let diagnostics = host.err();
+                    assert!(
+                        diagnostics.contains("\x1b["),
+                        "requested styling reaches the actual resume announcement"
+                    );
+                    assert!(
+                        !diagnostics.contains("\x1b[?2026h"),
+                        "publication-only recovery never starts an execution dashboard"
+                    );
+                    assert!(!diagnostics.contains("\r\x1b[2K"), "publication has no execution progress bar");
+                    assert!(
+                        host.out().contains("unviable"),
+                        "the requested bulk unviable listing survives footer construction: {}",
+                        host.out()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn survivor_actual_resumed_advice_uses_persisted_campaign_reachability_instead_of_outcome_only_fallbacks() {
+            for reachable in [false, true] {
+                let notes = crate::notes::Run::new();
+                let _scope = crate::notes::enter(Some(&notes));
+                let (_directory, args, _) = survivor_resume_checkpoint();
+                if !reachable {
+                    fs::create_dir_all(exec::gamma_base(&args.select.dir, None).join("campaign-location"))
+                        .expect("a real directory can block the campaign-location file publication");
+                }
+                let mut host = Sink::default();
+                resumed_testing(&mut host, &args, When::Never, Styler::new(false))
+                    .expect("completed verdicts remain reportable when only the locator cannot be published");
+                assert_eq!(host.out().contains("Run `cargo gamma suppress`"), reachable, "{}", host.out());
+                assert_eq!(host.out().contains("Run `cargo gamma hints`"), reachable, "{}", host.out());
+                assert_eq!(
+                    crate::notes::drain()
+                        .iter()
+                        .any(|note| note.contains("could not save campaign-state location")),
+                    !reachable
+                );
+            }
+        }
+
+        #[test]
+        fn survivor_actual_resumed_command_returns_each_native_validation_and_postprocessing_collision() {
+            for case in [
+                "workspace",
+                "artifact",
+                "prepared",
+                "log",
+                "record",
+                "snapshot",
+                "reports",
+                "advice",
+                "diagnostics",
+            ] {
+                let (_directory, args, mut state) = survivor_resume_checkpoint();
+                let base = args.measure.cache_dir.as_ref().expect("the fixture has an explicit cache");
+                let expected = match case {
+                    "workspace" => {
+                        let other = args.select.dir.join("other-workspace");
+                        let _other_plan = plan_at(other.clone());
+                        state["plan"]["root"] = serde_json::json!(other);
+                        state["plan"]["files"][0]["absolute"] = serde_json::json!(other.join("src/lib.rs"));
+                        survivor_write_resume_snapshot(base, &state);
+                        "saved campaign belongs to a different workspace"
+                    }
+                    "artifact" => {
+                        state["plan"]["mutants"][2]["outcome"] = serde_json::json!(Outcome::Pending);
+                        survivor_write_resume_snapshot(base, &state);
+                        fs::remove_file(base.join("workspace/src/lib.rs")).expect("an inspected source artifact can actually disappear");
+                        "prepared"
+                    }
+                    "prepared" => {
+                        state["plan"]["mutants"][2]["outcome"] = serde_json::json!(Outcome::Pending);
+                        state["workspace"]["target"] = serde_json::json!(base.join("foreign-target"));
+                        survivor_write_resume_snapshot(base, &state);
+                        "prepared testing workspace does not belong"
+                    }
+                    "log" => {
+                        fs::create_dir(base.join(crate::commands::verdict_log::TESTING_PROGRESS_LOG))
+                            .expect("a real directory blocks reopening the progress file");
+                        "could not reopen testing progress log"
+                    }
+                    "record" => {
+                        fs::create_dir(base.join("last-gamma-run.json")).expect("a real directory blocks completed-record publication");
+                        "refusing to overwrite campaign state"
+                    }
+                    "snapshot" => {
+                        fs::write(base.join(".cargo-gamma-report-source"), "occupied")
+                            .expect("a native file blocks the report-source directory");
+                        "report source path"
+                    }
+                    "reports" => {
+                        fs::create_dir_all(Documents::resolve(&args, &args.select.dir).json)
+                            .expect("a real directory blocks report JSON publication");
+                        "could not write"
+                    }
+                    "advice" => {
+                        fs::create_dir_all(Documents::resolve(&args, &args.select.dir).advice)
+                            .expect("a real directory blocks advice publication");
+                        "could not write the advice"
+                    }
+                    "diagnostics" => {
+                        fs::create_dir_all(Documents::resolve(&args, &args.select.dir).diag)
+                            .expect("a real directory blocks diagnostic publication");
+                        "could not write the diagnostics bundle"
+                    }
+                    _ => unreachable!("the case list is exhaustive"),
+                };
+                let Err(error) = resumed_testing(&mut Sink::default(), &args, When::Never, Styler::new(false)) else {
+                    panic!("the native {case} failure must be returned");
+                };
+                assert!(error.to_string().contains(expected), "{case}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_configuration_warning_and_resume_gates_respect_every_effective_source() {
+        let directory = workdir("run-config-conditions-");
+        let root = Utf8Path::from_path(directory.path()).unwrap();
+        fs::create_dir(root.join(".cargo")).unwrap();
+        let foreign = root.join(".cargo/mutants.toml");
+        let custom = root.join("custom.toml");
+        fs::write(&custom, "jobs = 7\n").unwrap();
+        for (present, no_config, explicit, warning) in [
+            (false, false, false, false),
+            (true, false, false, true),
+            (true, true, false, false),
+            (true, false, true, false),
+        ] {
+            if present {
+                fs::write(&foreign, "not gamma syntax").unwrap();
+            }
+            let mut args = RunArgs::default();
+            args.select.dir = root.to_owned();
+            args.select.config.no_config = no_config;
+            args.select.config.path = explicit.then(|| custom.clone());
+            let mut host = Sink::default();
+            configure(&mut host, &mut args, Styler::new(true)).unwrap();
+            assert_eq!(host.err().contains(".cargo/mutants.toml is not supported or read"), warning);
+            assert_eq!(
+                host.err().contains('\u{1b}'),
+                warning,
+                "the supplied colored warning style must survive forwarding"
+            );
+            assert_eq!(args.measure.jobs, explicit.then_some(7));
+            if present {
+                fs::remove_file(&foreign).unwrap();
+            }
+        }
+        fs::write(root.join("gamma.toml"), "jobs = 7\nfeatures = ['configured']\nmin-score = 82.5\n").unwrap();
+        let mut args = RunArgs::default();
+        args.select.dir = root.to_owned();
+        args.resume_testing = true;
+        configure(&mut Sink::default(), &mut args, Styler::new(false)).unwrap();
+        assert_eq!(args.min_score, Some(82.5));
+        assert_eq!(
+            args.measure.jobs, None,
+            "resumption reads reporting gates, not current execution configuration"
+        );
+        assert!(args.select.features.features.is_empty());
+        fs::write(root.join("gamma.toml"), "[").unwrap();
+        args.resume_testing = false;
+        configure(&mut Sink::default(), &mut args, Styler::new(false)).expect_err("malformed ordinary configuration must return an error");
+        fs::write(root.join("gamma.toml"), "workspace = true\n").unwrap();
+        args.select.packages = vec!["subject".into()];
+        configure(&mut Sink::default(), &mut args, Styler::new(false))
+            .expect_err("a configured workspace cannot be combined with an explicit package selection");
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_report_advice_diagnostic_and_gate_entrypoints_retain_the_supplied_color_style() {
+        let directory = workdir("run-style-forwarding-");
+        let plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        let mut args = RunArgs::default();
+        let session = session();
+        let styler = Styler::new(true);
+        for emitter in 0..8 {
+            let mut host = Sink::default();
+            match emitter {
+                0 => emit_reports(&mut host, &args, &plan, None, Some(19), &[], styler).unwrap(),
+                1 => report_stuck(&mut host, &["distinct failure".into()], styler).unwrap(),
+                2 => emit_diag(&mut host, &args, &plan, Some(&session), Instant::now(), styler).unwrap(),
+                3 => emit_diag_bundle(&mut host, &args, &plan, Some(&session), Instant::now(), styler).unwrap(),
+                4 => emit_diag_bundle_to(
+                    &mut host,
+                    &args,
+                    &plan,
+                    None,
+                    Instant::now(),
+                    styler,
+                    &plan.root.join("custom-diag.json"),
+                )
+                .unwrap(),
+                5 => emit_advice(&mut host, &args, &plan, &session, Duration::from_secs(1), styler).unwrap(),
+                6 => {
+                    args.min_score = Some(80.0);
+                    assert_eq!(ungraded(&mut host, &args, styler, false, false), EXIT_GATE_FAILED);
+                }
+                _ => {
+                    args.diag = true;
+                    emit_diag(&mut host, &args, &plan, Some(&session), Instant::now(), styler).unwrap();
+                }
+            }
+            assert!(
+                host.err().contains("\u{1b}["),
+                "emitter {emitter} discarded its explicit color style: {}",
+                host.err()
+            );
+        }
+        args.diag = true;
+        fails_at_every_line(1, |host| emit_diag(host, &args, &plan, Some(&session), Instant::now(), styler));
+    }
+
+    fn prepared_record(plan: &Plan, base: &Utf8Path) -> RecordPreparation {
+        RecordPreparation {
+            report_info: None,
+            name_filtered: false,
+            base: base.to_owned(),
+            context: crate::discover::record_context(&crate::discover::RecordContext {
+                toolchain: Some("survivor-record-context"),
+                ..crate::discover::RecordContext::default()
+            })
+            .unwrap(),
+            inputs: crate::discover::RunRecord::snapshot_with_external(&plan.root, base, &[], false),
+            killers: crate::discover::Killers::default(),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_completed_and_incomplete_records_propagate_real_filesystem_and_phase_failures() {
+        let directory = workdir("run-record-failures-");
+        let mut plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        plan.mutants[0].outcome = Outcome::CompileError;
+        let base = plan.root.join("blocked-cache");
+        let prepared = prepared_record(&plan, &base);
+        fs::write(&base, "retained cache collision").unwrap();
+        publish_completed_record(prepared.clone(), &plan, None)
+            .expect_err("a completed record cannot replace a file that blocks its cache directory");
+        store_incomplete_convergence(&prepared, &plan).expect_err("incomplete convergence must return its cache publication error");
+        let failed = exec::FailedMeasurement {
+            plan: Some(plan.clone()),
+            ..exec::FailedMeasurement::default()
+        };
+        store_failed_convergence(Some(&prepared), &failed)
+            .expect_err("a failed measurement must propagate incomplete-record publication errors");
+        assert_eq!(fs::read_to_string(&base).unwrap(), "retained cache collision");
+        fs::remove_file(&base).unwrap();
+        fs::create_dir(&base).unwrap();
+        fs::write(base.join("testing-phase.json"), "{").unwrap();
+        publish_completed_record(prepared, &plan, None)
+            .expect_err("a malformed testing phase must prevent marking a completed record as finished");
+        assert!(
+            base.join("last-gamma-run.json").is_file(),
+            "the phase error follows successful completed-record publication"
+        );
+        assert_eq!(fs::read_to_string(base.join("testing-phase.json")).unwrap(), "{");
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_missing_snapshot_source_is_an_incomplete_learning_error_and_advice_uses_any_resource_failure() {
+        let directory = workdir("run-record-generation-");
+        let mut plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        let base = plan.root.join("campaign");
+        fs::remove_file(plan.root.join("src/lib.rs")).unwrap();
+        let prepared = prepared_record(&plan, &base);
+        assert_eq!(
+            store_incomplete_convergence(&prepared, &plan).unwrap_err().message(),
+            "could not construct incomplete compiler learning from the captured source generation"
+        );
+        assert!(!base.exists());
+        fs::write(plan.root.join("src/lib.rs"), plan.files[0].source.as_ref().unwrap()).unwrap();
+        plan.mutants[0].outcome = Outcome::Survived;
+        plan.mutants[1].outcome = Outcome::Timeout;
+        let stored = crate::discover::RunRecord::from_run(&plan.root, &plan.mutants, &prepared.context, &[plan.root.join("src")]);
+        assert_eq!(postprocessing_advice(&plan.root, &stored, false), (false, false));
+        assert!(
+            postprocessing_advice(&plan.root, &stored, true).1,
+            "one resource failure beside a nonresource outcome remains suppressible"
+        );
+        let snapshot = plan.root.join("unavailable-report-source");
+        let failure = emit_reports_from(
+            &mut Sink::default(),
+            &RunArgs::default(),
+            &plan,
+            &ReportContents {
+                retained_info: None,
+                source_root: Some(&snapshot),
+                advice: None,
+                tests: None,
+                dropped: &[],
+            },
+            Styler::new(false),
+        )
+        .expect_err("missing synchronized report source must return an error rather than panic");
+        assert!(failure.to_string().contains("could not read campaign source"));
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_published_campaign_advice_requires_the_locator_to_resolve_back_to_that_generation() {
+        let directory = workdir("run-locator-validation-");
+        let mut plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        plan.mutants[0].outcome = Outcome::CompileError;
+        let base = plan.root.join("campaign");
+        let prepared = prepared_record(&plan, &base);
+        fs::create_dir(&base).unwrap();
+        crate::exec::mark_cache_owned_for_test(&plan.root, &base);
+        fs::write(plan.root.join("Cargo.toml"), "[").unwrap();
+        let advice = store_completed_record(prepared, &plan, None).unwrap();
+        assert_eq!(
+            advice,
+            (false, false),
+            "publishing a locator alone does not prove the requested workspace can resolve it"
+        );
+        let stored = crate::discover::RunRecord::load_required(&base).unwrap();
+        assert!(
+            crate::discover::Hints::record_promotion_is_useful(&plan.root, &stored),
+            "the saved compiler ordering really would be promotable if its locator were reachable"
+        );
+    }
+
+    fn quiet_events(host: &mut Sink) -> ConsoleEvents<'_, Sink> {
+        ConsoleEvents {
+            host,
+            progress: Progress::new(false, Styler::new(false), Some(80)),
+            dashboard: Dashboard::new(false, Some(80), Styler::new(false)),
+            styler: Styler::new(false),
+            show_build: false,
+            verdict_log: VerdictLog::default(),
+        }
+    }
+
+    #[test]
+    fn survivor_empty_failure_artifacts_leave_the_original_cause_and_filesystem_untouched() {
+        let directory = workdir("run-empty-failure-artifacts-");
+        let plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        let args = RunArgs::default();
+        let mut failure = Error::new("baseline failed before any test outcome");
+        let mut host = Sink::default();
+        emit_failure_artifacts(
+            &mut quiet_events(&mut host),
+            &args,
+            &plan,
+            None,
+            &mut failure,
+            &plan.root,
+            Instant::now(),
+        );
+        assert_eq!(failure.message(), "baseline failed before any test outcome");
+        assert!(host.err().is_empty());
+        assert!(!Documents::resolve(&args, &plan.root).diag.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "system-tests")]
+    fn survivor_partial_failure_artifact_writes_preserve_session_data_and_every_specific_warning() {
+        let directory = workdir("run-partial-failure-artifacts-");
+        let plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).unwrap());
+        let args = RunArgs {
+            artifact_dir: Some(plan.root.join("canonical")),
+            ..RunArgs::default()
+        };
+        let artifacts = plan.root.join("nested");
+        for blocked in [
+            Documents::resolve(&args, &plan.root).diag,
+            artifacts.join("baseline-failures/first/failure.json"),
+            artifacts.join("baseline-failures/first/diags.json"),
+        ] {
+            fs::create_dir_all(blocked).unwrap();
+        }
+        let mut failure = Error::new("baseline failed")
+            .with_nested_artifact(
+                "baseline-failures/first".into(),
+                "failure.json",
+                serde_json::json!({"failure": "first"}),
+            )
+            .with_nested_artifact(
+                "baseline-failures/second".into(),
+                "failure.json",
+                serde_json::json!({"failure": "second"}),
+            );
+        let mut measured = session();
+        measured.tests = Some(73);
+        let mut host = Sink::default();
+        emit_failure_artifacts(
+            &mut quiet_events(&mut host),
+            &args,
+            &plan,
+            Some(&measured),
+            &mut failure,
+            &artifacts,
+            Instant::now(),
+        );
+        assert_eq!(
+            failure.message(),
+            format!(
+                "baseline measurement failed due to 2 test failures; only 1 of 2 failure files could be written under {}",
+                platform_path(&artifacts.join("baseline-failures"))
+            )
+        );
+        for warning in [
+            "could not preserve the canonical diagnostics bundle after the baseline failure:",
+            "could not preserve the baseline failure record:",
+            "could not preserve the diagnostics bundle after the baseline failure:",
+        ] {
+            assert_eq!(host.err().matches(warning).count(), 1, "{}", host.err());
+        }
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(artifacts.join("baseline-failures/second/failure.json")).unwrap()).unwrap();
+        assert_eq!(record, serde_json::json!({"failure": "second"}));
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(artifacts.join("baseline-failures/second/diags.json")).unwrap()).unwrap();
+        assert_eq!(diagnostic["build"]["tests"], 73);
+        assert!(artifacts.join("baseline-failures/first/failure.json").is_dir());
+        assert!(artifacts.join("baseline-failures/first/diags.json").is_dir());
+    }
 
     #[derive(Debug, Default)]
     struct ClosedResults {
@@ -1678,6 +3370,21 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_name_filter_is_named_in_the_unevaluated_gate_hint() {
+        let args = RunArgs {
+            // Any valid threshold enables the gate; its value is illustrative.
+            min_score: Some(80.0),
+            ..RunArgs::default()
+        };
+        let mut host = Sink::default();
+
+        let code = ungraded(&mut host, &args, Styler::new(false), false, false);
+
+        assert_eq!(code, EXIT_GATE_FAILED);
+        assert!(host.err().contains("`--re`"), "{}", host.err());
+    }
+
+    #[test]
     fn disabled_incremental_mode_suppresses_missing_hints_advice() {
         let dir = workdir("run-missing-hints-");
         let root = Utf8Path::from_path(dir.path()).expect("UTF-8 work directory");
@@ -1706,21 +3413,47 @@ mod tests {
     }
 
     #[test]
+    fn incremental_no_disables_context_reuse_not_authoritative_historical_exclusions() {
+        let args = RunArgs {
+            incremental: Some(exec::IncrementalMode::No),
+            ..RunArgs::default()
+        };
+        assert!(incremental_context(&args).is_none());
+        let directory = crate::testing::workdir("incremental-independent-exclusions-");
+        let mut plan = plan_at(Utf8PathBuf::from_path_buf(directory.path().to_owned()).unwrap());
+        let base = plan.root.join("historical-exclusions");
+        fs::create_dir(&base).unwrap();
+        let mut inventory = crate::discover::CompilerExclusions::load(&base, &plan.root).unwrap();
+        let mutant = &mut plan.mutants[0];
+        mutant.outcome = Outcome::Pending;
+        mutant.ordinal = 1;
+        inventory.remember(core::slice::from_ref(mutant), &crate::HashSet::from_iter([1]), |_| "E0308".into());
+        inventory.store(&base).unwrap();
+        let inventory = crate::discover::CompilerExclusions::load(&base, &plan.root).unwrap();
+        assert_eq!(inventory.exclude(&mut plan.mutants), 1);
+        assert_eq!(plan.mutants[0].outcome, Outcome::CompileError);
+        assert_eq!(plan.mutants[0].ordinal, 0);
+    }
+
+    #[test]
     fn disabled_incremental_still_persists_postprocessing_state_without_adoption() {
         let args = RunArgs {
             incremental: Some(exec::IncrementalMode::No),
             ..RunArgs::default()
         };
         let (record_context, reusable) = postprocessing_contexts(&args, None).expect("real runs prepare a record");
+        assert!(record_context.states(crate::discover::Term::Environment));
         let (plan, _directory) = private_plan();
         let base = plan.root.join("campaign-state");
         let _locks = exec::claim_cache(&plan.root, &plan.root.join("target"), Some(&base)).expect("owned campaign cache");
         let inputs = crate::discover::RunRecord::snapshot_with_external(&plan.root, &base, &[], false);
         let prepared = RecordPreparation {
+            report_info: None,
             base: base.clone(),
             context: record_context,
             inputs,
             killers: crate::discover::Killers::default(),
+            name_filtered: false,
         };
         let killer = crate::discover::Killer {
             package: "subject".to_owned(),
@@ -1747,6 +3480,7 @@ mod tests {
         let base = plan.root.join("target/campaign-state");
         fs::create_dir_all(&base).expect("campaign base");
         let prepared = RecordPreparation {
+            report_info: None,
             inputs: crate::discover::RunRecord::snapshot_with_external(&plan.root, &base, &[], false),
             base: base.clone(),
             context: crate::discover::record_context(&crate::discover::RecordContext {
@@ -1755,6 +3489,7 @@ mod tests {
             })
             .expect("record context"),
             killers: crate::discover::Killers::default(),
+            name_filtered: false,
         };
         let failed = exec::FailedMeasurement {
             plan: Some(plan),
@@ -1783,6 +3518,7 @@ mod tests {
         .collect();
         crate::discover::RunRecord::store_probes(&base, &stale);
         let prepared = RecordPreparation {
+            report_info: None,
             inputs: crate::discover::RunRecord::snapshot_with_external(&plan.root, &base, &[], false),
             base: base.clone(),
             context: crate::discover::record_context(&crate::discover::RecordContext {
@@ -1791,6 +3527,7 @@ mod tests {
             })
             .expect("record context"),
             killers: crate::discover::Killers::default(),
+            name_filtered: false,
         };
 
         store_completed_record(prepared, &plan, Some(&crate::exec::Killers::default())).expect("completed campaign publication");
@@ -1818,10 +3555,12 @@ mod tests {
         let base = plan.root.join("campaign-state");
         let _locks = exec::claim_cache(&plan.root, &plan.root.join("target"), Some(&base)).expect("owned campaign cache");
         let prepared = RecordPreparation {
+            report_info: None,
             inputs: crate::discover::RunRecord::snapshot_with_external(&plan.root, &base, &[], false),
             base: base.clone(),
             context: crate::discover::ContextDigest::default(),
             killers: crate::discover::Killers::scan(&[plan.files[0].absolute.clone()]),
+            name_filtered: false,
         };
 
         store_completed_record(prepared, &plan, None).expect("completed campaign publication");
@@ -1850,10 +3589,12 @@ mod tests {
         assert_eq!(exec::campaign_base_from_state(&plan.root, None), Some(base.clone()));
         let inputs = crate::discover::RunRecord::snapshot_with_external(&plan.root, &base, &[], true);
         let prepared = RecordPreparation {
+            report_info: None,
             base: base.clone(),
             context: crate::discover::ContextDigest::default(),
             inputs,
             killers: crate::discover::Killers::default(),
+            name_filtered: false,
         };
         let probes = core::iter::once((
             plan.mutants[0].id.clone(),
@@ -1889,10 +3630,12 @@ mod tests {
         let mut plan = plan();
         let base = plan.root.join("campaign-state");
         let prepared = RecordPreparation {
+            report_info: None,
             inputs: crate::discover::RunRecord::snapshot_with_external(&plan.root, &base, &[], false),
             base,
             context: crate::discover::ContextDigest::default(),
             killers: crate::discover::Killers::default(),
+            name_filtered: false,
         };
         let changed = "pub fn changed() -> bool { true }\n";
         fs::write(&plan.files[0].absolute, changed).expect("changed source");
@@ -1923,6 +3666,7 @@ mod tests {
                 dir: missing,
                 ..crate::commands::SelectArgs::default()
             },
+            dry_run: true,
             ..RunArgs::default()
         };
         let mut host = Sink::default();
@@ -2027,14 +3771,11 @@ mod tests {
 
     fn plan_at(root: Utf8PathBuf) -> Plan {
         let src = root.join("src");
-        let source = "pub fn less(a: i32, b: i32) -> bool { a < b }\n";
+        let source = include_str!("../../tests/fixtures/completed-recovery/lib.rs");
         crate::testing::write_project(
             root.as_std_path(),
             &[
-                (
-                    "Cargo.toml",
-                    "[package]\nname = \"subject\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n",
-                ),
+                ("Cargo.toml", include_str!("../../tests/fixtures/completed-recovery/Cargo.toml")),
                 ("src/lib.rs", source),
             ],
         );
@@ -2141,9 +3882,47 @@ mod tests {
         assert_eq!(info.tests, Some(17));
         assert_eq!(info.mutant_id_version, Some(crate::model::MUTANT_ID_VERSION));
         assert!(!info.merged);
+        assert!(!info.name_filtered);
         assert!(info.not_built.is_none());
         assert_eq!(info.dropped_test_packages, ["unavailable"]);
         assert!(info.merge_provenance.is_none());
+
+        let mut filtered = RunArgs::default();
+        filtered.select.name_patterns.push(": accepts: ".to_owned());
+        assert!(run_info(&filtered, None, &[]).name_filtered);
+    }
+
+    #[test]
+    fn resumed_report_provenance_preserves_shard_age_and_other_shards() {
+        let retained = crate::fixtures::report_with(Some((1, 3)), 100, Vec::new()).config.unwrap();
+        let info = resumed_report_info(Some(&retained));
+        let info = report_info(&RunArgs::default(), Some(&info), Some(17), &["dropped".to_owned()]);
+        let mut expected = retained;
+        expected.tests = Some(17);
+        expected.dropped_test_packages = vec!["dropped".to_owned()];
+        assert_eq!(serde_json::to_value(&info).unwrap(), serde_json::to_value(expected).unwrap());
+        let mut resumed = crate::fixtures::report_with(None, 300, vec![crate::fixtures::mutant_result_at("older", 1, "Killed")]);
+        resumed.config = Some(info);
+        let other = crate::fixtures::report_with(Some((0, 3)), 110, vec![crate::fixtures::mutant_result_at("other", 2, "Survived")]);
+        let merged = crate::merge::merge(&[("resumed".to_owned(), resumed), ("other".to_owned(), other)], 300, Some(50));
+        assert_eq!(
+            (merged.withdrawn, merged.stale, merged.fresh, merged.shard_count),
+            (0, 2, 0, Some(3))
+        );
+        assert_eq!(merged.shards_seen, std::collections::BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn legacy_resume_reports_cannot_refresh_evidence_or_withdraw_other_populations() {
+        let info = resumed_report_info(None);
+        assert_eq!(info.started_at, 0);
+        assert!(info.merged);
+        assert!(info.shard.is_none());
+        let mut resumed = crate::fixtures::report_with(None, 300, vec![crate::fixtures::mutant_result_at("older", 1, "Killed")]);
+        resumed.config = Some(info);
+        let other = crate::fixtures::report_with(Some((0, 3)), 110, vec![crate::fixtures::mutant_result_at("other", 2, "Survived")]);
+        let merged = crate::merge::merge(&[("legacy".to_owned(), resumed), ("other".to_owned(), other)], 300, Some(50));
+        assert_eq!((merged.withdrawn, merged.stale, merged.fresh), (0, 2, 0));
     }
 
     #[test]
@@ -2248,7 +4027,7 @@ mod tests {
         measured.phases.sweep = Some(exec::SweepCost {
             launches: 821,
             exact_hits: 384,
-            generalized_hits: 2,
+            inferred_hits: 2,
             ..exec::SweepCost::default()
         });
 
@@ -2597,6 +4376,39 @@ mod tests {
         assert!(err.contains("── diag ─"), "{err}");
     }
 
+    #[test]
+    fn resumed_reporting_artifacts_describe_frozen_settings() {
+        let directory = workdir("resumed-reporting-");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).expect("utf8");
+        let mut live = RunArgs {
+            artifact_dir: Some(root.clone()),
+            ..RunArgs::default()
+        };
+        live.measure.jobs = Some(99);
+        live.measure.profile = Some("test".to_owned());
+        let shard = crate::elements::ShardInfo { count: 3, index: 1 };
+        let frozen = resumed_reporting_args(&live, 7, Some("relational.lt_to_le"), &[], Some(&shard), Some("gamma"));
+        let plan = plan();
+        let mut measured = session();
+        measured.baseline_wall = Duration::from_secs(20);
+        let mut host = Sink::default();
+        emit_advice(&mut host, &frozen, &plan, &measured, Duration::from_mins(2), Styler::new(false)).unwrap();
+        emit_diag(&mut host, &frozen, &plan, Some(&measured), Instant::now(), Styler::new(false)).unwrap();
+        let advice = fs::read_to_string(root.join("gamma-perf-advice.md")).unwrap();
+        assert!(advice.contains("at 7 jobs"), "{advice}");
+        assert!(!advice.contains("under Cargo's default test profile"), "{advice}");
+        assert!(!advice.contains("under test"), "{advice}");
+        let diagnostics: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("gamma-diagnostics.json")).unwrap()).unwrap();
+        assert_eq!(diagnostics["config"]["jobs"], 7);
+        assert_eq!(diagnostics["config"]["mutators"], serde_json::json!(["relational.lt_to_le"]));
+        assert_eq!(diagnostics["config"]["shard"], serde_json::json!([1, 3]));
+        let panel = summary_panel(&frozen, &plan, &measured, &[], &[], Duration::from_mins(2));
+        assert!(panel.contains("at 7 jobs"), "{panel}");
+        assert!(!panel.contains("under test"), "{panel}");
+        assert!(summary_panel(&live, &plan, &measured, &[], &[], Duration::from_mins(2)).contains("under test"));
+    }
+
     /// The bundle exists to be attached to an issue, which only works if it is already on disk by
     /// the time anyone decides the run was worth reporting.
     #[test]
@@ -2618,16 +4430,12 @@ mod tests {
 
         assert!(!args.diag, "the prose dump was not asked for and must not be the trigger");
         assert!(!err.contains("── diag ─"), "{err}");
-        assert_eq!(parsed["schemaVersion"], "5");
+        assert_eq!(parsed["schemaVersion"], "7");
         assert!(parsed["run"]["wallMs"].is_number(), "{text}");
 
-        // The phase profile is what makes the census's cost and its sweep dividend readable from one
-        // run. The copy, preflight and baseline always ran, so they are always present and named in
-        // camelCase; this session had no census, so that phase is omitted rather than a lying zero.
         assert!(parsed["phases"]["copy"]["elapsedMs"].is_number(), "{text}");
         assert!(parsed["phases"]["preflight"]["elapsedMs"].is_number(), "{text}");
         assert!(parsed["phases"]["baseline"]["elapsedMs"].is_number(), "{text}");
-        assert!(parsed["phases"]["census"].is_null(), "no census ran, so it is omitted: {text}");
 
         assert!(err.contains(&platform_path(&path)), "{err}");
     }
@@ -2679,8 +4487,8 @@ mod tests {
 
         assert!(first_baseline.contains("assertion failed"), "{first_baseline}");
         assert!(second_baseline.contains("time budget exceeded"), "{second_baseline}");
-        assert!(first_diagnostics.contains("\"schemaVersion\": \"5\""), "{first_diagnostics}");
-        assert!(second_diagnostics.contains("\"schemaVersion\": \"5\""), "{second_diagnostics}");
+        assert!(first_diagnostics.contains("\"schemaVersion\": \"7\""), "{first_diagnostics}");
+        assert!(second_diagnostics.contains("\"schemaVersion\": \"7\""), "{second_diagnostics}");
         assert_eq!(
             failure.to_string(),
             format!(
@@ -2727,38 +4535,6 @@ mod tests {
             failure.to_string().contains("could not remove stale baseline failures"),
             "{failure}"
         );
-    }
-
-    /// A run that censused says so in its bundle: the phase carries its own elapsed time, the tests
-    /// it walked, and the binaries it examined, so the census's cost is legible on its own rather
-    /// than folded inside the build's total.
-    #[test]
-    fn a_censused_run_records_the_census_phase_in_its_bundle() {
-        let mut args = RunArgs::default();
-
-        args.measure.jobs = Some(0);
-
-        let plan = plan();
-        let mut session = session();
-
-        session.phases.census = Some(exec::CensusCost {
-            elapsed: Duration::from_secs(8),
-            walked: 1_681,
-            binaries: 30,
-            ..exec::CensusCost::default()
-        });
-
-        let mut host = Sink::default();
-
-        emit_diag(&mut host, &args, &plan, Some(&session), Instant::now(), Styler::new(false)).expect("diag");
-
-        let path = Documents::resolve(&args, &plan.root).diag;
-        let text = fs::read_to_string(&path).expect("bundle file");
-        let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid json");
-
-        assert_eq!(parsed["phases"]["census"]["elapsedMs"], 8_000);
-        assert_eq!(parsed["phases"]["census"]["walked"], 1_681);
-        assert_eq!(parsed["phases"]["census"]["binaries"], 30);
     }
 
     /// The promise the file is worth attaching on: nothing in it names the tree it came from.
@@ -2847,6 +4623,71 @@ mod tests {
         assert!(host.err().contains("Hint"), "{}", host.err());
         assert!(host.err().contains("is not supported or read"), "{}", host.err());
         assert!(host.err().contains("configure gamma.toml explicitly"), "{}", host.err());
+    }
+
+    #[test]
+    fn resumed_environment_is_checked_only_when_mutants_remain_pending() {
+        for outcomes in [vec![], vec![Outcome::Killed, Outcome::Survived], vec![Outcome::NoCoverage]] {
+            let mutants: Vec<_> = outcomes.into_iter().map(|outcome| mutant(0, outcome, 0)).collect();
+            validate_resumed_environment(&mutants, || panic!("completed verdicts inherit no new environment")).unwrap();
+        }
+        for outcomes in [vec![Outcome::Pending], vec![Outcome::Killed, Outcome::Pending]] {
+            let mutants: Vec<_> = outcomes.into_iter().map(|outcome| mutant(0, outcome, 0)).collect();
+            let mut checked = false;
+            validate_resumed_environment(&mutants, || {
+                checked = true;
+                Ok(())
+            })
+            .unwrap();
+            assert!(checked);
+            let failure = validate_resumed_environment(&mutants, || Err(error!("scripted environment mismatch"))).unwrap_err();
+            assert_eq!(failure.to_string(), "scripted environment mismatch");
+        }
+    }
+
+    #[test]
+    fn unavailable_cache_context_still_records_environment_without_enabling_reuse() {
+        let (record_context, reusable) = postprocessing_contexts(&RunArgs::default(), None).unwrap();
+        assert!(record_context.states(crate::discover::Term::Environment));
+        assert!(record_context.term(crate::discover::Term::Toolchain).is_empty());
+        assert!(reusable.is_none());
+        assert!(
+            postprocessing_contexts(
+                &RunArgs {
+                    dry_run: true,
+                    ..RunArgs::default()
+                },
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resume_configuration_loads_only_reporting_gates() {
+        let dir = workdir("run-resume-gates-");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        fs::write(
+            root.join("gamma.toml"),
+            "min-score = 80.0\nmax-flaky = 2\njobs = 12\nno-confirm = true\n",
+        )
+        .unwrap();
+        for disabled in [false, true] {
+            let mut args = RunArgs {
+                resume_testing: true,
+                select: crate::commands::SelectArgs {
+                    dir: root.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            args.select.config.no_config = disabled;
+            configure(&mut Sink::default(), &mut args, Styler::new(false)).unwrap();
+            assert_eq!(args.min_score, if disabled { None } else { Some(80.0) });
+            assert_eq!(args.max_flaky, if disabled { None } else { Some(2) });
+            assert_eq!(args.measure.jobs, None);
+            assert!(!args.no_confirm);
+        }
     }
 
     /// Asking not to read config suppresses the note along with the loading.
@@ -2989,7 +4830,6 @@ mod tests {
         args.measure.include_tests = vec!["include-*".to_owned()];
         args.measure.exclude_tests = vec!["exclude-*".to_owned()];
         args.measure.test_workspace = true;
-        args.measure.optimize_test_execution = true;
         args.measure.nextest = true;
         args.limits.build_timeout = Some(11.25);
         args.limits.build_timeout_multiplier = Some(3.5);
@@ -3033,7 +4873,6 @@ mod tests {
         assert_eq!(config.include_tests, ["include-*"]);
         assert_eq!(config.exclude_tests, ["exclude-*"]);
         assert!(config.test_workspace);
-        assert!(config.optimize_test_execution);
         assert!(!config.whole_test_binaries);
         assert!(config.nextest);
         assert_eq!(config.incremental, exec::IncrementalMode::No);

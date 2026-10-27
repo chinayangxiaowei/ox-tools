@@ -3,6 +3,7 @@
 
 //! The union that turns per-shard reports into one score.
 
+use core::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ptr::from_ref;
@@ -43,6 +44,7 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
     // for speed over collision resistance would let whoever wrote them decide how long a merge
     // takes.
     let mut latest: HashMap<&str, Verdict<'_>> = HashMap::new();
+    let mut sightings: HashMap<&str, Sighting<'_>> = HashMap::new();
     let mut out = Merged::default();
     let mut lineages = Lineages::default();
     let selected_identity_version = reports
@@ -63,13 +65,6 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
 
     let current = populations(&compatible, &mut lineages);
     let sources = sources(&compatible, &mut lineages);
-
-    // Withdrawal is a fact about a mutant, not about the inputs that mentioned it. Counting a
-    // sighting per input made ten nightly reports of the same three withdrawn ids read as thirty,
-    // and inflated the one figure whose whole job is to say whether the inputs span commits further
-    // apart than the reader thinks — the figure that is also how passing the same file twice would
-    // otherwise become visible.
-    let mut withdrawn: HashSet<&str> = HashSet::new();
 
     out.unchecked = compatible
         .iter()
@@ -98,21 +93,36 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
             let (source_at, source_origin, source_lineage) = source_provenance(input_name, report, path, file, &mut lineages);
 
             for mutant in &file.mutants {
-                // A file whose current population is known admits exactly the ids in it. When no
-                // input supplies a complete population, absence says nothing about whether the code
-                // still exists, so every id remains admissible.
-                if current.get(path.as_str()).is_some_and(|population| {
-                    !population.ids.contains(mutant.id.as_str())
-                        && population_is_authoritative(
-                            rank(source_origin, source_at, &source_lineage),
-                            rank(population.origin, population.started_at, &population.lineage),
-                        )
-                }) {
-                    let _ = withdrawn.insert(mutant.id.as_str());
-                    continue;
+                let sighting = sighting_provenance(
+                    report,
+                    mutant,
+                    source_at,
+                    source_origin,
+                    &source_lineage,
+                    source_name_filtered(report, path),
+                );
+                match sightings.entry(mutant.id.as_str()) {
+                    Entry::Vacant(slot) => {
+                        let _ = slot.insert(sighting);
+                    }
+                    Entry::Occupied(mut slot) => {
+                        let held = slot.get_mut();
+                        match rank(sighting.origin, sighting.started_at, &sighting.lineage).cmp(&rank(
+                            held.origin,
+                            held.started_at,
+                            &held.lineage,
+                        )) {
+                            Ordering::Greater => *held = sighting,
+                            // Equal-rank twins can differ only in their filter flag; keep either
+                            // one's protection so the outcome does not depend on input order.
+                            Ordering::Equal => held.name_filtered |= sighting.name_filtered,
+                            Ordering::Less => {}
+                        }
+                    }
                 }
 
-                let (tested_at, origin, lineage) = verdict_provenance(input_name, report, mutant, &mut lineages);
+                let (tested_at, origin, lineage, name_filtered) =
+                    verdict_provenance(input_name, report, mutant, source_name_filtered(report, path), &mut lineages);
                 let compatible = file.source == source.file.source && file.language == source.file.language;
                 retain(
                     &mut latest,
@@ -123,6 +133,7 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
                         origin,
                         lineage,
                         compatible,
+                        name_filtered,
                         source_rank: (source.started_at, source.origin, source.lineage.clone()),
                     },
                 );
@@ -130,18 +141,40 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
         }
     }
 
+    // Decide withdrawal after collecting all sightings. An older complete population may omit an
+    // ID later seen by a filtered run; an earlier compatible presentation is still needed to render
+    // that later verdict, even though its own source predates the complete population.
+    let mut withdrawn = 0;
+    latest.retain(|id, verdict| {
+        let sighting = sightings
+            .get(id)
+            .expect("every retained verdict was inserted alongside a source sighting");
+        let removed = current.get(verdict.file).is_some_and(|population| {
+            !population.ids.contains(*id)
+                && population_is_authoritative(
+                    rank(sighting.origin, sighting.started_at, &sighting.lineage),
+                    rank(population.origin, population.started_at, &population.lineage),
+                )
+        });
+        withdrawn += usize::from(removed);
+        !removed
+    });
+
     let mut files: HashMap<&str, Vec<&Verdict<'_>>> = HashMap::new();
 
-    out.withdrawn = withdrawn.len();
+    out.withdrawn = withdrawn;
 
     // The dissenters are named in whatever order the inputs arrived in, and a shell glob chooses
     // that; sorting is what stops the same rotation reading differently on two machines.
     out.inconsistent.sort();
     out.identity_incompatible.sort();
 
-    for verdict in latest.values() {
+    for (id, verdict) in &latest {
         if verdict.presentation.is_none() {
             out.incompatible += 1;
+            if verdict.name_filtered || sightings.get(id).is_some_and(|sighting| sighting.name_filtered) {
+                out.unpresentable_filtered += 1;
+            }
             continue;
         }
 
@@ -180,17 +213,17 @@ pub fn merge(reports: &[(String, Report)], now: u64, window: Option<u64>) -> Mer
 
     out.flaky.sort();
 
-    out.report = rebuild(&compatible, &sources, files);
+    // A rendered report cannot carry a filtered verdict that has no presentation in its selected
+    // source. Publishing this partial result would erase the verdict from every later staged merge.
+    if out.unpresentable_filtered == 0 {
+        out.report = rebuild(&compatible, &sources, &sightings, files);
+    }
     out
 }
 
 /// The mutant-identity scheme a report belongs to.
 fn identity_version(report: &Report) -> u32 {
-    report
-        .config
-        .as_ref()
-        .and_then(|config| config.mutant_id_version)
-        .unwrap_or(MUTANT_ID_VERSION)
+    report.identity_version()
 }
 
 struct Candidate<'report> {
@@ -200,6 +233,7 @@ struct Candidate<'report> {
     origin: &'report str,
     lineage: String,
     compatible: bool,
+    name_filtered: bool,
     source_rank: (u64, &'report str, String),
 }
 
@@ -212,6 +246,7 @@ fn retain<'report>(latest: &mut HashMap<&'report str, Verdict<'report>>, candida
         origin,
         lineage,
         compatible,
+        name_filtered,
         source_rank,
     } = candidate;
     let entry = latest.entry(mutant.id.as_str());
@@ -224,6 +259,7 @@ fn retain<'report>(latest: &mut HashMap<&'report str, Verdict<'report>>, candida
                 tested_at,
                 origin,
                 lineage,
+                name_filtered,
                 presentation: compatible.then_some(mutant),
                 presentation_rank: compatible.then_some(source_rank),
             });
@@ -235,8 +271,13 @@ fn retain<'report>(latest: &mut HashMap<&'report str, Verdict<'report>>, candida
         // earned verdict, but it can supply its presentation when it fits the selected source.
         Entry::Occupied(mut slot) => {
             let held = slot.get();
-            let winner = verdict_rank(&mutant.status, origin, tested_at, &lineage)
-                > verdict_rank(&held.mutant.status, held.origin, held.tested_at, &held.lineage);
+            let order = verdict_rank(&mutant.status, origin, tested_at, &lineage).cmp(&verdict_rank(
+                &held.mutant.status,
+                held.origin,
+                held.tested_at,
+                &held.lineage,
+            ));
+            let winner = order.is_gt();
             let newer_presentation = compatible
                 && held
                     .presentation_rank
@@ -256,14 +297,19 @@ fn retain<'report>(latest: &mut HashMap<&'report str, Verdict<'report>>, candida
                     tested_at,
                     origin,
                     lineage,
+                    name_filtered,
                     presentation,
                     presentation_rank,
                 });
-            } else if newer_presentation {
+            } else {
                 let held = slot.get_mut();
-                held.file = path;
-                held.presentation = Some(mutant);
-                held.presentation_rank = Some(source_rank);
+                // As with sightings, an equal-rank twin keeps either input's filter protection.
+                held.name_filtered |= order.is_eq() && name_filtered;
+                if newer_presentation {
+                    held.file = path;
+                    held.presentation = Some(mutant);
+                    held.presentation_rank = Some(source_rank);
+                }
             }
         }
     }
@@ -301,13 +347,13 @@ fn verdict_rank<'name, 'lineage>(
 
 /// The complete set of mutant ids each file currently admits, where an input says so.
 ///
-/// Only an unsharded report can answer this: it lists every mutant of every file it covers, so an
-/// id it does not mention is an id the code no longer produces. A sharded report lists one slice of
-/// the population, and reading its silence as a withdrawal would erase most of the rotation.
+/// Only an explicitly complete, unsharded, unmerged, unfiltered report can answer this. A partial,
+/// name-filtered, or legacy report contributes observations, but reading its silence as withdrawal
+/// could erase live mutants.
 ///
-/// Two unsharded reports with the same timestamp describe the same commit, so one is as good as the
-/// other; the tie is settled by [`rank`] rather than by which was named first, which is what keeps
-/// the population — and so the whole score — independent of the order the inputs were listed.
+/// Two unsharded, unfiltered reports with the same timestamp describe the same commit, so one is as
+/// good as the other; the tie is settled by [`rank`] rather than by which was named first, which
+/// keeps the population — and so the whole score — independent of input order.
 struct Population<'report> {
     started_at: u64,
     origin: &'report str,
@@ -322,6 +368,15 @@ struct Source<'report> {
     started_at: u64,
     origin: &'report str,
     lineage: String,
+    name_filtered: bool,
+}
+
+/// A mutant's latest source sighting, independent of the file source chosen for rendering.
+struct Sighting<'report> {
+    started_at: u64,
+    origin: &'report str,
+    lineage: String,
+    name_filtered: bool,
 }
 
 fn populations<'report>(
@@ -331,7 +386,11 @@ fn populations<'report>(
     let mut newest: HashMap<&str, Population<'_>> = HashMap::new();
 
     for (name, report) in reports.iter().copied() {
-        if report.config.as_ref().is_some_and(|config| config.shard.is_some() || config.merged) {
+        if !report
+            .config
+            .as_ref()
+            .is_some_and(|config| config.population_complete && config.shard.is_none() && !config.merged && !config.name_filtered)
+        {
             continue;
         }
 
@@ -429,13 +488,64 @@ fn source_provenance<'report>(
     }
 }
 
+/// Prefers staged per-file provenance over the report flag; missing run metadata is unfiltered.
+fn source_name_filtered(report: &Report, path: &str) -> bool {
+    let Some(config) = report.config.as_ref() else {
+        return false;
+    };
+
+    config
+        .merge_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.sources.get(path))
+        .map_or(config.name_filtered, |source| source.name_filtered)
+}
+
+/// Prefers persisted mutant sightings over the rendered source generation.
+/// Older reports without sightings use the source generation and lineage; empty stored lineages
+/// also fall back to the supplied source lineage.
+fn sighting_provenance<'report>(
+    report: &'report Report,
+    mutant: &MutantResult,
+    source_at: u64,
+    source_origin: &'report str,
+    source_lineage: &str,
+    name_filtered: bool,
+) -> Sighting<'report> {
+    let provenance = report
+        .config
+        .as_ref()
+        .and_then(|config| config.merge_provenance.as_ref())
+        .and_then(|provenance| provenance.sightings.get(mutant.id.as_str()));
+
+    provenance.map_or_else(
+        || Sighting {
+            started_at: source_at,
+            origin: source_origin,
+            lineage: source_lineage.to_owned(),
+            name_filtered,
+        },
+        |sighting| Sighting {
+            started_at: sighting.started_at,
+            origin: sighting.origin.as_str(),
+            lineage: if sighting.lineage.is_empty() {
+                source_lineage.to_owned()
+            } else {
+                sighting.lineage.clone()
+            },
+            name_filtered: sighting.name_filtered,
+        },
+    )
+}
+
 /// Finds the run that established one verdict.
 fn verdict_provenance<'report>(
     name: &'report str,
     report: &'report Report,
     mutant: &MutantResult,
+    name_filtered: bool,
     lineages: &mut Lineages<'report>,
-) -> (u64, &'report str, String) {
+) -> (u64, &'report str, String, bool) {
     let provenance = report
         .config
         .as_ref()
@@ -449,9 +559,9 @@ fn verdict_provenance<'report>(
             provenance.lineage.clone()
         };
 
-        (provenance.started_at, provenance.origin.as_str(), lineage)
+        (provenance.started_at, provenance.origin.as_str(), lineage, provenance.name_filtered)
     } else {
-        (started_at(report), name, lineages.verdict(name, mutant))
+        (started_at(report), name, lineages.verdict(name, mutant), name_filtered)
     }
 }
 
@@ -524,17 +634,23 @@ impl<'report> Lineages<'report> {
 }
 
 /// Selects one source generation per file before choosing verdicts.
+///
+/// A name-filtered report lacks presentations for the rest of its file. When an unfiltered source
+/// exists, it wins even if an earlier generation supplied it; otherwise a newer filtered
+/// source could make every unmatched historical verdict incompatible and erase it from the score.
 fn sources<'report>(reports: &[&'report (String, Report)], lineages: &mut Lineages<'report>) -> HashMap<&'report str, Source<'report>> {
     let mut newest = HashMap::new();
 
     for (name, report) in reports.iter().copied() {
         for (path, file) in &report.files {
             let (started_at, origin, lineage) = source_provenance(name, report, path, file, lineages);
+            let name_filtered = source_name_filtered(report, path);
             let candidate = Source {
                 file,
                 started_at,
                 origin,
                 lineage,
+                name_filtered,
             };
 
             match newest.entry(path.as_str()) {
@@ -542,8 +658,10 @@ fn sources<'report>(reports: &[&'report (String, Report)], lineages: &mut Lineag
                     let _ = slot.insert(candidate);
                 }
                 Entry::Occupied(mut slot)
-                    if rank(origin, started_at, &candidate.lineage)
-                        > rank(slot.get().origin, slot.get().started_at, &slot.get().lineage) =>
+                    if (slot.get().name_filtered && !name_filtered)
+                        || (slot.get().name_filtered == name_filtered
+                            && rank(origin, started_at, &candidate.lineage)
+                                > rank(slot.get().origin, slot.get().started_at, &slot.get().lineage)) =>
                 {
                     let _ = slot.insert(candidate);
                 }
@@ -566,25 +684,44 @@ fn merged_tests(reports: &[&(String, Report)]) -> Option<usize> {
         .filter(|_| !reports.is_empty())
 }
 
-fn merged_not_built(reports: &[&(String, Report)]) -> Option<usize> {
-    let count = reports
-        .iter()
-        .filter_map(|(_, report)| report.config.as_ref()?.not_built)
-        .fold(0, usize::saturating_add);
+fn merged_not_built(files: &std::collections::BTreeMap<String, FileResult>) -> Option<usize> {
+    let count = files
+        .values()
+        .flat_map(|file| &file.mutants)
+        .filter(|mutant| {
+            mutant.status == "Ignored"
+                && mutant
+                    .status_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with(crate::elements::NOT_BUILT_PREFIX))
+        })
+        .count();
 
     (count > 0).then_some(count)
 }
 
+fn merged_dropped_test_packages(reports: &[&(String, Report)]) -> Vec<String> {
+    reports
+        .iter()
+        .filter_map(|(_, report)| report.config.as_ref())
+        .flat_map(|config| config.dropped_test_packages.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Rebuilds a report document from the merged verdicts.
 ///
-/// Source text is taken from whichever input had it. A file's source can differ between reports from
-/// different commits; the newest is not necessarily the one that matches every verdict, and there is
-/// no honest way to reconcile that, so the most recent report that contains the file wins and the
-/// freshness accounting is what tells the reader how much to trust it. When two reports are equally
-/// recent the winner is settled by [`rank`], the same tie-break the population used, so the source
-/// and the mutants rendered over it come from one coherent choice rather than from opposite ends of
-/// the argument list.
-fn rebuild(reports: &[&(String, Report)], sources: &HashMap<&str, Source<'_>>, files: HashMap<&str, Vec<&Verdict<'_>>>) -> Option<Report> {
+/// Source text is taken from an unfiltered input when available; otherwise the newest filtered
+/// input supplies it. A file's source can differ between commits, so freshness accounting shows
+/// how much to trust verdicts from other revisions. Equally recent inputs are ordered by [`rank`]
+/// so the choice is independent of argument order.
+fn rebuild(
+    reports: &[&(String, Report)],
+    sources: &HashMap<&str, Source<'_>>,
+    sightings: &HashMap<&str, Sighting<'_>>,
+    files: HashMap<&str, Vec<&Verdict<'_>>>,
+) -> Option<Report> {
     let base = reports
         .iter()
         .max_by(|left, right| rank(&left.0, started_at(&left.1), "").cmp(&rank(&right.0, started_at(&right.1), "")))
@@ -603,6 +740,7 @@ fn rebuild(reports: &[&(String, Report)], sources: &HashMap<&str, Source<'_>>, f
                     started_at: source.started_at,
                     origin: source.origin.to_owned(),
                     lineage: source.lineage.clone(),
+                    name_filtered: source.name_filtered,
                 },
             );
             newest = newest.max(source.started_at);
@@ -636,8 +774,21 @@ fn rebuild(reports: &[&(String, Report)], sources: &HashMap<&str, Source<'_>>, f
                             started_at: verdict.tested_at,
                             origin: verdict.origin.to_owned(),
                             lineage: verdict.lineage.clone(),
+                            name_filtered: verdict.name_filtered,
                         },
                     );
+                    if let Some(sighting) = sightings.get(mutant.id.as_str()) {
+                        newest = newest.max(sighting.started_at);
+                        let _ = provenance.sightings.insert(
+                            mutant.id.to_string(),
+                            SourceProvenance {
+                                started_at: sighting.started_at,
+                                origin: sighting.origin.to_owned(),
+                                lineage: sighting.lineage.clone(),
+                                name_filtered: sighting.name_filtered,
+                            },
+                        );
+                    }
 
                     Some(mutant)
                 })
@@ -662,14 +813,7 @@ fn rebuild(reports: &[&(String, Report)], sources: &HashMap<&str, Source<'_>>, f
         })
         .collect();
 
-    let dropped_test_packages = reports
-        .iter()
-        .filter_map(|(_, report)| report.config.as_ref())
-        .flat_map(|config| config.dropped_test_packages.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-
+    let not_built = merged_not_built(&merged_files);
     Some(Report {
         schema_version: base.schema_version.clone(),
         thresholds: base.thresholds,
@@ -680,10 +824,12 @@ fn rebuild(reports: &[&(String, Report)], sources: &HashMap<&str, Source<'_>>, f
             started_at: newest,
             mutant_id_version: Some(identity_version(base)),
             merged: true,
+            population_complete: false,
+            name_filtered: false,
             shard: None,
             tests: merged_tests(reports),
-            not_built: merged_not_built(reports),
-            dropped_test_packages,
+            not_built,
+            dropped_test_packages: merged_dropped_test_packages(reports),
             merge_provenance: Some(provenance),
         }),
     })
@@ -698,6 +844,285 @@ mod tests {
 
     /// One day, in seconds.
     const DAY: u64 = 86_400;
+
+    fn assert_schema_valid(report: &Report) {
+        let report = serde_json::to_value(report).expect("concrete report fixtures serialize");
+        crate::elements::validate_schema(&report).expect("these report fixtures are accepted by the actual input schema");
+    }
+
+    #[test]
+    fn survivor_cached_lineage_bytes_match_the_uncached_persistent_protocol() {
+        let report = report(None, 17, vec![mutant("site", 1, "Killed")]);
+        let file = &report.files["src/lib.rs"];
+        let mut cached = Lineages::default();
+        let source_identity = lineage(&[b"source", b"origin.json", file.language.as_bytes(), file.source.as_bytes()]);
+        let owned_encoding = serde_json::to_vec(&file.mutants[0]).expect("the concrete mutant serializes");
+        let verdict_identity = lineage(&[b"verdict", b"origin.json", &owned_encoding]);
+        assert_eq!(cached.source("origin.json", file), source_identity);
+        assert_eq!(cached.verdict("origin.json", &file.mutants[0]), verdict_identity);
+    }
+
+    #[test]
+    fn survivor_legacy_empty_and_retained_opaque_provenance_lineages_have_distinct_preservation_rules() {
+        for retained in [false, true] {
+            let mut report = report(None, 17, vec![mutant("site", 1, "Killed")]);
+            let source_lineage = if retained { "a".repeat(64) } else { String::new() };
+            let verdict_lineage = if retained { "b".repeat(64) } else { String::new() };
+            let mut provenance = MergeProvenance::default();
+            let _source = provenance.sources.insert(
+                "src/lib.rs".to_owned(),
+                SourceProvenance {
+                    started_at: 11,
+                    origin: "original-source.json".to_owned(),
+                    lineage: source_lineage.clone(),
+                    name_filtered: false,
+                },
+            );
+            let _verdict = provenance.verdicts.insert(
+                "site".to_owned(),
+                VerdictProvenance {
+                    started_at: 13,
+                    origin: "original-verdict.json".to_owned(),
+                    lineage: verdict_lineage.clone(),
+                    name_filtered: false,
+                },
+            );
+            report.config.as_mut().expect("fixture run metadata exists").merge_provenance = Some(provenance);
+            assert_schema_valid(&report);
+            let file = &report.files["src/lib.rs"];
+            let mut cached = Lineages::default();
+            let expected_source = if retained {
+                source_lineage
+            } else {
+                cached.source("original-source.json", file)
+            };
+            let expected_verdict = if retained {
+                verdict_lineage
+            } else {
+                cached.verdict("original-verdict.json", &file.mutants[0])
+            };
+            assert_eq!(
+                source_provenance("outer.json", &report, "src/lib.rs", file, &mut cached),
+                (11, "original-source.json", expected_source)
+            );
+            assert_eq!(
+                verdict_provenance("outer.json", &report, &file.mutants[0], false, &mut cached),
+                (13, "original-verdict.json", expected_verdict, false)
+            );
+        }
+    }
+
+    #[test]
+    fn survivor_winning_compatible_verdicts_keep_their_newer_presentation_generation_for_later_inputs() {
+        let old = mutant("site", 1, "Killed");
+        let new = mutant("site", 2, "Survived");
+        let mut held = HashMap::default();
+        for (result, generation) in [(&old, 1), (&new, 2), (&old, 1)] {
+            retain(
+                &mut held,
+                Candidate {
+                    mutant: result,
+                    path: "src/lib.rs",
+                    tested_at: generation,
+                    origin: "run.json",
+                    lineage: generation.to_string(),
+                    compatible: true,
+                    name_filtered: false,
+                    source_rank: (generation, "run.json", generation.to_string()),
+                },
+            );
+        }
+        let retained = &held["site"];
+        assert_eq!(retained.mutant.status, "Survived");
+        assert_eq!(
+            retained
+                .presentation
+                .expect("the winning compatible presentation must remain")
+                .location
+                .start
+                .line,
+            2
+        );
+        assert_eq!(
+            retained.presentation_rank.as_ref().expect("its generation must remain tracked").0,
+            2
+        );
+    }
+
+    #[test]
+    fn survivor_language_mismatch_is_not_compatible_even_when_the_source_bytes_match() {
+        let old = report(Some((0, 2)), 10, vec![mutant("site", 1, "Killed")]);
+        let mut current = report(Some((1, 2)), 20, Vec::new());
+        current.files.get_mut("src/lib.rs").expect("fixture source exists").language = "typescript".to_owned();
+        assert_schema_valid(&old);
+        assert_schema_valid(&current);
+        let result = merge(&[("old.json".to_owned(), old), ("current.json".to_owned(), current)], 20, None);
+        assert_eq!(result.incompatible, 1);
+        assert_eq!((result.valid, result.detected), (0, 0));
+        assert!(result.report.expect("an empty merged report still exists").files.is_empty());
+    }
+
+    #[test]
+    fn survivor_flaky_diagnostics_are_sorted_independently_of_mutant_hash_iteration_order() {
+        let results = [7, 2, 5, 0, 6, 1, 4, 3]
+            .into_iter()
+            .map(|index| {
+                let mut result = mutant(&format!("case{index:02}"), 1, "Ignored");
+                result.status_reason = Some("flaky: unresolved baseline".to_owned());
+                result
+            })
+            .collect();
+        let merged = merge(&[("run.json".to_owned(), report(None, 10, results))], 10, None);
+        let expected: Vec<_> = (0..8)
+            .map(|index| format!("case{index:02} in src/lib.rs: flaky: unresolved baseline"))
+            .collect();
+        assert_eq!(merged.flaky, expected);
+    }
+
+    #[test]
+    fn survivor_equal_named_population_ranks_keep_the_first_population_but_the_last_base_document() {
+        let mut first = report(None, 10, vec![mutant("first", 1, "Killed")]);
+        let mut last = report(None, 10, vec![mutant("last", 1, "Survived")]);
+        first.framework.version = "first-version".to_owned();
+        last.framework.version = "last-version".to_owned();
+        let merged = merge(&[("same.json".to_owned(), first), ("same.json".to_owned(), last)], 10, None);
+        assert_eq!((merged.valid, merged.detected), (1, 1));
+        let document = merged.report.expect("the retained first population can be rendered");
+        assert_eq!(document.framework.version, "last-version");
+        assert_eq!(document.files["src/lib.rs"].mutants[0].id, "first");
+    }
+
+    #[test]
+    fn survivor_equal_retained_verdict_generations_do_not_replace_the_first_accepted_outcome() {
+        let mut first = report(Some((0, 2)), 10, vec![mutant("site", 1, "Killed")]);
+        let mut second = report(Some((1, 2)), 10, vec![mutant("site", 1, "Survived")]);
+        for document in [&mut first, &mut second] {
+            let mut provenance = MergeProvenance::default();
+            let _previous = provenance.verdicts.insert(
+                "site".to_owned(),
+                VerdictProvenance {
+                    started_at: 7,
+                    origin: "retained.json".to_owned(),
+                    lineage: "a".repeat(64),
+                    name_filtered: false,
+                },
+            );
+            document.config.as_mut().expect("fixture run metadata exists").merge_provenance = Some(provenance);
+            assert_schema_valid(document);
+        }
+        let merged = merge(&[("first.json".to_owned(), first), ("second.json".to_owned(), second)], 10, None);
+        assert_eq!((merged.valid, merged.detected), (1, 1));
+        assert_eq!(
+            merged.report.expect("a merged document exists").files["src/lib.rs"].mutants[0].status,
+            "Killed"
+        );
+    }
+
+    #[test]
+    fn survivor_equal_source_generations_do_not_replace_the_first_compatible_presentation() {
+        let mut first_mutant = mutant("site", 1, "Killed");
+        first_mutant.description = Some("first producer's presentation".to_owned());
+        let mut second_mutant = mutant("site", 1, "Survived");
+        second_mutant.description = Some("second producer's presentation".to_owned());
+        let first = report(Some((0, 2)), 10, vec![first_mutant]);
+        let second = report(Some((1, 2)), 20, vec![second_mutant]);
+        assert_schema_valid(&first);
+        assert_schema_valid(&second);
+        let merged = merge(&[("first.json".to_owned(), first), ("second.json".to_owned(), second)], 20, None);
+        let document = merged.report.expect("the compatible source can be rendered");
+        let retained = &document.files["src/lib.rs"].mutants[0];
+        assert_eq!(retained.status, "Survived", "the later verdict still wins");
+        assert_eq!(retained.description.as_deref(), Some("first producer's presentation"));
+    }
+
+    #[test]
+    fn survivor_maximum_schema_timestamp_is_ordered_without_incrementing_and_overflowing() {
+        let old = report(None, u64::MAX - 1, vec![mutant("site", 1, "Killed")]);
+        let current = report(None, u64::MAX, vec![mutant("site", 1, "Survived")]);
+        assert_schema_valid(&current);
+        let merged = merge(
+            &[("old.json".to_owned(), old), ("current.json".to_owned(), current)],
+            u64::MAX,
+            None,
+        );
+        assert_eq!((merged.valid, merged.detected), (1, 0));
+        let document = merged.report.expect("the newer accepted timestamp can be merged");
+        assert_eq!(document.files["src/lib.rs"].mutants[0].status, "Survived");
+        assert_eq!(document.config.expect("merged provenance is present").started_at, u64::MAX);
+    }
+
+    #[test]
+    fn survivor_cached_lineages_preserve_repeated_sources_and_reset_between_distinct_verdicts() {
+        let report = report(None, 17, vec![mutant("a", 1, "Killed"), mutant("b", 2, "Survived")]);
+        let file = &report.files["src/lib.rs"];
+        let mut cached = Lineages::default();
+        let first = cached.source("first", file);
+        assert_eq!(first.len(), 64);
+        assert_eq!(cached.source("first", file), first);
+        assert_ne!(cached.source("second", file), first);
+        let a = cached.verdict("first", &file.mutants[0]);
+        let b = cached.verdict("first", &file.mutants[1]);
+        assert_ne!(a, b);
+        assert_eq!(cached.verdict("first", &file.mutants[0]), a);
+        assert_eq!(cached.verdict("first", &file.mutants[1]), b);
+        assert_eq!(Lineages::default().verdict("first", &file.mutants[1]), b);
+    }
+
+    #[test]
+    fn survivor_missing_config_retains_unknown_metadata_and_merge_selects_the_newest_base_document() {
+        let mut unknown = report(None, 0, vec![mutant("a", 1, "Killed")]);
+        unknown.config = None;
+        let merged = merge(&[("unknown".to_owned(), unknown)], 10, None);
+        assert_eq!((merged.valid, merged.detected), (1, 1));
+        assert_eq!(merged.shard_count, None);
+        let config = merged.report.unwrap().config.unwrap();
+        assert_eq!(config.tests, None);
+        assert_eq!(config.not_built, None);
+        assert_eq!(config.started_at, 0);
+        let mut old = report(None, 0, vec![mutant("a", 1, "Killed")]);
+        let mut new = report(None, 1, vec![mutant("a", 1, "Killed")]);
+        old.framework.version = "old".into();
+        new.framework.version = "new".into();
+        let mut reports = [("z-old".into(), old), ("a-new".into(), new)];
+        for _ in 0..2 {
+            assert_eq!(merge(&reports, 2, None).report.unwrap().framework.version, "new");
+            reports.reverse();
+        }
+    }
+
+    #[test]
+    fn survivor_presentation_retention_does_not_regress_on_older_or_incompatible_candidates() {
+        let first = mutant("id", 1, "Killed");
+        let later = mutant("id", 8, "Survived");
+        let incompatible = mutant("id", 19, "Timeout");
+        let mut latest = HashMap::new();
+        for (mutant, path, tested_at, compatible, source_at) in [
+            (&first, "first.rs", 5, true, 5),
+            (&later, "later.rs", 4, true, 8),
+            (&first, "first.rs", 3, true, 5),
+            (&incompatible, "incompatible.rs", 9, false, 19),
+        ] {
+            retain(
+                &mut latest,
+                Candidate {
+                    mutant,
+                    path,
+                    tested_at,
+                    origin: "origin",
+                    lineage: "verdict".into(),
+                    compatible,
+                    name_filtered: false,
+                    source_rank: (source_at, "origin", "source".into()),
+                },
+            );
+        }
+        let held = &latest["id"];
+        assert_eq!(held.mutant.status, "Timeout");
+        assert_eq!(held.tested_at, 9);
+        assert_eq!(held.file, "later.rs");
+        assert_eq!(held.presentation.unwrap().location.start.line, 8);
+        assert_eq!(held.presentation_rank.as_ref().unwrap().0, 8);
+    }
 
     #[test]
     fn an_equal_rank_population_is_authoritative_for_withdrawals() {
@@ -765,7 +1190,7 @@ mod tests {
     #[test]
     fn explicitly_mixed_identity_schemes_are_isolated_instead_of_unioning_their_ids() {
         let mut legacy = report(Some((0, 2)), 100, vec![mutant("legacy-id", 1, "Survived")]);
-        legacy.config.as_mut().expect("config").mutant_id_version = Some(MUTANT_ID_VERSION - 1);
+        legacy.config.as_mut().expect("config").mutant_id_version = Some(6);
         let current = report(Some((1, 2)), 200, vec![mutant("current-id", 1, "Killed")]);
 
         let merged = merge(&[("legacy".to_owned(), legacy), ("current".to_owned(), current)], 300, None);
@@ -784,23 +1209,42 @@ mod tests {
     }
 
     #[test]
-    fn unstamped_reports_use_the_current_identity_scheme() {
+    fn review_unstamped_reports_do_not_share_current_identities() {
         let mut unstamped = report(Some((0, 2)), 100, vec![mutant("unstamped-id", 1, "Survived")]);
         unstamped.config.as_mut().expect("config").mutant_id_version = None;
         let current = report(Some((1, 2)), 200, vec![mutant("current-id", 1, "Killed")]);
 
         let merged = merge(&[("unstamped".to_owned(), unstamped), ("current".to_owned(), current)], 300, None);
 
-        assert!(merged.identity_incompatible.is_empty());
-        assert_eq!(merged.valid, 2);
+        assert_eq!(merged.identity_incompatible, ["unstamped"]);
+        assert_eq!(merged.valid, 1);
         assert_eq!(merged.detected, 1);
     }
 
     #[test]
-    fn an_unstamped_report_has_exactly_the_current_identity_version() {
+    fn review_unstamped_reports_keep_the_historical_identity_version() {
         let unstamped = fixtures::report();
 
-        assert_eq!(identity_version(&unstamped), MUTANT_ID_VERSION);
+        assert_eq!(identity_version(&unstamped), 5);
+    }
+
+    #[test]
+    fn review_unstamped_and_explicit_scheme_five_reports_still_merge() {
+        let mut unstamped = report(Some((0, 2)), 100, vec![mutant("old", 1, "Survived")]);
+        unstamped.config.as_mut().expect("config").mutant_id_version = None;
+        let mut stamped = report(Some((1, 2)), 200, vec![mutant("new", 2, "Killed")]);
+        stamped.config.as_mut().expect("config").mutant_id_version = Some(5);
+        let merged = merge(&[("unstamped".into(), unstamped), ("stamped".into(), stamped)], 300, None);
+
+        assert!(merged.identity_incompatible.is_empty());
+        assert_eq!(merged.valid, 2);
+        assert_eq!(merged.detected, 1);
+        assert_eq!(identity_version(merged.report.as_ref().unwrap()), 5);
+    }
+
+    #[test]
+    fn reports_without_run_metadata_are_not_name_filtered() {
+        assert!(!source_name_filtered(&fixtures::report(), "src/lib.rs"));
     }
 
     #[test]
@@ -1315,7 +1759,9 @@ mod tests {
     #[test]
     fn run_metadata_is_aggregated_and_survives_staging() {
         let configured = |id: &str, tests: Option<usize>, not_built: Option<usize>, dropped: &[&str]| {
-            let mut report = report(Some((0, 2)), 100, vec![mutant(id, 1, "Killed")]);
+            let mut result = mutant(id, 1, if not_built.is_some() { "Ignored" } else { "Killed" });
+            result.status_reason = not_built.map(|_| format!("{}compiler budget exhausted", crate::elements::NOT_BUILT_PREFIX));
+            let mut report = report(Some((0, 2)), 100, vec![result]);
             let config = report.config.as_mut().expect("run info");
 
             config.tests = tests;
@@ -1336,7 +1782,7 @@ mod tests {
         let config = merged.config.as_ref().expect("config");
 
         assert_eq!(config.tests, Some(8));
-        assert_eq!(config.not_built, Some(5));
+        assert_eq!(config.not_built, Some(2));
         assert_eq!(config.dropped_test_packages, ["broken", "extra", "slow"]);
 
         let staged = merge(
@@ -1352,7 +1798,7 @@ mod tests {
         let config = staged.config.expect("config");
 
         assert_eq!(config.tests, None);
-        assert_eq!(config.not_built, Some(5));
+        assert_eq!(config.not_built, Some(2));
         assert_eq!(config.dropped_test_packages, ["broken", "extra", "later", "slow"]);
     }
 
@@ -1369,17 +1815,92 @@ mod tests {
         let maximum_named = ("maximum".to_owned(), maximum);
         let maximum_refs = [&maximum_named];
         assert_eq!(merged_tests(&maximum_refs), Some(usize::MAX));
-        assert_eq!(merged_not_built(&maximum_refs), None);
+        assert_eq!(merged_not_built(&maximum_named.1.files), None);
 
         let one = configured(Some(1), Some(1));
         let one_named = ("one".to_owned(), one);
         let one_refs = [&one_named];
-        assert_eq!(merged_not_built(&one_refs), Some(1));
+        assert_eq!(merged_tests(&one_refs), Some(1));
+        assert_eq!(
+            merged_not_built(&one_named.1.files),
+            None,
+            "metadata alone cannot create a not-built observation"
+        );
+    }
+
+    #[test]
+    fn retained_not_built_counts_deduplicate_supersede_and_survive_staging() {
+        let mut not_built = mutant("a", 1, "Ignored");
+        not_built.status_reason = Some(format!("{}unavailable", crate::elements::NOT_BUILT_PREFIX));
+        let old = report(Some((0, 2)), 100, vec![not_built]);
+        let duplicate = merge(&[("a".into(), old.clone()), ("b".into(), old.clone())], 300, None)
+            .report
+            .unwrap();
+        assert_eq!(duplicate.config.as_ref().unwrap().not_built, Some(1));
+        let newest = report(Some((0, 2)), 200, vec![mutant("a", 1, "Killed"), mutant("b", 2, "Killed")]);
+        let direct = merge(&[("a".into(), old), ("new".into(), newest.clone())], 300, None)
+            .report
+            .unwrap();
+        let staged = merge(&[("stage".into(), duplicate), ("new".into(), newest)], 300, None)
+            .report
+            .unwrap();
+        for merged in [&direct, &staged] {
+            assert_eq!(merged.config.as_ref().unwrap().not_built, None);
+            assert_eq!(merged.files["src/lib.rs"].mutants.len(), 2);
+        }
+    }
+
+    #[test]
+    fn partial_and_legacy_reports_cannot_withdraw_unchanged_survivors() {
+        for complete in [Some(false), None] {
+            let old = report(None, 100, vec![mutant("a", 1, "Survived"), mutant("b", 2, "Survived")]);
+            let newer = report(None, 200, vec![mutant("a", 1, "Killed")]);
+            let mut newer = serde_json::to_value(newer).unwrap();
+            if let Some(complete) = complete {
+                newer["config"]["populationComplete"] = complete.into();
+            } else {
+                newer["config"].as_object_mut().unwrap().remove("populationComplete");
+            }
+            let newer = serde_json::from_value(newer).unwrap();
+            let merged = merge(&[("old".into(), old), ("partial".into(), newer)], 300, None);
+            assert_eq!(merged.withdrawn, 0);
+            assert_eq!(merged.valid, 2);
+            assert_eq!(merged.detected, 1);
+            assert!(!merged.report.unwrap().config.unwrap().population_complete);
+        }
+    }
+
+    #[test]
+    fn a_complete_empty_population_retires_the_last_historical_identity() {
+        for complete in [true, false] {
+            let old = report(None, 100, vec![mutant("last", 1, "Survived")]);
+            let mut empty = report(None, 200, Vec::new());
+            empty.files.get_mut("src/lib.rs").unwrap().source = "pub struct Marker;".into();
+            empty.config.as_mut().unwrap().population_complete = complete;
+            let merged = merge(&[("old".into(), old), ("empty".into(), empty)], 300, None);
+            assert_eq!(merged.withdrawn, usize::from(complete));
+            assert_eq!(merged.valid, 0);
+            assert_eq!(merged.incompatible, usize::from(!complete));
+        }
+    }
+
+    #[test]
+    fn shard_and_merge_flags_preclude_population_authority_even_with_an_explicit_complete_flag() {
+        for sharded in [true, false] {
+            let old = report(None, 100, vec![mutant("a", 1, "Survived"), mutant("b", 2, "Survived")]);
+            let mut newer = report(None, 200, vec![mutant("a", 1, "Killed")]);
+            let config = newer.config.as_mut().unwrap();
+            config.population_complete = true;
+            config.shard = sharded.then_some(crate::elements::ShardInfo { index: 0, count: 2 });
+            config.merged = !sharded;
+            let merged = merge(&[("old".into(), old), ("partial".into(), newer)], 300, None);
+            assert_eq!((merged.withdrawn, merged.valid, merged.detected), (0, 2, 1));
+        }
     }
 
     #[test]
     fn merged_started_at_is_the_newest_source_or_verdict_provenance() {
-        let merged_at = |source_at, verdict_at| {
+        let merged_at = |source_at, verdict_at, sighting_at| {
             let mut input = report(None, 0, vec![mutant("aaa", 1, "Killed")]);
             let config = input.config.as_mut().expect("config");
             let mut provenance = MergeProvenance::default();
@@ -1389,6 +1910,7 @@ mod tests {
                     started_at: source_at,
                     origin: "source".to_owned(),
                     lineage: String::new(),
+                    name_filtered: false,
                 },
             );
             let _ = provenance.verdicts.insert(
@@ -1397,6 +1919,16 @@ mod tests {
                     started_at: verdict_at,
                     origin: "verdict".to_owned(),
                     lineage: String::new(),
+                    name_filtered: false,
+                },
+            );
+            let _ = provenance.sightings.insert(
+                "aaa".to_owned(),
+                SourceProvenance {
+                    started_at: sighting_at,
+                    origin: "sighting".to_owned(),
+                    lineage: String::new(),
+                    name_filtered: true,
                 },
             );
             config.merge_provenance = Some(provenance);
@@ -1408,9 +1940,10 @@ mod tests {
                 .started_at
         };
 
-        assert_eq!(merged_at(300, 200), 300);
-        assert_eq!(merged_at(200, 300), 300);
-        assert_eq!(merged_at(0, 0), 0);
+        assert_eq!(merged_at(300, 200, 100), 300);
+        assert_eq!(merged_at(200, 300, 100), 300);
+        assert_eq!(merged_at(100, 200, 300), 300);
+        assert_eq!(merged_at(0, 0, 0), 0);
     }
 
     #[test]
@@ -1561,6 +2094,322 @@ mod tests {
         assert_eq!(merged.detected, 1);
         assert_eq!(merged.never_tested, 1, "the replacement construct has never been run");
         assert!((merged.score() - 100.0).abs() < f64::EPSILON);
+    }
+
+    // These timestamps are synthetic ordered generations. No freshness window is used, so only
+    // their ordering matters, not their magnitudes or spacing.
+    #[test]
+    fn a_newer_name_filtered_report_keeps_unmatched_historical_verdicts() {
+        let previous = report(None, 100, vec![mutant("aaa", 1, "Killed"), mutant("bbb", 2, "Survived")]);
+        let mut filtered = report(None, 200, vec![mutant("aaa", 1, "Pending")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+
+        // Merge reads persisted reports, so check that the marker survives the JSON boundary.
+        let filtered = serde_json::to_value(filtered).expect("the filtered report serializes");
+        assert_eq!(filtered["config"]["nameFiltered"], true);
+        let filtered = serde_json::from_value(filtered).expect("the filtered report deserializes");
+
+        let merged = merge(&[("previous".to_owned(), previous), ("filtered".to_owned(), filtered)], 300, None);
+
+        assert_eq!(merged.withdrawn, 0, "the regex did not prove that `bbb` was removed from source");
+        let ids: Vec<&str> = merged.report.as_ref().expect("a merged report").files["src/lib.rs"]
+            .mutants
+            .iter()
+            .map(|mutant| mutant.id.as_str())
+            .collect();
+        assert_eq!(ids, ["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn a_filtered_source_change_keeps_unmatched_historical_presentations() {
+        let mut previous = report(None, 100, vec![mutant("aaa", 1, "Survived"), mutant("bbb", 2, "Survived")]);
+        previous.files.get_mut("src/lib.rs").expect("the fixture has a source file").source = "old source\n".to_owned();
+
+        let mut filtered = report(None, 200, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        filtered.files.get_mut("src/lib.rs").expect("the fixture has a source file").source = "changed source\n".to_owned();
+
+        let merged = merge(&[("previous".to_owned(), previous), ("filtered".to_owned(), filtered)], 300, None);
+        let file = &merged.report.as_ref().expect("a merged report").files["src/lib.rs"];
+        let verdicts: Vec<_> = file
+            .mutants
+            .iter()
+            .map(|mutant| (mutant.id.as_str(), mutant.status.as_str()))
+            .collect();
+
+        assert_eq!(
+            file.source, "old source\n",
+            "the full presentation remains the source of the merged file"
+        );
+        assert_eq!(verdicts, [("aaa", "Killed"), ("bbb", "Survived")]);
+        assert_eq!(merged.withdrawn, 0);
+        assert_eq!(merged.incompatible, 0);
+        assert_eq!(merged.valid, 2);
+        assert_eq!(merged.detected, 1);
+        assert!((merged.score() - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_new_filtered_mutant_requires_a_complete_presentation_before_staging() {
+        let previous = report_with_source(None, 100, "old source\n", vec![mutant("bbb", 2, "Survived")]);
+        let mut filtered = report_with_source(None, 200, "new source\n", vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+
+        let incomplete = merge(
+            &[("previous".to_owned(), previous.clone()), ("filtered".to_owned(), filtered.clone())],
+            300,
+            None,
+        );
+        assert_eq!(incomplete.unpresentable_filtered, 1);
+        assert_eq!(incomplete.incompatible, 1);
+        assert!(incomplete.report.is_none());
+        assert_eq!(incomplete.scored(), None);
+
+        let complete = report_with_source(None, 300, "new source\n", vec![mutant("aaa", 1, "Pending")]);
+        let merged = merge(
+            &[
+                ("previous".to_owned(), previous),
+                ("filtered".to_owned(), filtered),
+                ("complete".to_owned(), complete),
+            ],
+            400,
+            None,
+        );
+        let file = &merged.report.as_ref().expect("the complete source makes a report stageable").files["src/lib.rs"];
+
+        assert_eq!(merged.unpresentable_filtered, 0);
+        assert_eq!(merged.incompatible, 0);
+        assert_eq!(file.source, "new source\n");
+        assert_eq!(file.mutants.len(), 1);
+        assert_eq!(file.mutants[0].id, "aaa");
+        assert_eq!(file.mutants[0].status, "Killed");
+    }
+
+    #[test]
+    fn a_filtered_verdict_requires_presentation_after_an_unfiltered_sighting() {
+        let source_b = "fn aaa() {}\nfn bbb() {}\n// B\n";
+        let source_c = "fn aaa() {}\nfn bbb() {}\n// C\n";
+        let mut filtered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        let listing = report_with_source(Some((0, 2)), 200, source_b, vec![mutant("aaa", 1, "Pending")]);
+        let run = report_with_source(Some((1, 2)), 300, source_c, vec![mutant("bbb", 2, "Survived")]);
+        let complete = report_with_source(None, 400, source_c, vec![mutant("aaa", 1, "Pending"), mutant("bbb", 2, "Pending")]);
+        let mut originals = vec![
+            ("filtered".to_owned(), filtered),
+            ("listing".to_owned(), listing),
+            ("run".to_owned(), run),
+        ];
+        let incomplete = merge(&originals, 400, None);
+        originals.push(("complete".to_owned(), complete));
+        let direct = merge(&originals, 400, None);
+
+        let file = &direct
+            .report
+            .as_ref()
+            .expect("the complete C listing presents both retained verdicts")
+            .files["src/lib.rs"];
+        assert_eq!(direct.incompatible, 0);
+        assert_eq!(direct.unpresentable_filtered, 0);
+        assert_eq!(file.mutants[0].id, "aaa");
+        assert_eq!(file.mutants[0].status, "Killed");
+        assert_eq!(incomplete.incompatible, 1);
+        assert_eq!(
+            (incomplete.unpresentable_filtered, incomplete.report.is_none()),
+            (1, true),
+            "an unpresentable filtered verdict must prevent staging even after an unfiltered sighting",
+        );
+    }
+
+    #[test]
+    fn staged_filtered_verdict_requires_presentation_after_a_complete_sighting() {
+        let source_b = "fn aaa() {}\nfn bbb() {}\n// B\n";
+        let source_c = "fn aaa() {}\nfn bbb() {}\n// C\n";
+        let mut filtered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        let listing = report_with_source(None, 200, source_b, vec![mutant("aaa", 1, "Pending")]);
+        let run = report_with_source(Some((1, 2)), 300, source_c, vec![mutant("bbb", 2, "Survived")]);
+        let complete = report_with_source(None, 400, source_c, vec![mutant("aaa", 1, "Pending"), mutant("bbb", 2, "Pending")]);
+        let originals = vec![("filtered".to_owned(), filtered), ("listing".to_owned(), listing)];
+        let first = merge(&originals, 400, None);
+        assert_eq!((first.incompatible, first.unpresentable_filtered), (0, 0));
+        let staged = first.report.expect("the complete B listing presents the filtered verdict");
+        assert_eq!(staged.files["src/lib.rs"].mutants[0].status, "Killed");
+        let staged = serde_json::to_value(staged).expect("the staged report serializes");
+        assert_eq!(
+            staged["config"]["mergeProvenance"]["sources"]["src/lib.rs"]["nameFiltered"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            staged["config"]["mergeProvenance"]["sightings"]["aaa"]["nameFiltered"],
+            serde_json::Value::Null
+        );
+        assert_eq!(staged["config"]["mergeProvenance"]["verdicts"]["aaa"]["nameFiltered"], true);
+        let staged = serde_json::from_value(staged).expect("the staged report deserializes");
+        let second = merge(&[("staged".to_owned(), staged), ("run".to_owned(), run.clone())], 400, None);
+        let mut originals = originals;
+        originals.push(("run".to_owned(), run));
+        originals.push(("complete".to_owned(), complete));
+        let direct = merge(&originals, 400, None);
+        let file = &direct
+            .report
+            .as_ref()
+            .expect("the complete C listing presents the retained verdict")
+            .files["src/lib.rs"];
+        assert_eq!((direct.incompatible, direct.unpresentable_filtered), (0, 0));
+        assert_eq!(file.mutants[0].id, "aaa");
+        assert_eq!(file.mutants[0].status, "Killed");
+        assert_eq!(second.incompatible, 1);
+        assert_eq!(
+            (second.unpresentable_filtered, second.report.is_none()),
+            (1, true),
+            "a staged filtered verdict must prevent staging without a compatible presentation; emitted report: {:?}",
+            second.report,
+        );
+    }
+
+    #[test]
+    fn equal_rank_stages_keep_filter_protection_in_either_order() {
+        let source_b = "fn aaa() {}\nfn bbb() {}\n// B\n";
+        let source_c = "fn aaa() {}\nfn bbb() {}\n// C\n";
+        let mut filtered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        let unfiltered = report_with_source(None, 100, source_b, vec![mutant("aaa", 1, "Killed")]);
+        let filtered = merge(&[("inner.json".to_owned(), filtered)], 150, None)
+            .report
+            .expect("a filtered input can be staged");
+        let unfiltered = merge(&[("inner.json".to_owned(), unfiltered)], 150, None)
+            .report
+            .expect("an unfiltered input can be staged");
+        let run = report_with_source(Some((1, 2)), 300, source_c, vec![mutant("bbb", 2, "Survived")]);
+
+        for stages in [[&filtered, &unfiltered], [&unfiltered, &filtered]] {
+            let merged = merge(
+                &[
+                    ("first".to_owned(), stages[0].clone()),
+                    ("second".to_owned(), stages[1].clone()),
+                    ("run".to_owned(), run.clone()),
+                ],
+                400,
+                None,
+            );
+            assert_eq!(
+                (merged.unpresentable_filtered, merged.report.is_none()),
+                (1, true),
+                "an equal-rank filtered stage must prevent staging regardless of input order",
+            );
+        }
+    }
+
+    #[test]
+    fn staged_filtered_source_keeps_its_partial_origin() {
+        let mut previous = report(None, 100, vec![mutant("aaa", 1, "Survived"), mutant("bbb", 2, "Survived")]);
+        previous.files.get_mut("src/lib.rs").expect("the fixture has a source file").source = "old source\n".to_owned();
+
+        let mut filtered = report(None, 200, vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        filtered.files.get_mut("src/lib.rs").expect("the fixture has a source file").source = "changed source\n".to_owned();
+
+        let staged = merge(&[("filtered".to_owned(), filtered)], 300, None)
+            .report
+            .expect("a filtered input can be staged");
+        let staged = serde_json::to_value(staged).expect("the staged report serializes");
+        assert_eq!(staged["config"]["mergeProvenance"]["sources"]["src/lib.rs"]["nameFiltered"], true);
+        let staged = serde_json::from_value(staged).expect("the staged report deserializes");
+
+        let merged = merge(&[("previous".to_owned(), previous), ("staged".to_owned(), staged)], 400, None);
+        let file = &merged.report.as_ref().expect("a merged report").files["src/lib.rs"];
+        let ids: Vec<_> = file.mutants.iter().map(|mutant| mutant.id.as_str()).collect();
+
+        assert_eq!(file.source, "old source\n");
+        assert_eq!(ids, ["aaa", "bbb"]);
+        assert_eq!(merged.valid, 2);
+        assert_eq!(merged.detected, 1);
+        assert_eq!(merged.incompatible, 0);
+    }
+
+    #[test]
+    fn staged_filtered_sighting_survives_an_older_complete_population() {
+        let first = report_with_source(None, 100, "old source\n", vec![mutant("aaa", 1, "Survived")]);
+        let mut filtered = report_with_source(None, 300, "changed source\n", vec![mutant("aaa", 1, "Killed")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        let middle = report_with_source(None, 200, "old source\n", vec![mutant("bbb", 2, "Survived")]);
+
+        let direct = merge(
+            &[
+                ("first".to_owned(), first.clone()),
+                ("filtered".to_owned(), filtered.clone()),
+                ("middle".to_owned(), middle.clone()),
+            ],
+            400,
+            None,
+        );
+        let staged = merge(&[("first".to_owned(), first), ("filtered".to_owned(), filtered)], 400, None)
+            .report
+            .expect("the first merge produces a report");
+        let staged = serde_json::to_value(staged).expect("the staged report serializes");
+        assert_eq!(staged["config"]["mergeProvenance"]["sources"]["src/lib.rs"]["startedAt"], 100);
+        assert_eq!(staged["config"]["mergeProvenance"]["sightings"]["aaa"]["startedAt"], 300);
+        let staged: Report = serde_json::from_value(staged).expect("the staged report deserializes");
+        let final_population = report_with_source(None, 400, "old source\n", vec![mutant("bbb", 2, "Survived")]);
+        let withdrawn = merge(
+            &[("stage".to_owned(), staged.clone()), ("final".to_owned(), final_population)],
+            500,
+            None,
+        );
+        assert_eq!(
+            withdrawn.withdrawn, 1,
+            "a complete population newer than the sighting withdraws `aaa`"
+        );
+        assert_eq!(
+            withdrawn.report.as_ref().expect("a merged report").files["src/lib.rs"]
+                .mutants
+                .len(),
+            1
+        );
+
+        let staged = merge(&[("stage".to_owned(), staged), ("middle".to_owned(), middle)], 400, None);
+
+        assert_eq!(rendered(&staged), rendered(&direct), "staging changed the retained mutant");
+        assert_eq!(staged.withdrawn, direct.withdrawn);
+        assert_eq!(staged.withdrawn, 0, "a later filtered sighting keeps the mutant alive");
+        assert_eq!(
+            staged.report.as_ref().expect("a merged report").files["src/lib.rs"].mutants.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_pending_filtered_sighting_keeps_staged_report_metadata_newer() {
+        let mut old = report_with_source(None, 100, "old source\n", vec![mutant("aaa", 1, "Killed")]);
+        old.project_root = Some("old root".to_owned());
+        let mut filtered = report_with_source(None, 300, "new source\n", vec![mutant("aaa", 1, "Pending")]);
+        filtered.config.as_mut().expect("the fixture includes run metadata").name_filtered = true;
+        filtered.project_root = Some("filtered root".to_owned());
+        let mut middle = report_with_source(None, 200, "old source\n", vec![mutant("aaa", 1, "Pending")]);
+        middle.project_root = Some("middle root".to_owned());
+
+        let direct = merge(
+            &[
+                ("old".to_owned(), old.clone()),
+                ("filtered".to_owned(), filtered.clone()),
+                ("middle".to_owned(), middle.clone()),
+            ],
+            400,
+            None,
+        )
+        .report
+        .expect("the direct merge produces a report");
+        let staged = merge(&[("old".to_owned(), old), ("filtered".to_owned(), filtered)], 400, None)
+            .report
+            .expect("the staged merge produces a report");
+        assert_eq!(staged.config.as_ref().expect("merged run metadata").started_at, 300);
+        let staged = merge(&[("staged".to_owned(), staged), ("middle".to_owned(), middle)], 400, None)
+            .report
+            .expect("the second merge produces a report");
+
+        assert_eq!(direct.project_root.as_deref(), Some("filtered root"));
+        assert_eq!(staged.project_root, direct.project_root);
+        assert_eq!(staged.config.as_ref().expect("merged run metadata").started_at, 300);
     }
 
     #[test]

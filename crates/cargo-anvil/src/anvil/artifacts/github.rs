@@ -5,8 +5,6 @@
 //! root workflows, each an owned file gated on [`Backend::GitHub`].
 //!
 //! Holds the embedded templates and registry functions.
-//!
-//! See [`github.md`](../../../docs/design/github.md).
 
 use crate::backend::Backend;
 use crate::catalog::Artifact;
@@ -166,6 +164,15 @@ mod tests {
         "scheduled-exhaustive",
     ];
 
+    fn setup_action_step(name: &str) -> &str {
+        let marker = format!("    - name: {name}\n");
+        let remainder = SETUP_ACTION
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("setup action should contain step '{name}'"))
+            .1;
+        remainder.split_once("\n    - ").map_or(remainder, |(step, _)| step)
+    }
+
     #[test]
     fn artifacts_keep_their_emission_order() {
         let paths: Vec<_> = all()
@@ -236,6 +243,10 @@ mod tests {
         assert!(SETUP_ACTION.contains("$minimum = [version]'1.46.0'"));
         assert!(SETUP_ACTION.contains("cargo-anvil requires just >= $minimum"));
         assert!(SETUP_ACTION.contains("ANVIL_GROUP: ${{ inputs.group }}"));
+        let install_just = setup_action_step("Install just");
+        assert!(install_just.contains("GITHUB_TOKEN: ${{ github.token }}"));
+        let install_catalog = setup_action_step("Install anvil toolchains + tools");
+        assert!(install_catalog.contains("GITHUB_TOKEN: ${{ github.token }}"));
         assert!(SETUP_ACTION.contains("just \"anvil-$ANVIL_GROUP-setup\" binstall"));
         assert!(SETUP_ACTION.contains(r"^[a-z0-9-]+$"));
         assert!(SETUP_ACTION.contains("::error::Invalid Anvil group;"));
@@ -273,13 +284,18 @@ mod tests {
     }
 
     #[test]
-    fn setup_action_can_reclaim_github_hosted_runner_disk_space() {
+    fn setup_action_manages_github_hosted_runner_system_packages() {
         assert!(SETUP_ACTION.contains("free-disk-space:"));
         assert!(SETUP_ACTION.contains("runner.environment == 'github-hosted'"));
         assert!(SETUP_ACTION.contains("/usr/local/lib/android"));
         assert!(SETUP_ACTION.contains(r"C:\Program Files (x86)\Android"));
-        assert!(!SETUP_ACTION.contains("Install libclang"));
-        assert!(!SETUP_ACTION.contains("apt-get install -y libclang-dev"));
+        let install_libclang = setup_action_step("Install libclang (Linux spellcheck groups)");
+        assert!(install_libclang.contains("runner.environment == 'github-hosted'"));
+        assert!(install_libclang.contains("runner.os == 'Linux'"));
+        assert!(install_libclang.contains("sudo apt-get update && sudo apt-get install -y libclang-dev"));
+        assert!(install_libclang.contains("inputs.group == 'pr-fast'"));
+        assert!(install_libclang.contains("inputs.group == 'spellcheck'"));
+        assert!(!install_libclang.contains("inputs.group == 'none'"));
     }
 
     #[test]
@@ -473,6 +489,10 @@ export -f just
         assert!(REPORT_STATUS_ACTION.contains("statusDescription.slice(0, MAX_DESCRIPTION_LENGTH)"));
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "native and cargo-careful retain the full generated-workflow contract scan; focused workflow tests preserve Miri coverage"
+    )]
     #[test]
     fn pr_impl_workflow_has_expected_jobs() {
         assert!(PR_IMPL_WORKFLOW.contains("workflow_call:"));
@@ -523,6 +543,10 @@ export -f just
         ] {
             assert!(PR_IMPL_WORKFLOW.contains(name), "PR impl workflow missing display name '{name}'");
         }
+        assert!(
+            PR_IMPL_WORKFLOW.contains("if: matrix.os == 'windows'") && PR_IMPL_WORKFLOW.contains("if: matrix.os != 'windows'"),
+            "the mutation matrix must run on Windows and no-op every compatibility context"
+        );
         assert!(PR_IMPL_WORKFLOW.contains("publish_commit_statuses:"));
         assert_eq!(
             PR_IMPL_WORKFLOW.matches("BASE_REF: ${{ inputs.base_ref }}").count(),

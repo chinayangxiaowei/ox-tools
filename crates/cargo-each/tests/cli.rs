@@ -832,19 +832,18 @@ fn publishable_filter_excludes_publish_false() {
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
 #[test]
-fn multiple_exclude_filters_union() {
-    // `--exclude-filter` is OR-combined: dropping `bin` removes {beta, epsilon}
-    // and dropping `metadata:role=script-only` removes {gamma}; their union
-    // leaves {alpha, delta}. A flip to `all()` would drop nothing (no member
-    // matches both exclusions).
+fn multiple_negated_filters_intersect() {
+    // Repeated filters are AND-combined: excluding `bin` removes {beta,
+    // epsilon}, and excluding `metadata:role=script-only` removes {gamma},
+    // leaving {alpha, delta}.
     let (_tmp, manifest) = fixture();
     each(&manifest)
         .args([
             "--workspace",
-            "--exclude-filter",
-            "bin",
-            "--exclude-filter",
-            "metadata:role=script-only",
+            "--filter",
+            "not bin",
+            "--filter",
+            "not metadata:role=script-only",
             "--dry-run",
             "--",
             "echo",
@@ -852,13 +851,7 @@ fn multiple_exclude_filters_union() {
         ])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("echo alpha")
-                .and(predicate::str::contains("echo delta"))
-                .and(predicate::str::contains("echo beta").not())
-                .and(predicate::str::contains("echo gamma").not())
-                .and(predicate::str::contains("echo epsilon").not()),
-        );
+        .stdout("echo alpha\necho delta\n");
 }
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
@@ -878,13 +871,13 @@ fn filter_lib_drops_bin_only_member() {
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
 #[test]
-fn exclude_filter_metadata_drops_matching_member() {
+fn negated_metadata_filter_drops_matching_member() {
     let (_tmp, manifest) = fixture();
     each(&manifest)
         .args([
             "--workspace",
-            "--exclude-filter",
-            "metadata:role=script-only",
+            "--filter",
+            "not metadata:role=script-only",
             "--dry-run",
             "--",
             "tool",
@@ -892,11 +885,7 @@ fn exclude_filter_metadata_drops_matching_member() {
         ])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("tool gamma")
-                .not()
-                .and(predicate::str::contains("tool alpha")),
-        );
+        .stdout("tool alpha\ntool beta\ntool delta\ntool epsilon\n");
 }
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
@@ -962,8 +951,8 @@ fn per_target_mode_filters_required_features_and_substitutes_target() {
             "--workspace",
             "--each-target",
             "test",
-            "--target-required-feature",
-            "loom",
+            "--target-filter",
+            "required-feature:loom",
             "--dry-run",
             "--",
             "echo",
@@ -1016,26 +1005,6 @@ fn per_target_and_once_are_mutually_exclusive() {
         .assert()
         .failure()
         .code(2);
-}
-
-#[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
-#[test]
-fn target_required_feature_requires_target_mode() {
-    let (_tmp, manifest) = fixture();
-    each(&manifest)
-        .args([
-            "--workspace",
-            "--target-required-feature",
-            "loom",
-            "--dry-run",
-            "--",
-            "echo",
-            "{name}",
-        ])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(predicate::str::contains("--each-target"));
 }
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
@@ -1282,15 +1251,15 @@ fn once_with_boolean_filter_uses_explicit_packages_not_workspace() {
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]
 #[test]
-fn once_with_exclude_filter_uses_explicit_packages_not_workspace() {
-    // An `--exclude-filter` also narrows the set, so `{packages}` must expand
-    // to an explicit `--package` list, not `--workspace`.
+fn once_with_negated_filter_uses_explicit_packages_not_workspace() {
+    // A negated filter narrows the set, so `{packages}` must expand to an
+    // explicit `--package` list, not `--workspace`.
     let (_tmp, manifest) = fixture();
     each(&manifest)
         .args([
             "--workspace",
-            "--exclude-filter",
-            "metadata:role=script-only",
+            "--filter",
+            "not metadata:role=script-only",
             "--once",
             "--dry-run",
             "--",
@@ -1300,7 +1269,7 @@ fn once_with_exclude_filter_uses_explicit_packages_not_workspace() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--package").and(predicate::str::contains("--workspace").not()));
+        .stdout("cargo x --package alpha@0.1.0 --package beta@0.1.0 --package delta@1.2.3-beta.1+build --package epsilon@0.1.0\n");
 }
 
 #[cfg_attr(miri, ignore = "spawns the cargo-each binary and cargo subprocesses; miri supports neither")]

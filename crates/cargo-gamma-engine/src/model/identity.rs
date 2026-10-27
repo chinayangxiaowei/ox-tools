@@ -200,16 +200,16 @@ impl SiteIndex {
 
 /// The identity normalization contract.
 ///
-/// Caller-supplied error replacement text participates in those mutants' identities. Every
-/// identity whose replacement comes from the registry remains independent of replacement text.
+/// Caller-supplied error replacement text and normalized stated-value expressions participate in
+/// those mutants' identities. Registry-provided replacements remain independent of replacement text.
 ///
 /// The current contract builds an implementation's item-path scope from the self type's complete
 /// token-aware source representation. Qualification, generic arguments, reference syntax, and
 /// lexical token boundaries therefore remain distinct. The preceding contract used only the final
 /// path segment and could fall back to source-order occurrence for otherwise distinct self types.
-/// Version 6 reserves source-order occurrence slots before confidence filtering, so withholding an
+/// Source-order occurrence slots are reserved before confidence filtering, so withholding an
 /// optimistic site cannot renumber the surviving sites.
-pub const MUTANT_ID_VERSION: u32 = 6;
+pub const MUTANT_ID_VERSION: u32 = 7;
 
 /// Computes the stable, content-addressed identity of a mutant.
 ///
@@ -346,6 +346,7 @@ pub fn normalize_site_text(text: &str) -> CompactString {
             .get(offset..)
             .and_then(|rest| rest.chars().next())
             .expect("the loop keeps the UTF-8 boundary below the text length");
+        // #[gamma::skip(stmt.delete_assign, tag = "timeout", reason = "removing the character advance revisits the same nonliteral character indefinitely")]
         offset += character.len_utf8();
 
         if character.is_whitespace() {

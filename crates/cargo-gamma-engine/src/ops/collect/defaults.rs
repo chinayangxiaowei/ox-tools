@@ -9,6 +9,7 @@ use syn::{
     Type, TypeParamBound, UseTree, WherePredicate,
 };
 
+use super::default_identity::{Identities, Pending};
 use crate::cfg::CfgSet;
 use crate::{HashMap, HashSet};
 
@@ -80,6 +81,7 @@ impl DefaultPaths {
     /// written through an alias recurses only when bare `Default` still resolves to that standard
     /// trait; qualified and differently aliased custom traits stay mutable.
     pub(super) fn is_fallback_trait(&self, path: &Path) -> bool {
+        // #[gamma::skip(iter.first_to_last, reason = "the right operand is evaluated only for a one-segment path, whose first and last segment are identical")]
         if path.segments.len() == 1 && path.segments.first().is_some_and(|segment| segment.ident == "Default") {
             return true;
         }
@@ -193,6 +195,7 @@ impl DefaultPaths {
                 .first()
                 .expect("alias expansion cannot consume more segments than the original path contains");
             let Some(prefix) = self.module_aliases.get(first) else {
+                // #[gamma::skip(loop.break_to_continue, reason = "without an alias prefix expanded is unchanged, so continuing the bounded loop only repeats the same failed lookup")]
                 break;
             };
 
@@ -363,6 +366,14 @@ impl Completeness {
 /// compiled, which costs a little signal rather than producing a wrong verdict.
 #[derive(Debug, Default)]
 pub struct Defaults {
+    identities: Option<Identities>,
+    sources: super::source_identities::Sources,
+    resource_namespaces: super::resource_namespaces::Namespaces,
+    local_imports: HashMap<String, Option<String>>,
+    aliases: HashSet<String>,
+    module_path: Vec<String>,
+    uncertain_types: HashSet<String>,
+    alias_targets: HashMap<String, HashSet<String>>,
     /// The local bindings that decide whether `Default` means the standard trait.
     paths: DefaultPaths,
 
@@ -382,11 +393,15 @@ pub struct Defaults {
     /// prove the opposite. Only a mixed collision is undecidable.
     ambiguous: HashSet<String>,
 
+    /// Names also introduced by aliases or re-exports, whose target declaration is unresolved.
+    indirect: HashSet<String>,
+
     /// Names declared with type or const parameters.
     ///
     /// A bare use can fill omitted parameters from declaration defaults whose instantiated bounds
     /// are not visible at the use site, so the name alone is not positive `Default` evidence.
     generic: HashSet<String>,
+    unproven_generic_types: HashSet<String>,
 
     /// For each `type Alias<T, E = SomeError> = Result<T, E>`, the name of that default error type.
     ///
@@ -436,6 +451,76 @@ fn merge_alias(into: &mut HashMap<String, Option<String>>, alias: String, error:
 }
 
 impl Defaults {
+    /// Builds declaration evidence labeled with the physical source that supplied it.
+    #[must_use]
+    pub fn of_source_in(file: &File, cfg: &CfgSet, source: &str) -> Self {
+        let mut index = Self::of_in(file, cfg);
+        index.sources.insert(source, Pending::of(file, cfg));
+        index.resource_namespaces.label(source);
+        index
+    }
+
+    /// Resolves the labeled evidence using unique, active source/module paths per crate root.
+    ///
+    /// Each tuple contains the source label, crate-root label, and logical module path.
+    /// Sources without a unique module path must be omitted.
+    pub fn bind_sources(&mut self, modules: &[(String, String, Vec<String>)]) {
+        self.sources.bind(modules);
+        self.resource_namespaces.bind(modules);
+    }
+
+    /// Adds the report spelling of an already-labeled physical source.
+    pub fn alias_source(&mut self, source: &str, report: &str) {
+        if source != report {
+            self.sources.alias(source, report);
+            self.resource_namespaces.alias(source, report);
+        }
+    }
+
+    pub(crate) fn has_labeled_sources(&self) -> bool {
+        self.sources.bound
+    }
+
+    pub(crate) fn resource_namespace_transparent(&self, source: &str, inline: &[String]) -> bool {
+        self.resource_namespaces.transparent(source, inline)
+    }
+
+    pub(super) fn resource_sources(&self) -> &super::resource_namespaces::Namespaces {
+        &self.resource_namespaces
+    }
+
+    /// Binds Cargo-resolved dependency evidence for bounded resource analysis.
+    ///
+    /// Missing or conflicting resolved edges
+    /// never establish an external API contract.
+    pub fn bind_resource_dependencies(&mut self, dependencies: &[super::ResourceDependency]) {
+        self.resource_namespaces.dependencies(dependencies);
+    }
+
+    /// Shares span-free source evidence before binding a combined workspace layout.
+    ///
+    /// This does not share nominal type inference. Conflicting source evidence
+    /// remains unknown, and dependency edges still require resolved identities.
+    pub fn extend_resource_evidence(&mut self, other: &Self) {
+        self.resource_namespaces.extend(&other.resource_namespaces);
+    }
+
+    pub(crate) fn source_default(&self, source: &str, inline: &[String], path: &[String]) -> Option<bool> {
+        self.is_complete().then(|| self.sources.default_for(source, inline, path)).flatten()
+    }
+
+    pub(crate) fn source_is_enum(&self, source: &str, inline: &[String], path: &[String]) -> bool {
+        self.sources.is_enum(source, inline, path)
+    }
+
+    pub(crate) fn source_defines(&self, source: &str, inline: &[String], path: &[String]) -> bool {
+        self.sources.defines(source, inline, path)
+    }
+
+    pub(crate) fn source_same_type(&self, source: &str, inline: &[String], left: &[String], right: &[String]) -> bool {
+        self.sources.same_type(source, inline, left, right)
+    }
+
     /// Builds the index over one parsed file.
     ///
     /// A workspace's index is the [`absorb`](Self::absorb) of one of these per file, which is what
@@ -449,6 +534,8 @@ impl Defaults {
     #[must_use]
     pub fn of_in(file: &File, cfg: &CfgSet) -> Self {
         let mut index = Self {
+            identities: Some(Identities::of(file, cfg)),
+            resource_namespaces: super::resource_namespaces::Namespaces::of(file, cfg),
             paths: DefaultPaths::of_in(file, cfg),
             cfg: cfg.clone(),
             completeness: Completeness::Complete,
@@ -456,6 +543,7 @@ impl Defaults {
         };
 
         index.visit_file(file);
+        index.note_default_aliases();
         index
     }
 
@@ -491,6 +579,44 @@ impl Defaults {
         self.lacks_error_default(name)
     }
 
+    /// Exact source-local paths are useful only before indexes with unknown module roots merge.
+    pub(crate) fn lacks_local_path(&self, path: &[String]) -> bool {
+        if !self.is_complete() {
+            return false;
+        }
+        if let Some(identities) = &self.identities {
+            return identities.default_for(path) == Some(false);
+        }
+        path.first().is_some_and(|root| root == "crate") && path.last().is_some_and(|name| self.lacks_error_default(name))
+    }
+
+    pub(crate) fn has_single_source_evidence(&self) -> bool {
+        self.is_complete() && self.identities.is_some()
+    }
+
+    pub(crate) fn has_local_default(&self, path: &[String]) -> bool {
+        self.identities.as_ref().and_then(|identities| identities.default_for(path)) == Some(true)
+    }
+
+    pub(crate) fn local_default(&self, path: &[String]) -> Option<bool> {
+        self.identities.as_ref()?.default_for(path)
+    }
+
+    fn note_default_aliases(&mut self) {
+        let mut pending = self.defaulted.iter().cloned().collect::<Vec<_>>();
+        let mut seen = HashSet::default();
+        while let Some(name) = pending.pop() {
+            if seen.insert(name.clone())
+                && let Some(targets) = self.alias_targets.get(&name)
+            {
+                for target in targets {
+                    let _uncertain = self.uncertain_types.insert(target.clone());
+                    pending.push(target.clone());
+                }
+            }
+        }
+    }
+
     /// Folds another index into this one.
     ///
     /// Used to put together what several threads each learned from the files they parsed, in
@@ -504,6 +630,13 @@ impl Defaults {
     /// `result_error` cannot union, because its values are single names rather than membership, so
     /// a key two files disagree about is demoted to "unknown" instead — see [`merge_alias`].
     pub fn absorb(&mut self, other: Self) {
+        self.sources.absorb(other.sources);
+        self.resource_namespaces.absorb(other.resource_namespaces);
+        self.identities = if matches!(self.completeness, Completeness::Empty) {
+            other.identities
+        } else {
+            None
+        };
         self.completeness = self.completeness.merge(other.completeness);
         let collisions = self.defined.intersection(&other.defined).cloned().collect::<Vec<_>>();
         for name in collisions {
@@ -515,13 +648,24 @@ impl Defaults {
             }
         }
         self.ambiguous.extend(other.ambiguous);
+        self.indirect.extend(other.indirect);
         self.defined.extend(other.defined);
         self.defaulted.extend(other.defaulted);
         self.generic.extend(other.generic);
+        self.unproven_generic_types.extend(other.unproven_generic_types);
+        self.aliases.extend(other.aliases);
+        self.uncertain_types.extend(other.uncertain_types);
+        for (name, targets) in other.alias_targets {
+            self.alias_targets.entry(name).or_default().extend(targets);
+        }
+        for (name, target) in other.local_imports {
+            merge_alias(&mut self.local_imports, name, target);
+        }
 
         for (alias, error) in other.result_error {
             merge_alias(&mut self.result_error, alias, error);
         }
+        self.note_default_aliases();
     }
 
     /// Returns whether a type named by the index has no `Default`, given only its name.
@@ -530,7 +674,29 @@ impl Defaults {
     /// is a name rather than a syntax node.
     #[must_use]
     pub fn lacks_error_default(&self, name: &str) -> bool {
-        self.completeness.supplies_negative_evidence() && self.defined.contains(name) && !self.defaulted.contains(name)
+        if !self.completeness.supplies_negative_evidence() || self.indirect.contains("*") {
+            return false;
+        }
+        let mut name = name;
+        let mut seen = HashSet::default();
+        loop {
+            if !seen.insert(name) || self.aliases.contains(name) || self.uncertain_types.contains(name) {
+                return false;
+            }
+            if self.indirect.contains(name) {
+                let Some(Some(target)) = self.local_imports.get(name) else {
+                    return false;
+                };
+                if target != name {
+                    if self.defined.contains(name) && (self.defaulted.contains(name) || self.ambiguous.contains(name)) {
+                        return false;
+                    }
+                    name = target;
+                    continue;
+                }
+            }
+            return self.defined.contains(name) && !self.defaulted.contains(name);
+        }
     }
 
     /// Returns whether the workspace declares a type with this unqualified name.
@@ -573,6 +739,10 @@ impl Defaults {
             && self.defaulted.contains(name)
     }
 
+    pub(crate) fn generic_default_is_unproven(&self, name: &str) -> bool {
+        self.unproven_generic_types.contains(name) || self.uncertain_types.contains(name)
+    }
+
     pub(crate) fn is_complete(&self) -> bool {
         self.completeness.supplies_negative_evidence()
     }
@@ -593,6 +763,10 @@ impl Defaults {
 
     fn note_derive(&mut self, name: &str, generics: &Generics, attributes: &[syn::Attribute]) {
         let defaulted = derives_default(attributes, &self.paths);
+        if attributes.iter().any(|attribute| attribute.path().is_ident("cfg_attr")) {
+            let _inserted = self.indirect.insert(name.to_owned());
+            let _inserted = self.uncertain_types.insert(name.to_owned());
+        }
         if self.defined.contains(name) && self.defaulted.contains(name) != defaulted {
             let _inserted = self.ambiguous.insert(name.to_owned());
         }
@@ -655,6 +829,9 @@ impl<'ast> Visit<'ast> for Defaults {
             && (self.module_depth == 0 || path.segments.len() > 1)
             && let Some(name) = name_of(&node.self_ty)
         {
+            if !node.generics.params.is_empty() || node.generics.where_clause.is_some() {
+                let _inserted = self.unproven_generic_types.insert(name.clone());
+            }
             let _inserted = self.defaulted.insert(name);
         }
 
@@ -668,13 +845,20 @@ impl<'ast> Visit<'ast> for Defaults {
         }
 
         self.module_depth += 1;
+        self.module_path.push(node.ident.to_string());
         visit::visit_item_mod(self, node);
+        let _module = self.module_path.pop();
         self.module_depth -= 1;
     }
 
     fn visit_item_type(&mut self, node: &'ast ItemType) {
         if self.cfg.skip_gate(&node.attrs) {
             return;
+        }
+        let _inserted = self.indirect.insert(node.ident.to_string());
+        let _inserted = self.aliases.insert(node.ident.to_string());
+        if let Some(target) = name_of(&node.ty) {
+            let _target = self.alias_targets.entry(node.ident.to_string()).or_default().insert(target);
         }
 
         // Only an alias for `Result` matters, and only when it supplies its own error type as a
@@ -699,10 +883,80 @@ impl<'ast> Visit<'ast> for Defaults {
         // #[gamma::skip(stmt.delete_call, reason = "`Defaults` has no callbacks for nodes nested in an alias target, so descent is unobservable")]
         visit::visit_item_type(self, node);
     }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        fn names(tree: &syn::UseTree, into: &mut HashSet<String>) {
+            match tree {
+                syn::UseTree::Path(path) => names(&path.tree, into),
+                syn::UseTree::Name(name) => {
+                    let _inserted = into.insert(name.ident.to_string());
+                }
+                syn::UseTree::Rename(rename) => {
+                    let _inserted = into.insert(rename.rename.to_string());
+                }
+                syn::UseTree::Glob(_) => {
+                    let _inserted = into.insert("*".to_owned());
+                }
+                syn::UseTree::Group(group) => {
+                    for tree in &group.items {
+                        names(tree, into);
+                    }
+                }
+            }
+        }
+        fn targets(tree: &syn::UseTree, prefix: &mut Vec<String>, into: &mut Vec<(String, Vec<String>)>) {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    prefix.push(path.ident.to_string());
+                    targets(&path.tree, prefix, into);
+                    let _last = prefix.pop();
+                }
+                syn::UseTree::Name(name) => {
+                    let mut target = prefix.clone();
+                    if name.ident != "self" {
+                        target.push(name.ident.to_string());
+                    }
+                    if let Some(introduced) = target.last() {
+                        into.push((introduced.clone(), target));
+                    }
+                }
+                syn::UseTree::Rename(rename) => {
+                    let mut target = prefix.clone();
+                    if rename.ident != "self" {
+                        target.push(rename.ident.to_string());
+                    }
+                    into.push((rename.rename.to_string(), target));
+                }
+                syn::UseTree::Group(group) => {
+                    for tree in &group.items {
+                        targets(tree, prefix, into);
+                    }
+                }
+                syn::UseTree::Glob(_) => {}
+            }
+        }
+        if self.cfg.skip_gate(&node.attrs) {
+            return;
+        }
+        names(&node.tree, &mut self.indirect);
+        let mut imports = Vec::new();
+        targets(&node.tree, &mut Vec::new(), &mut imports);
+        for (name, path) in imports {
+            let local = node.leading_colon.is_none()
+                && path.first().is_some_and(|root| {
+                    matches!(root.as_str(), "crate" | "self" | "super")
+                        || self
+                            .identities
+                            .as_ref()
+                            .is_some_and(|identities| identities.local_module(&self.module_path, root))
+                });
+            merge_alias(&mut self.local_imports, name, local.then(|| path.last().cloned()).flatten());
+        }
+    }
 }
 
 /// Returns whether a `#[derive(...)]` on an item lists `Default`.
-fn derives_default(attributes: &[syn::Attribute], paths: &DefaultPaths) -> bool {
+pub(super) fn derives_default(attributes: &[syn::Attribute], paths: &DefaultPaths) -> bool {
     let mut found = false;
 
     for attribute in attributes {
@@ -769,10 +1023,146 @@ fn payload_name(ty: &Type, index: usize) -> Option<String> {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    #[test]
+    fn imported_error_names_follow_unambiguous_local_targets_but_not_conflicting_defaults() {
+        let mut defaults = super::Defaults::of(&syn::parse_file("struct Error; use self::Error as Alias;").unwrap());
+        assert!(defaults.lacks_error_default("Alias"));
+        defaults.defined.insert("Alias".into());
+        defaults.defaulted.insert("Alias".into());
+        assert!(!defaults.lacks_error_default("Alias"));
+        defaults.defaulted.remove("Alias");
+        defaults.ambiguous.insert("Alias".into());
+        assert!(!defaults.lacks_error_default("Alias"));
+    }
+
+    #[test]
+    fn public_reexports_block_negative_evidence_for_each_introduced_name() {
+        let file = syn::parse_file(
+            "struct Named; struct Renamed; struct Grouped; pub use external::{Named, Original as Renamed, nested::{Grouped}};",
+        )
+        .unwrap();
+        let index = super::Defaults::of(&file);
+        for name in ["Named", "Renamed", "Grouped"] {
+            assert!(!index.lacks_default(&syn::parse_str(name).unwrap()), "{name}");
+        }
+        let file = syn::parse_file("struct Any; pub use external::*;").unwrap();
+        assert!(!super::Defaults::of(&file).lacks_default(&syn::parse_quote!(Any)));
+        let mut index = super::Defaults::of(&syn::parse_file("struct Missing;").unwrap());
+        index.absorb(super::Defaults::default());
+        assert!(index.lacks_default(&syn::parse_quote!(Missing)));
+    }
+
     use proc_macro2::TokenStream;
     use syn::{parse_file, parse_quote};
 
     use super::*;
+
+    #[test]
+    fn single_source_negative_evidence_requires_the_qualified_declaration() {
+        let defaults = Defaults::of(
+            &parse_file(
+                "struct Value;
+                 mod missing { pub struct Value; }
+                 mod ready { #[derive(Default)] pub struct Value; }",
+            )
+            .unwrap(),
+        );
+        for path in [vec!["crate", "Value"], vec!["crate", "missing", "Value"]] {
+            let path = path.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(defaults.lacks_local_path(&path), "{path:?}");
+        }
+        for path in [vec!["crate", "ready", "Value"], vec!["crate", "unresolved", "Value"]] {
+            let path = path.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(!defaults.lacks_local_path(&path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn unrelated_import_bindings_preserve_standard_default_and_later_where_bounds() {
+        for text in ["use core as root;", "use foreign::Other;", "use core::default as defaults;"] {
+            let paths = DefaultPaths::of(&parse_file(text).unwrap());
+            assert!(paths.is_standard_trait(&parse_quote!(Default)), "{text}");
+            assert!(paths.is_standard_default_callee(&parse_quote!(Default::default)), "{text}");
+        }
+        let item: syn::ItemFn = parse_quote!(
+            fn f<'a, const N: usize, T, U, V>()
+            where
+                'a: 'static,
+                (T,): Clone,
+                T::Item: Clone,
+                U: Clone + Default,
+                V: Default,
+            {
+            }
+        );
+        assert_eq!(
+            standard_defaulted_parameters(&item.sig.generics, &DefaultPaths::default()),
+            ["U", "V"]
+        );
+        let index = Defaults::of(&parse_file("#[derive(Default)] struct Ready;").unwrap());
+        assert!(index.has_default(&parse_quote!(Ready)));
+        assert!(!index.has_default(&parse_quote!(<T>::Ready)));
+    }
+
+    #[test]
+    fn generic_default_declarations_require_generic_unambiguous_repeated_evidence() {
+        let repeated = Defaults::of(
+            &parse_file(
+                "#[derive(Default)] struct Plain; #[derive(Default)] struct Plain; \
+             #[derive(Default)] struct Generic<T>(T); #[derive(Default)] struct Generic<T>(T);",
+            )
+            .unwrap(),
+        );
+        assert!(repeated.has_default_name("Plain"));
+        assert!(!repeated.declares_generic_default_name("Plain"));
+        assert!(repeated.declares_generic_default_name("Generic"));
+        let conflicting = Defaults::of(&parse_file("#[derive(Default)] struct Generic<T>(T); struct Generic<T>(T);").unwrap());
+        assert!(!conflicting.declares_generic_default_name("Generic"));
+        let mut combined = repeated;
+        combined.absorb(conflicting);
+        assert!(!combined.declares_generic_default_name("Generic"));
+        assert!(combined.has_default_name("Plain"));
+    }
+
+    #[test]
+    fn default_path_matrix_separates_prelude_aliases_modules_and_custom_shadows() {
+        for (source, trait_path, standard, fallback, derive) in [
+            ("", "Default", true, true, true),
+            ("trait Default {}", "Default", false, true, true),
+            ("trait Other {}", "Default", true, true, true),
+            ("use other::Default;", "Default", false, true, false),
+            ("use core::default::Default as D;", "D", true, true, true),
+            ("use core::default::Default as D; struct Default;", "D", true, false, true),
+            ("use core::default as d;", "d::Default", true, true, true),
+            ("use core::default::{self as d};", "d::Default", true, true, true),
+            ("use other::default as d;", "d::Default", false, false, true),
+            ("use core::default as Default;", "Default::Default", true, false, true),
+            ("mod child { trait Default{} }", "Default", true, true, true),
+            (
+                "#[cfg(not(unix))] struct Default; use core::default::Default as D;",
+                "D",
+                true,
+                true,
+                true,
+            ),
+        ] {
+            let paths = DefaultPaths::of_in(&parse_file(source).unwrap(), &CfgSet::parse("unix"));
+            let path = syn::parse_str::<Path>(trait_path).unwrap();
+            assert_eq!(paths.is_standard_trait(&path), standard, "{source} / {trait_path}");
+            assert_eq!(paths.is_fallback_trait(&path), fallback, "{source} / {trait_path}");
+            assert_eq!(paths.is_standard_derive(&parse_quote!(Default)), derive, "{source}");
+            let callee = syn::parse_str::<Path>(&format!("{trait_path}::default")).unwrap();
+            assert_eq!(paths.is_standard_default_callee(&callee), standard, "{source}");
+            let segments = callee.segments.iter().map(|segment| segment.ident.to_string()).collect::<Vec<_>>();
+            assert_eq!(paths.is_standard_default_segments(&segments), standard, "{source}");
+            assert!(!paths.is_standard_default_callee(&parse_quote!(helper)));
+            assert!(!paths.is_standard_default_segments(&["D".into(), "new".into()]));
+        }
+        let generics: syn::Generics = syn::parse_quote!(<'a, const N: usize, T, U: Default, V: Clone, W: core::default::Default>);
+        assert_eq!(standard_defaulted_parameters(&generics, &DefaultPaths::default()), ["U", "W"]);
+        let qualified: Type = parse_quote!(<T as Trait>::Output);
+        assert_eq!(unqualified_name_of(&qualified), None);
+    }
 
     #[test]
     fn unqualified_names_follow_parenthesized_and_grouped_types() {
@@ -786,6 +1176,50 @@ mod tests {
         assert_eq!(unqualified_name_of(&parse_quote!(_)), None);
     }
 
+    #[test]
+    fn derive_paths_cfg_modules_and_associated_attributes_preserve_exact_evidence() {
+        let defaults = Defaults::of_in(
+            &parse_file(
+                "use core::default as d;
+             #[other(Default)] struct NotDerived;
+             #[derive(Clone,Default)] struct Derived;
+             #[cfg(not(unix))] mod inactive { #[derive(Default)] struct Disabled; }
+             mod nested { struct Bare; impl Default for Bare {} struct Qualified; impl core::default::Default for Qualified {}
+                 struct ViaModule; impl d::Default for ViaModule {} }
+             struct Root; impl Default for Root {}",
+            )
+            .unwrap(),
+            &CfgSet::parse("unix"),
+        );
+        assert!(!defaults.has_default(&parse_quote!(NotDerived)));
+        assert!(defaults.has_default(&parse_quote!(Derived)));
+        assert!(!defaults.defines("Disabled"));
+        assert!(!defaults.has_default(&parse_quote!(Bare)));
+        assert!(defaults.has_default(&parse_quote!(Qualified)));
+        assert!(defaults.has_default(&parse_quote!(ViaModule)));
+        assert!(defaults.has_default(&parse_quote!(Root)));
+        let implementation: syn::ItemImpl = parse_quote!(impl Example {
+            #[cfg(unix)] const VALUE:u8=0;
+            #[cfg(unix)] type Associated=u8;
+        });
+        for item in &implementation.items {
+            assert_eq!(impl_item_attrs(item).len(), 1);
+            assert!(impl_item_attrs(item)[0].path().is_ident("cfg"));
+        }
+        let declaration: syn::ItemTrait = parse_quote!(
+            trait Example {
+                #[cfg(unix)]
+                const VALUE: u8;
+                #[cfg(unix)]
+                type Associated;
+            }
+        );
+        for item in &declaration.items {
+            assert_eq!(trait_item_attrs(item).len(), 1);
+            assert!(trait_item_attrs(item)[0].path().is_ident("cfg"));
+        }
+    }
+
     fn index(sources: &[&str]) -> Defaults {
         let mut defaults = Defaults::default();
 
@@ -794,6 +1228,38 @@ mod tests {
         }
 
         defaults
+    }
+
+    #[test]
+    fn partial_and_colliding_default_indexes_preserve_unknown_evidence() {
+        let mut complete = index(&["struct Missing; #[derive(Default)] struct Present; union Bits { value: u32 }"]);
+        assert!(complete.lacks_default(&parse_quote!(Missing)));
+        assert!(complete.lacks_default(&parse_quote!(Bits)));
+        assert!(complete.declares_default_name("Present"));
+        complete.mark_incomplete();
+        assert!(!complete.is_complete());
+        assert!(!complete.lacks_default(&parse_quote!(Missing)));
+        assert!(!complete.declares_default_name("Present"));
+
+        for sources in [
+            ["#[derive(Default)] struct Config;", "struct Config;"],
+            ["struct Config;", "#[derive(Default)] struct Config;"],
+        ] {
+            let collided = index(&sources);
+            assert!(!collided.declares_default_name("Config"));
+            assert!(!collided.has_default(&parse_quote!(Config)));
+            assert!(!collided.lacks_default(&parse_quote!(Config)));
+            assert!(collided.defines("Config"));
+        }
+        let generic = index(&["#[derive(Default)] struct Generic<T>(T);"]);
+        assert!(!generic.declares_default_name("Generic"));
+        assert!(generic.declares_generic_default_name("Generic"));
+        let gated = Defaults::of_in(
+            &parse_file("#[cfg(not(unix))] union Disabled { field: u32 } union Active { field: u32 }").unwrap(),
+            &CfgSet::parse("unix"),
+        );
+        assert!(!gated.defines("Disabled"));
+        assert!(gated.defines("Active"));
     }
 
     #[test]

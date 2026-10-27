@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use cargo_metadata::semver::Version;
 
 use crate::error::{EachError, InvalidPackageFileLineError, PackageFileReadError, PackageFileUtf8Error, UnknownSelectorError};
+use crate::filter::glob_matches;
 use crate::workspace::{Member, Workspace};
 
 /// A parsed package selection, before it is resolved against a workspace.
@@ -55,9 +56,22 @@ impl Selection {
         exclude: &[String],
         none: bool,
     ) -> Result<Self, EachError> {
+        Self::from_sources_with_reader(packages, package_files, all, exclude, none, |path| fs::read(path))
+    }
+
+    /// Build a selection with an explicit package-file reader.
+    pub(crate) fn from_sources_with_reader(
+        packages: &[String],
+        package_files: &[PathBuf],
+        all: bool,
+        exclude: &[String],
+        none: bool,
+        mut read: impl FnMut(&Path) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Self, EachError> {
         let mut combined = packages.to_vec();
         for path in package_files {
-            combined.extend(read_package_file(path)?);
+            let bytes = read(path).map_err(|error| PackageFileReadError::caused_by(path.display().to_string(), error))?;
+            combined.extend(parse_package_file(path, bytes)?);
         }
         Ok(Self {
             packages: combined,
@@ -122,9 +136,8 @@ impl Selection {
     }
 }
 
-fn read_package_file(path: &Path) -> Result<Vec<String>, EachError> {
+fn parse_package_file(path: &Path, bytes: Vec<u8>) -> Result<Vec<String>, EachError> {
     let display = path.display().to_string();
-    let bytes = fs::read(path).map_err(|error| PackageFileReadError::caused_by(display.clone(), error))?;
     let contents = String::from_utf8(bytes).map_err(|error| PackageFileUtf8Error::caused_by(display.clone(), error))?;
     contents
         .strip_prefix('\u{feff}')
@@ -285,35 +298,6 @@ fn version_matches(supplied: &str, actual: &Version) -> bool {
     }
 }
 
-/// Tiny Unix-style glob matcher: `*` matches any run of characters
-/// (including empty), `?` matches exactly one character. Everything else
-/// matches literally.
-///
-/// Uses dynamic programming, so ambiguous `*` backtracking remains bounded by
-/// `O(len(pattern) * len(name))`.
-fn glob_matches(pattern: &str, name: &str) -> bool {
-    let name: Vec<char> = name.chars().collect();
-    let mut previous = vec![false; name.len() + 1];
-    previous[0] = true;
-
-    for pattern_char in pattern.chars() {
-        let mut current = vec![false; name.len() + 1];
-        if pattern_char == '*' {
-            current[0] = previous[0];
-        }
-        for (index, name_char) in name.iter().enumerate() {
-            current[index + 1] = if pattern_char == '*' {
-                previous[index + 1] || current[index]
-            } else {
-                previous[index] && (pattern_char == '?' || pattern_char == *name_char)
-            };
-        }
-        previous = current;
-    }
-
-    previous[name.len()]
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -330,6 +314,7 @@ mod tests {
             rust_version: Some("1.70.0".parse().expect("valid Rust version")),
             manifest_path: PathBuf::from(format!("/ws/{name}/Cargo.toml")),
             publishable: true,
+            doctest: true,
             features: BTreeSet::new(),
             targets: Vec::new(),
             dependencies: BTreeSet::new(),
