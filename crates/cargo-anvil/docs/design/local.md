@@ -74,11 +74,25 @@ imported `.just` files. The alias `anvil := anvil-pr` lives in `mod.just`, not i
 the user's `Justfile`, so renaming or retargeting the alias is a template update
 with no managed-region churn.
 
-Recipes in the `groups/`, `tiers.just`, and `checks/` files that actually *run* checks
-are annotated with `[group("anvil")]`. The install/validate-prereqs/setup recipes
-in `tools.just` (and the per-check/group/tier setup recipes colocated in the same
-files) are annotated with `[group("anvil-setup")]`. `just --groups` therefore shows
-two clean clusters: one for "run checks", one for "install prereqs".
+`just --list` (also shown by a repository's default listing recipe) exposes only
+the user-facing entry points, organized into three groups:
+
+- **`anvil`**: individual checks, local-development commands (`anvil-build` and
+  `anvil-readme`), check groups, tiers, and `anvil-impact`. The `anvil` alias is
+  listed alongside its target, `anvil-pr`.
+- **`anvil-setup`**: `anvil-setup` to install everything and
+  `anvil-validate-prereqs` to verify the environment without installing anything.
+- **`anvil-container`**: container execution, status, tag, and cleanup commands.
+
+Per-check, per-group, and per-tier `*-setup` / `*-validate-prereqs` recipes and
+atomic tool, toolchain, and component recipes are dependency plumbing, annotated
+with `[private]`. Other internal helpers use `[private]` or an underscore-prefixed
+name. Just omits these recipes from `--list` and `--summary`; they remain callable
+by their existing names, both as dependencies and directly from the command line.
+For example, `just anvil-clippy-setup` still installs only Clippy's prerequisites,
+and the generated cloud workflows still call their group-specific setup recipes.
+`just --show <recipe>` can inspect a hidden recipe. Visibility does not change any
+recipe's arguments or dependency graph.
 
 > **Containerized execution.** `justfiles/anvil/container.just` adds the
 > `anvil-container <command…>` recipe, which runs the given argv inside a pinned
@@ -106,7 +120,7 @@ anvil-clippy: anvil-clippy-validate-prereqs
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-The per-check `*-validate-prereqs` recipe (in the `anvil-setup` group) chains the
+The private per-check `*-validate-prereqs` recipe chains the
 relevant atomic validators -- e.g. `anvil-component-default-clippy-validate-prereqs`
 for clippy, plus `anvil-tool-rustc-validate-prereqs` for the toolchain pin -- each of
 which calls `cargo install --list` / `rustup component list` / `rustc --version` to
@@ -522,7 +536,7 @@ a CI shell and threading the result between jobs as environment variables.
 | `snapshots/current.json`     | cargo-delta snapshot of the working tree. Cached, keyed on the HEAD sha (`current.key`); the dirty-tree guard widens instead of snapshotting, so a snapshotted tree always corresponds exactly to HEAD. |
 | `impact.json`                | the `cargo delta impact --format json` report (the durable source of truth). An unchanged tree yields an empty impact set, which cargo-delta reports either as a report with empty tiers or by printing nothing at all, in which case the recipe stores `{}`. A bare `{}` is therefore not a reliable "nothing changed" signal: the dirty-tree and baseline-without-a-workspace paths also write `{}` as a synthetic placeholder while widening every tier to `--workspace`. Read the `include_<tier>.txt` files for the scope actually selected. |
 | `include_<tier>.txt`         | the pre-projected per-tier scope string (see below), one file per tier. |
-| `doctest_packages.txt`       | Ordinally sorted `name@version` specs for workspace members with at least one metadata target marked `doctest = true`. It is projected from the formatter's locked metadata read and lets doc-test avoid a redundant metadata process. |
+| `doctest_packages.txt`       | Ordinally sorted `name@version` specs for workspace members with at least one metadata target marked `doctest = true`. It is projected from the formatter's locked metadata read and lets doc-test avoid rereading target capabilities. |
 
 Because the modified/current set comes from cargo-delta's **committed** git diff against
 the base, local scoping reflects the commits your branch adds on top of the base ref, the
@@ -762,8 +776,8 @@ repository wrappers for common Cargo operations:
 just anvil-build
 just anvil-build --package my-crate
 just anvil-doc-build --open
-just anvil-examples --run
-just anvil-examples --run --package my-crate --example basic
+just anvil-examples
+just anvil-examples --package my-crate --example basic
 just anvil-fmt --fix
 just anvil-miri --package my-crate --test test_name
 just anvil-miri --package my-crate --example basic
@@ -776,17 +790,36 @@ The other options extend existing checks without changing their no-option cloud
 behavior. Every recipe accepts only its documented options and rejects unknown,
 duplicate, incomplete, or conflicting input.
 
-An unfiltered `anvil-examples --run` skips examples listed by their package:
+`anvil-examples` builds selected example targets and then executes them.
+Standalone commands invoke this recipe directly; PR and scheduled test groups
+depend on it.
+Standalone and PR invocations use the affected-package scope described in §4;
+scheduled and full tiers cover the entire workspace. Explicit `--package`
+selection overrides impact scope, and `--example` selects one target and
+requires `--package`.
+
+When no `--example` is specified, execution skips examples listed by their
+package:
 
 ```toml
 [package.metadata.anvil.examples]
 no-run = ["interactive-demo", "needs-production-credentials"]
 ```
 
-The metadata affects execution only: `anvil-examples` still compiles every
-example. Explicitly selecting an excluded example with `--example` runs it,
-because the user has supplied the missing intent. Runs default to a 30-second
-per-example timeout, configurable with `--timeout <seconds>`.
+The metadata affects execution only: excluded examples still compile when
+selected for the build. Explicitly selecting an excluded example with
+`--package` and `--example` runs it.
+
+Examples run sequentially with all features enabled, `ANVIL_EXAMPLE=1`,
+and no application arguments. The default per-example timeout is 30 seconds;
+`--timeout <seconds>` accepts 1 through 3600 seconds. A nonzero exit or timeout
+marks the check as failed, but the remaining selected examples still run.
+Examples inherit the recipe's stdout and stderr, so output streams live without
+recipe-level buffering. Failures are identified by package and example name.
+
+Examples requiring arguments, services, credentials, or interaction must support
+this smoke-test invocation or declare a `no-run` exclusion. Anvil does not
+provision example-specific services.
 
 `anvil-miri` continues to run affected test targets by default. `--test`
 adds a libtest name filter, while `--example` switches the invocation to one

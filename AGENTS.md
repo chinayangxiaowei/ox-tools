@@ -10,6 +10,19 @@ The spell checker dictionary is in the `.spelling` file, one word per line in ar
 
 Do not manually edit `CHANGELOG.md` files. Changelogs are automatically updated on release.
 
+## cargo-anvil Versioning
+
+When a PR changes cargo-anvil's catalog (including template-only updates),
+include an appropriate `cargo-anvil` crate version bump in the same PR. Use
+`.\scripts\release-crate.ps1 cargo-anvil -Version <new-version>` to update
+the version and generate the changelog, then regenerate the Anvil artifacts,
+snapshots, and `.anvil.lock` from the updated sources.
+
+A changed `catalog_checksum` with an unchanged `tool_version` in
+`.anvil.lock`, compared with the PR base, is likely a bug: a version bump
+may be missing. Keep the crate version, `Cargo.lock`, and generated lock
+metadata synchronized; do not hand-edit `.anvil.lock` to fix this.
+
 ## Design Docs Are Part of the Source
 
 Each crate's design is captured under `crates/<crate>/docs/`, kept in
@@ -86,6 +99,23 @@ in sync is far cheaper than regenerating that context on every review or
 extension.
 
 ## Maintainability
+
+### Evidence before complexity
+
+Review feedback is a claim to verify, not an instruction to implement its
+suggested design. Identify the broken contract and demonstrate the wrong outcome
+in a supported configuration, through a focused reproduction or conclusive
+code-level evidence. Distinguish observed failures from hypothetical risks;
+passing CI alone does not disprove a defect.
+
+Prefer deletion, reuse, and small local corrections over new abstractions,
+configuration knobs, fallback chains, or environment provisioning. Explain why
+any added complexity is necessary for the demonstrated problem. Push back on
+unsupported scenarios and speculative hardening, but do not defer proven
+regressions introduced by the PR. Keep regression coverage focused on the
+contract rather than building a new framework for an edge case.
+
+### Expect messages
 
 While it is fine to use `.expect()`, the precondition is that it is either a programming error (the caller did something wrong)
 or a situation that can never happen (in the absence of bugs). The expect-message must document either what the caller did wrong

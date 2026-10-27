@@ -50,6 +50,20 @@
 //! package specs only: comments, command-line tokens, malformed input, and
 //! missing, unreadable, or non-UTF-8 files are errors.
 //!
+//! ### Source-qualified package selection
+//!
+//! Selection remains workspace-only, even when a registry dependency has the
+//! same name and version. Existing `-p name@version` and `--package-file`
+//! inputs resolve in the current checkout; no cargo-delta record format is
+//! required. Use `{cargo-spec}` for child Cargo commands that must distinguish
+//! the local package from a registry copy. Selectors are checkout-local and
+//! are reconstructed from metadata in each checkout.
+//!
+//! Ordinary aggregate `cargo build` and `cargo test` commands do not need
+//! cargo-each. Cargo's `--workspace` with `--exclude` flags scopes selection
+//! to workspace members without ambiguous package specs or checkout-local paths.
+//! Callers must skip explicitly empty selections rather than exclude every member.
+//!
 //! ## Filters
 //!
 //! `--filter` accepts Boolean expressions using `not`, `and`, `or`, and
@@ -78,7 +92,15 @@
 //!   `{json:key}`.
 //! - `--each-target <KIND>`: run once per matching Cargo target, using
 //!   `{target}` plus the package placeholders. Repeated kinds are OR-combined;
-//!   `--target-required-feature` further narrows targets.
+//!   repeated `--target-filter` expressions are AND-combined after kind
+//!   selection. Target-filter atoms are `name:<glob>`,
+//!   `required-feature:<name>`, and
+//!   `name-in-metadata:<dotted.key>`.
+//! - `--require-target-per-package`: in per-target mode, reject the complete
+//!   selection before execution unless every selected package retains at
+//!   least one target after kind and target-expression filtering. All missing
+//!   packages are reported as `name@version`; an empty package selection
+//!   remains a successful no-op.
 //!
 //! `--keep-going` runs every invocation and exits non-zero if any failed
 //! (default is fail-fast). `--jobs <N|auto>` bounds concurrent per-package,
@@ -99,6 +121,10 @@
 //!
 //! - `{name}` — bare package name (per-package and per-target).
 //! - `{spec}` — `name@version` (per-package and per-target).
+//! - `{cargo-spec}` — source-qualified `file:///...#name@version` Cargo
+//!   selector (per-package and per-target). Paths are URL-encoded, so spaces
+//!   remain part of one argv element. Built from the manifest directory,
+//!   package name, and version.
 //! - `{version}` — package version (per-package and per-target).
 //! - `{manifest}` — absolute member `Cargo.toml` path (per-package and
 //!   per-target).
@@ -106,6 +132,7 @@
 //! - `{packages}` — the cargo selection flags for the resolved set
 //!   (`--workspace` for the whole workspace, else `--package name@version …`);
 //!   valid only in `--once` mode and only as a standalone argument.
+//!   Like `{spec}`, this expansion is not source-qualified.
 //! - `{workspace-rust-version}` — the root `[workspace.package].rust-version`,
 //!   or root `[package].rust-version` in a single-package repository; valid in
 //!   Cargo-backed per-package, per-target, and `--once` modes. Expands to an
@@ -131,6 +158,10 @@
 //! floor; malformed or inconsistent declarations remain errors. Substitution
 //! is textual, so an empty value does not remove its surrounding argv element.
 //! Placeholder mode validation still runs before an empty-plan no-op.
+//! With `--require-target-per-package`, target selection is validated for every
+//! selected package before any child command is spawned. A failure lists every
+//! package without a matching target in deterministic package order and exits
+//! 2, regardless of `--jobs`, `--keep-going`, `--timeout`, or `--chdir`.
 //!
 //! JSON-record mode requires one JSON object per nonempty input line and does
 //! not load Cargo metadata. Referenced `{json:key}` fields must exist and be
@@ -185,6 +216,13 @@
 //!
 //! # Examples
 //!
+//! Select a local package even when a registry dependency shares its identity:
+//!
+//! ```text
+//! cargo each -p crate-a@1.0.0 -- cargo check --package {cargo-spec}
+//! cargo each --package-file selected.txt -- cargo check --package {cargo-spec}
+//! ```
+//!
 //! Run a per-manifest tool over every library crate:
 //!
 //! ```text
@@ -202,7 +240,8 @@
 //! Run every Cargo test target that requires the `loom` feature:
 //!
 //! ```text
-//! cargo each --workspace --each-target test --target-required-feature loom -- \
+//! cargo each --workspace --filter feature:loom --each-target test \
+//!     --target-filter required-feature:loom --require-target-per-package -- \
 //!     cargo test -p {name} --test {target} --features loom
 //! ```
 

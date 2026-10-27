@@ -17,6 +17,11 @@ bitset
 catchable
 Ctrl
 unanalyzable
+journaled
+quiesces
+unmerged
+unselected
+unvalidated
 acyclic
 addrs
 ado
@@ -201,6 +206,7 @@ IP
 io
 jitter
 JSON
+JSONC
 JSON's
 JSON5
 Justfile
@@ -895,6 +901,7 @@ VCS
 wasm
 weakenings
 worklist
+Kahn
 XFS
 ~
 Baselining

@@ -627,6 +627,9 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.93
+# The allow list is shared across repositories, so it may intentionally
+# include licenses absent from this repository's dependency graph.
+unused-allowed-license = "allow"
 # <<< anvil-managed: anvil-deny-licenses
 
 # >>> anvil-managed: anvil-deny-bans
@@ -665,6 +668,7 @@ unknown-git = "deny"
 # Unscoped (consults external risk DB).
 
 # Analyze dependency features and version requirements with cargo-aprz.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-aprz: anvil-aprz-validate-prereqs
     $ErrorActionPreference = 'Stop'
@@ -685,11 +689,11 @@ anvil-aprz: anvil-aprz-validate-prereqs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-aprz` recipe.
-[group("anvil-setup")]
+[private]
 anvil-aprz-setup installer="install": (anvil-tool-cargo-aprz-install installer)
 
 # Validate prerequisites for the `anvil-aprz` recipe.
-[group("anvil-setup")]
+[private]
 anvil-aprz-validate-prereqs: anvil-tool-cargo-aprz-validate-prereqs
 
 === justfiles/anvil/checks/audit.just ===
@@ -704,6 +708,7 @@ anvil-aprz-validate-prereqs: anvil-tool-cargo-aprz-validate-prereqs
 # Unscoped (consults external advisory DB; reads Cargo.lock).
 
 # Audit dependencies for known security vulnerabilities.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-audit: anvil-audit-validate-prereqs
     $ErrorActionPreference = 'Stop'
@@ -711,11 +716,11 @@ anvil-audit: anvil-audit-validate-prereqs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-audit` recipe.
-[group("anvil-setup")]
+[private]
 anvil-audit-setup installer="install": (anvil-tool-cargo-audit-install installer)
 
 # Validate prerequisites for the `anvil-audit` recipe.
-[group("anvil-setup")]
+[private]
 anvil-audit-validate-prereqs: anvil-tool-cargo-audit-validate-prereqs
 
 === justfiles/anvil/checks/bench.just ===
@@ -730,10 +735,11 @@ anvil-audit-validate-prereqs: anvil-tool-cargo-audit-validate-prereqs
 # Affected tier.
 
 # Build all workspace benchmarks.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-bench: anvil-bench-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude affected)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if ($include -eq '--skip') { Write-Host 'anvil-bench: no affected packages; skipping'; exit 0 }
@@ -744,11 +750,11 @@ anvil-bench: anvil-bench-validate-prereqs anvil-impact
 # is needed beyond the Rust toolchain.
 
 # Install prerequisites for the `anvil-bench` recipe.
-[group("anvil-setup")]
+[private]
 anvil-bench-setup installer="install": anvil-toolchain-stable-install
 
 # Validate prerequisites for the `anvil-bench` recipe.
-[group("anvil-setup")]
+[private]
 anvil-bench-validate-prereqs: anvil-tool-rustc-validate-prereqs
 
 === justfiles/anvil/checks/bolero.just ===
@@ -783,6 +789,7 @@ anvil-bench-validate-prereqs: anvil-tool-rustc-validate-prereqs
 # repo-specific to standardize).
 
 # Run Bolero tests for affected workspace packages.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-bolero: anvil-bolero-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -797,7 +804,7 @@ anvil-bolero: anvil-bolero-validate-prereqs anvil-impact
         Write-Host 'anvil-bolero: no affected packages; skipping'
         exit 0
     }
-    $packageNames = [System.Collections.Generic.List[string]]::new()
+    $packageSpecs = [System.Collections.Generic.List[string]]::new()
     if ($include -and $include -ne '--workspace') {
         $pkgArgs = @(-split $include)
         for ($i = 0; $i -lt $pkgArgs.Count; $i++) {
@@ -805,9 +812,7 @@ anvil-bolero: anvil-bolero-validate-prereqs anvil-impact
                 Write-Error "anvil-bolero: unsupported affected-package arguments: $include"
                 exit 1
             }
-            # Impact emits version-qualified specs (name@version); cargo-bolero
-            # resolves workspace members by bare package name.
-            $packageNames.Add(($pkgArgs[++$i] -split '@', 2)[0])
+            $packageSpecs.Add($pkgArgs[++$i])
         }
     } else {
         $metadataJson = & cargo {{_anvil_stable_toolchain_args}} metadata --no-deps --format-version 1
@@ -819,7 +824,7 @@ anvil-bolero: anvil-bolero-validate-prereqs anvil-impact
             $metadata = $metadataJson | ConvertFrom-Json
             foreach ($package in $metadata.packages) {
                 if ($metadata.workspace_members -contains $package.id) {
-                    $packageNames.Add($package.name)
+                    $packageSpecs.Add("$($package.name)@$($package.version)")
                 }
             }
         } catch {
@@ -829,20 +834,25 @@ anvil-bolero: anvil-bolero-validate-prereqs anvil-impact
     }
 
     # cargo-bolero accepts only one --package, so discover each package
-    # separately and combine the emitted JSON target objects.
+    # separately and combine the emitted JSON target objects. cargo-each
+    # resolves each workspace-member spec and passes cargo-bolero a
+    # source-qualified '{cargo-spec}', which stays unambiguous when a
+    # registry dependency shares the member's name and version.
     $targets = [System.Collections.Generic.List[object]]::new()
-    foreach ($packageName in $packageNames) {
-        $targetsJson = & cargo '+{{ rust_nightly }}' bolero list --profile release --package $packageName
+    foreach ($packageSpec in $packageSpecs) {
+        $targetsJson = & cargo {{_anvil_stable_toolchain_args}} each --package $packageSpec '--' cargo '+{{ rust_nightly }}' bolero list --profile release --package '{cargo-spec}'
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "anvil-bolero: target discovery failed for package '$packageName'"
+            Write-Error "anvil-bolero: target discovery failed for package '$packageSpec'"
             exit $LASTEXITCODE
         }
         try {
             foreach ($targetJson in ($targetsJson | Where-Object { $_ -match '^\{' })) {
-                $targets.Add(($targetJson | ConvertFrom-Json))
+                $target = $targetJson | ConvertFrom-Json
+                $target | Add-Member -NotePropertyName anvilPackageSpec -NotePropertyValue $packageSpec
+                $targets.Add($target)
             }
         } catch {
-            Write-Error "anvil-bolero: could not parse target discovery output for package '$packageName': $_"
+            Write-Error "anvil-bolero: could not parse target discovery output for package '$packageSpec': $_"
             exit 1
         }
     }
@@ -852,28 +862,27 @@ anvil-bolero: anvil-bolero-validate-prereqs anvil-impact
     }
     $failed = $false
     foreach ($t in $targets) {
-        $packageName = if ($t.package) { $t.package } else { $t.package_name }
         $testName = if ($t.test) { $t.test } elseif ($t.test_name) { $t.test_name } else { $t.target }
-        if (-not $packageName -or -not $testName) {
+        if (-not $testName) {
             Write-Error "anvil-bolero: target discovery returned an unsupported object: $($t | ConvertTo-Json -Compress)"
             exit 1
         }
-        Write-Host "anvil-bolero: ${packageName}::${testName}"
-        & cargo '+{{ rust_nightly }}' bolero test --profile release --engine libfuzzer -T 60s --package $packageName $testName
+        Write-Host "anvil-bolero: $($t.anvilPackageSpec)::${testName}"
+        & cargo {{_anvil_stable_toolchain_args}} each --package $t.anvilPackageSpec '--' cargo '+{{ rust_nightly }}' bolero test --profile release --engine libfuzzer -T 60s --package '{cargo-spec}' $testName
         if ($LASTEXITCODE -ne 0) { $failed = $true }
     }
     if ($failed) { exit 1 }
 
-# bolero needs cargo-bolero plus the pinned nightly toolchain
+# bolero needs cargo-bolero, cargo-each, and the pinned nightly toolchain
 # (libfuzzer engine requires nightly rustc features).
 
 # Install prerequisites for the `anvil-bolero` recipe.
-[group("anvil-setup")]
-anvil-bolero-setup installer="install": anvil-toolchain-nightly-install (anvil-tool-cargo-bolero-install installer)
+[private]
+anvil-bolero-setup installer="install": anvil-toolchain-nightly-install (anvil-tool-cargo-bolero-install installer) (anvil-tool-cargo-each-install installer)
 
 # Validate prerequisites for the `anvil-bolero` recipe.
-[group("anvil-setup")]
-anvil-bolero-validate-prereqs: anvil-toolchain-nightly-validate-prereqs anvil-tool-cargo-bolero-validate-prereqs
+[private]
+anvil-bolero-validate-prereqs: anvil-toolchain-nightly-validate-prereqs anvil-tool-cargo-bolero-validate-prereqs anvil-tool-cargo-each-validate-prereqs
 
 === justfiles/anvil/checks/careful.just ===
 # Copyright (c) Microsoft Corporation.
@@ -885,10 +894,11 @@ anvil-bolero-validate-prereqs: anvil-toolchain-nightly-validate-prereqs anvil-to
 # See https://github.com/microsoft/ox-tools/blob/main/crates/cargo-anvil/docs/design/checks.md
 
 # Run tests with cargo-careful for affected workspace packages.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-careful: anvil-careful-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude affected)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if ($include -eq '--skip') { Write-Host 'anvil-careful: no affected packages; skipping'; exit 0 }
@@ -950,11 +960,11 @@ anvil-careful: anvil-careful-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-careful` recipe.
-[group("anvil-setup")]
+[private]
 anvil-careful-setup installer="install": anvil-component-nightly-rust-src-install (anvil-tool-cargo-careful-install installer)
 
 # Validate prerequisites for the `anvil-careful` recipe.
-[group("anvil-setup")]
+[private]
 anvil-careful-validate-prereqs: anvil-component-nightly-rust-src-validate-prereqs anvil-tool-cargo-careful-validate-prereqs
 
 === justfiles/anvil/checks/cargo-hack.just ===
@@ -971,10 +981,11 @@ anvil-careful-validate-prereqs: anvil-component-nightly-rust-src-validate-prereq
 # is the right scope.
 
 # Check feature combinations for required workspace packages.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-cargo-hack: anvil-cargo-hack-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include required)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude required)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if ($include -eq '--skip') { Write-Host 'anvil-cargo-hack: no affected packages; skipping'; exit 0 }
@@ -982,11 +993,11 @@ anvil-cargo-hack: anvil-cargo-hack-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-cargo-hack` recipe.
-[group("anvil-setup")]
+[private]
 anvil-cargo-hack-setup installer="install": (anvil-tool-cargo-hack-install installer)
 
 # Validate prerequisites for the `anvil-cargo-hack` recipe.
-[group("anvil-setup")]
+[private]
 anvil-cargo-hack-validate-prereqs: anvil-tool-cargo-hack-validate-prereqs
 
 === justfiles/anvil/checks/cargo-sort.just ===
@@ -1008,6 +1019,7 @@ anvil-cargo-hack-validate-prereqs: anvil-tool-cargo-hack-validate-prereqs
 # (e.g. blank-line-separated dependency blocks) intact.
 
 # Check that Cargo.toml dependency tables are sorted.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-cargo-sort: anvil-cargo-sort-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1019,11 +1031,11 @@ anvil-cargo-sort: anvil-cargo-sort-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-cargo-sort` recipe.
-[group("anvil-setup")]
+[private]
 anvil-cargo-sort-setup installer="install": (anvil-tool-cargo-sort-install installer)
 
 # Validate prerequisites for the `anvil-cargo-sort` recipe.
-[group("anvil-setup")]
+[private]
 anvil-cargo-sort-validate-prereqs: anvil-tool-cargo-sort-validate-prereqs
 
 === justfiles/anvil/checks/check-all-targets.just ===
@@ -1041,6 +1053,7 @@ anvil-cargo-sort-validate-prereqs: anvil-tool-cargo-sort-validate-prereqs
 # defaults disabled, without linking or executing their test binaries.
 
 # Check all targets of affected packages independently.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-check-all-targets: anvil-check-all-targets-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1056,16 +1069,16 @@ anvil-check-all-targets: anvil-check-all-targets-validate-prereqs anvil-impact
     foreach ($cfg in $configs) {
         Write-Host "anvil-check-all-targets: checking $($cfg.name) features"
         $featureArgs = $cfg.flags
-        & cargo {{_anvil_stable_toolchain_args}} each @pkg --keep-going '--' cargo {{_anvil_stable_toolchain_args}} check --package '{spec}' --all-targets @featureArgs --locked
+        & cargo {{_anvil_stable_toolchain_args}} each @pkg --keep-going '--' cargo {{_anvil_stable_toolchain_args}} check --package '{cargo-spec}' --all-targets @featureArgs --locked
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
 # Install prerequisites for the `anvil-check-all-targets` recipe.
-[group("anvil-setup")]
+[private]
 anvil-check-all-targets-setup installer="install": anvil-toolchain-stable-install (anvil-tool-cargo-each-install installer)
 
 # Validate prerequisites for the `anvil-check-all-targets` recipe.
-[group("anvil-setup")]
+[private]
 anvil-check-all-targets-validate-prereqs: anvil-tool-rustc-validate-prereqs anvil-tool-cargo-each-validate-prereqs
 
 === justfiles/anvil/checks/clippy.just ===
@@ -1085,10 +1098,11 @@ anvil-check-all-targets-validate-prereqs: anvil-tool-rustc-validate-prereqs anvi
 # rustup component; same reasoning as fmt for the require.
 
 # Lint affected workspace packages with Clippy.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-clippy: anvil-clippy-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude affected)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if ($include -eq '--skip') { Write-Host 'anvil-clippy: no affected packages; skipping'; exit 0 }
@@ -1096,11 +1110,11 @@ anvil-clippy: anvil-clippy-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-clippy` recipe.
-[group("anvil-setup")]
+[private]
 anvil-clippy-setup installer="install": anvil-component-default-clippy-install
 
 # Validate prerequisites for the `anvil-clippy` recipe.
-[group("anvil-setup")]
+[private]
 anvil-clippy-validate-prereqs: anvil-component-default-clippy-validate-prereqs
 
 === justfiles/anvil/checks/deny.just ===
@@ -1117,6 +1131,7 @@ anvil-clippy-validate-prereqs: anvil-component-default-clippy-validate-prereqs
 # depend on the adopter's default shell (absent/varying on Windows).
 
 # Check dependency licenses, bans, sources, and advisories.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-deny: anvil-deny-validate-prereqs
     $ErrorActionPreference = 'Stop'
@@ -1124,11 +1139,11 @@ anvil-deny: anvil-deny-validate-prereqs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-deny` recipe.
-[group("anvil-setup")]
+[private]
 anvil-deny-setup installer="install": (anvil-tool-cargo-deny-install installer)
 
 # Validate prerequisites for the `anvil-deny` recipe.
-[group("anvil-setup")]
+[private]
 anvil-deny-validate-prereqs: anvil-tool-cargo-deny-validate-prereqs
 
 === justfiles/anvil/checks/doc-build.just ===
@@ -1145,11 +1160,12 @@ anvil-deny-validate-prereqs: anvil-tool-cargo-deny-validate-prereqs
 # crate that wasn't itself modified.
 
 # Build documentation for required workspace packages.
+[group("anvil")]
 [arg("open", long, value="true")]
 [script("pwsh", "-NoProfile")]
 anvil-doc-build open="false": anvil-doc-build-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include required)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude required)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if ($include -eq '--skip') { Write-Host 'anvil-doc-build: no affected packages; skipping'; exit 0 }
@@ -1163,11 +1179,11 @@ anvil-doc-build open="false": anvil-doc-build-validate-prereqs anvil-impact
 # rely on it being present everywhere anvil runs.
 
 # Install prerequisites for the `anvil-doc-build` recipe.
-[group("anvil-setup")]
+[private]
 anvil-doc-build-setup installer="install": anvil-toolchain-stable-install
 
 # Validate prerequisites for the `anvil-doc-build` recipe.
-[group("anvil-setup")]
+[private]
 anvil-doc-build-validate-prereqs: anvil-tool-rustc-validate-prereqs
 
 === justfiles/anvil/checks/doc-test.just ===
@@ -1192,6 +1208,7 @@ anvil-doc-build-validate-prereqs: anvil-tool-rustc-validate-prereqs
 # explicit crate types such as rlib/cdylib and proc macros remain eligible.
 
 # Run documentation tests for affected workspace packages.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-doc-test: anvil-doc-test-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1207,7 +1224,7 @@ anvil-doc-test: anvil-doc-test-validate-prereqs anvil-impact
         [System.StringComparer]::Ordinal
     )
     foreach ($spec in @(-split "$capableText")) { if ($spec) { $docPackages[$spec] = $true } }
-    $specs = if ($selection -contains '--workspace') {
+    $specs = @(if ($selection -contains '--workspace') {
         $workspaceSpecs = [string[]]@($docPackages.Keys)
         [Array]::Sort($workspaceSpecs, [System.StringComparer]::Ordinal)
         $workspaceSpecs
@@ -1220,27 +1237,27 @@ anvil-doc-test: anvil-doc-test-validate-prereqs anvil-impact
                 }
             }
         )
-    }
+    })
     if ($specs.Count -eq 0) {
         Write-Host 'anvil-doc-test: no affected doctest-capable packages; skipping'
         exit 0
     }
-    $docSelection = [System.Collections.Generic.List[string]]::new()
-    foreach ($spec in $specs) {
-        $docSelection.Add('--package')
-        $docSelection.Add($spec)
-    }
+    # Workspace-exclude selection stays unambiguous when a registry
+    # dependency shares a member's name and version.
+    $docSelectionText = (& "{{ just_executable() }}" _anvil-workspace-exclude @specs)
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $docSelection = @(-split $docSelectionText)
     & cargo {{_anvil_stable_toolchain_args}} test --doc @docSelection --all-features --locked
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & cargo {{_anvil_stable_toolchain_args}} test --doc @docSelection --locked
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-doc-test` recipe.
-[group("anvil-setup")]
+[private]
 anvil-doc-test-setup installer="install": anvil-toolchain-stable-install
 
 # Validate prerequisites for the `anvil-doc-test` recipe.
-[group("anvil-setup")]
+[private]
 anvil-doc-test-validate-prereqs: anvil-tool-rustc-validate-prereqs
 
 === justfiles/anvil/checks/ensure-no-cyclic-deps.just ===
@@ -1255,6 +1272,7 @@ anvil-doc-test-validate-prereqs: anvil-tool-rustc-validate-prereqs
 # Modified tier.
 
 # Check that workspace dependencies contain no cycles.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-ensure-no-cyclic-deps: anvil-ensure-no-cyclic-deps-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1266,11 +1284,11 @@ anvil-ensure-no-cyclic-deps: anvil-ensure-no-cyclic-deps-validate-prereqs anvil-
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-ensure-no-cyclic-deps` recipe.
-[group("anvil-setup")]
+[private]
 anvil-ensure-no-cyclic-deps-setup installer="install": (anvil-tool-cargo-ensure-no-cyclic-deps-install installer)
 
 # Validate prerequisites for the `anvil-ensure-no-cyclic-deps` recipe.
-[group("anvil-setup")]
+[private]
 anvil-ensure-no-cyclic-deps-validate-prereqs: anvil-tool-cargo-ensure-no-cyclic-deps-validate-prereqs
 
 === justfiles/anvil/checks/ensure-no-default-features.just ===
@@ -1285,6 +1303,7 @@ anvil-ensure-no-cyclic-deps-validate-prereqs: anvil-tool-cargo-ensure-no-cyclic-
 # Modified tier.
 
 # Check that workspace packages compile without default features.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-ensure-no-default-features: anvil-ensure-no-default-features-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1296,11 +1315,11 @@ anvil-ensure-no-default-features: anvil-ensure-no-default-features-validate-prer
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-ensure-no-default-features` recipe.
-[group("anvil-setup")]
+[private]
 anvil-ensure-no-default-features-setup installer="install": (anvil-tool-cargo-ensure-no-default-features-install installer)
 
 # Validate prerequisites for the `anvil-ensure-no-default-features` recipe.
-[group("anvil-setup")]
+[private]
 anvil-ensure-no-default-features-validate-prereqs: anvil-tool-cargo-ensure-no-default-features-validate-prereqs
 
 === justfiles/anvil/checks/examples.just ===
@@ -1314,15 +1333,14 @@ anvil-ensure-no-default-features-validate-prereqs: anvil-tool-cargo-ensure-no-de
 
 # Affected tier.
 
-# Build examples, or run selected examples locally with `--run`.
-[arg("run", long, value="true")]
+# Build and run selected examples.
+[group("anvil")]
 [arg("package", long, pattern='(?:[A-Za-z0-9_.-]+)?')]
 [arg("example", long, pattern='(?:[A-Za-z0-9_.-]+)?')]
 [arg("timeout", long, pattern='[1-9][0-9]{0,3}')]
 [script("pwsh", "-NoProfile")]
-anvil-examples run="false" package="" example="" timeout="30": anvil-examples-validate-prereqs anvil-impact
+anvil-examples package="" example="" timeout="30": anvil-examples-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $run = [bool]::Parse('{{run}}')
     $package = '{{package}}'
     $example = '{{example}}'
     $timeout = [int]'{{timeout}}'
@@ -1331,7 +1349,7 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
         Write-Error 'anvil-examples: --example requires --package to avoid workspace ambiguity'
         exit 2
     }
-    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude affected)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if (-not $package -and $include -eq '--skip') { Write-Host 'anvil-examples: no affected packages; skipping'; exit 0 }
@@ -1340,8 +1358,6 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
     $stableArgs = {{_anvil_stable_toolchain_args}}
     & cargo @stableArgs build @pkgArgs @exampleArgs --all-features --locked
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    if (-not $run) { exit 0 }
-
     $metadataJson = & cargo @stableArgs metadata --no-deps --format-version 1
     if ($LASTEXITCODE -ne 0) { Write-Error 'anvil-examples: cargo metadata failed'; exit $LASTEXITCODE }
     try {
@@ -1350,32 +1366,35 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
         Write-Error "anvil-examples: could not parse cargo metadata output: $_"
         exit 1
     }
-    $selectedPackages = if ($package) {
-        @($package)
-    } elseif ($include -and $include -ne '--workspace') {
-        $names = [System.Collections.Generic.List[string]]::new()
-        $parts = @(-split $include)
-        for ($i = 0; $i -lt $parts.Count; $i++) {
-            if ($parts[$i] -eq '--package' -and ++$i -lt $parts.Count) {
-                $names.Add(($parts[$i] -split '@', 2)[0])
-            }
+    $workspaceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($id in $meta.workspace_members) { [void]$workspaceIds.Add("$id") }
+    $members = @($meta.packages | Where-Object { $workspaceIds.Contains("$($_.id)") })
+    $excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    for ($i = 0; $i -lt $pkgArgs.Count; $i++) {
+        if ($pkgArgs[$i] -eq '--exclude' -and ++$i -lt $pkgArgs.Count) { [void]$excluded.Add($pkgArgs[$i]) }
+    }
+    $selectedIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($p in $members) {
+        $selected = if ($package) {
+            [string]::Equals($package, $p.name, [System.StringComparison]::Ordinal) -or
+                [string]::Equals($package, "$($p.name)@$($p.version)", [System.StringComparison]::Ordinal)
+        } else {
+            -not $excluded.Contains($p.name)
         }
-        @($names)
-    } else {
-        @($meta.packages | Where-Object { $meta.workspace_members -contains $_.id } | ForEach-Object { $_.name })
+        if ($selected) { [void]$selectedIds.Add("$($p.id)") }
     }
     $targets = @(
-        foreach ($p in $meta.packages) {
-            if ($p.name -notin $selectedPackages) { continue }
+        foreach ($p in $members) {
+            if (-not $selectedIds.Contains("$($p.id)")) { continue }
             $noRun = @($p.metadata.anvil.examples.'no-run')
             foreach ($target in $p.targets) {
                 if ($target.kind -notcontains 'example') { continue }
-                if ($example -and $target.name -ne $example) { continue }
-                if (-not $example -and $target.name -in $noRun) {
+                if ($example -and $target.name -cne $example) { continue }
+                if (-not $example -and $target.name -cin $noRun) {
                     Write-Host "anvil-examples: $($p.name)::$($target.name) skipped by package metadata"
                     continue
                 }
-                [pscustomobject]@{ package = $p.name; example = $target.name }
+                [pscustomobject]@{ package = $p.name; id = "$($p.id)"; example = $target.name }
             }
         }
     )
@@ -1395,11 +1414,15 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
         $start = [System.Diagnostics.ProcessStartInfo]::new()
         $start.FileName = $cargo
         $start.UseShellExecute = $false
-        $start.RedirectStandardOutput = $true
-        $start.RedirectStandardError = $true
         $start.Environment['ANVIL_EXAMPLE'] = '1'
+        # Package IDs carry Cargo's canonical workspace path. Start from that
+        # path so a short (8.3) Windows working directory still matches it.
+        $start.WorkingDirectory = [string]$meta.workspace_root
+        # The metadata package ID is a source-qualified package spec: it
+        # selects exactly this member even when a registry dependency shares
+        # its name and version, or the root is outside `default-members`.
         foreach ($arg in @($stableArgs) + @(
-            'run', '--package', $target.package, '--example', $target.example,
+            'run', '--package', $target.id, '--example', $target.example,
             '--all-features', '--locked'
         )) {
             $start.ArgumentList.Add($arg)
@@ -1410,8 +1433,6 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
             Write-Error "anvil-examples: failed to start $($target.package)::$($target.example)"
             exit 1
         }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
         $timedOut = $false
         if (-not $process.WaitForExit($timeout * 1000)) {
             $process.Kill($true)
@@ -1420,10 +1441,6 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
             $failed = $true
             $timedOut = $true
         }
-        $out = $stdout.GetAwaiter().GetResult()
-        $err = $stderr.GetAwaiter().GetResult()
-        if ($out) { Write-Host $out.TrimEnd() }
-        if ($err) { [Console]::Error.WriteLine($err.TrimEnd()) }
         if (-not $timedOut -and $process.ExitCode -ne 0) {
             [Console]::Error.WriteLine("anvil-examples: $($target.package)::$($target.example) exited with code $($process.ExitCode)")
             $failed = $true
@@ -1433,11 +1450,11 @@ anvil-examples run="false" package="" example="" timeout="30": anvil-examples-va
     if ($failed) { exit 1 }
 
 # Install prerequisites for the `anvil-examples` recipe.
-[group("anvil-setup")]
+[private]
 anvil-examples-setup installer="install": anvil-toolchain-stable-install
 
 # Validate prerequisites for the `anvil-examples` recipe.
-[group("anvil-setup")]
+[private]
 anvil-examples-validate-prereqs: anvil-tool-rustc-validate-prereqs
 
 === justfiles/anvil/checks/external-types.just ===
@@ -1452,17 +1469,13 @@ anvil-examples-validate-prereqs: anvil-tool-rustc-validate-prereqs
 # Affected tier (lints public API of changed crates and reverse dependencies).
 #
 # cargo-check-external-types is per-manifest: no --package/--workspace,
-# only --manifest-path. Iterate the affected library crates and run
-# the tool once each, pointing at the crate's Cargo.toml. Bin-only
-# crates have no public API surface and are skipped.
-# TODO(anvil-runner): even after a `cargo ox-run` helper absorbs the
-# skip/splat preamble, this recipe stays multi-step: cargo-check-
-# external-types is per-manifest (no --package/--workspace), so we
-# build a name->manifest map from cargo metadata, filter to lib crates,
-# intersect with the affected set ($include), and call the tool once per
-# crate. Hard-fails on errors (no tolerance, unlike semver-check).
+# only --manifest-path. cargo-each runs the tool once per affected
+# library crate with its `{manifest}` path, so no package spec reaches
+# Cargo. Bin-only crates have no public API surface and are filtered
+# out. Hard-fails on errors (no tolerance, unlike semver-check).
 
 # Check public APIs for unapproved external types.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-external-types: anvil-external-types-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1474,70 +1487,26 @@ anvil-external-types: anvil-external-types-validate-prereqs anvil-impact
         exit 0
     }
     $pkg = @(if ($include) { -split $include } else { '--workspace' })
-    # Build pkg-name -> manifest-path map, restricted to library crates.
-    $libPkgs = @{}
-    $metadataJson = & cargo {{_anvil_stable_toolchain_args}} metadata --no-deps --format-version 1
+    Write-Host "anvil-external-types: catalog tool minimum cargo-check-external-types {{ cargo_check_external_types_version }}; rustdoc toolchain {{ rust_nightly_external_types }}"
+    # cargo-check-external-types requires nightly rustdoc (uses unstable -Z
+    # flags) AND pins a specific rustdoc-types schema version. We pin nightly
+    # narrowly to the schema this tool version expects via
+    # `rust_nightly_external_types` in versions.just -- bump that pin
+    # alongside any cargo-check-external-types upgrade. No tolerance for
+    # schema mismatches: if it fails, the pin or the tool needs to move.
+    & cargo {{_anvil_stable_toolchain_args}} each @pkg --filter lib --keep-going '--' cargo '+{{ rust_nightly_external_types }}' check-external-types --manifest-path '{manifest}'
     if ($LASTEXITCODE -ne 0) {
-        Write-Error 'anvil-external-types: cargo metadata failed'
+        Write-Error "anvil-external-types: failed. The installed tool may be newer than the catalog minimum; it must remain compatible with rustdoc from {{ rust_nightly_external_types }}."
         exit $LASTEXITCODE
     }
-    try {
-        $meta = $metadataJson | ConvertFrom-Json
-    } catch {
-        Write-Error "anvil-external-types: could not parse cargo metadata output: $_"
-        exit 1
-    }
-    foreach ($p in $meta.packages) {
-        if ($p.targets | Where-Object { $_.kind -contains 'lib' }) {
-            $libPkgs[$p.name] = $p.manifest_path
-        }
-    }
-    # Decide which packages to check.
-    $packages = @()
-    if ($pkg -contains '--workspace') {
-        $packages = $libPkgs.Keys
-    } else {
-        for ($i = 0; $i -lt $pkg.Count; $i++) {
-            if ($pkg[$i] -eq '--package' -and ($i + 1) -lt $pkg.Count) {
-                # Impact emits version-qualified specs (name@version);
-                # strip the @version to recover the bare package name
-                # this manifest-path map keys on.
-                $name = ($pkg[$i + 1] -split '@', 2)[0]
-                if ($libPkgs.ContainsKey($name)) { $packages += $name }
-                $i++
-            }
-        }
-    }
-    if ($packages.Count -eq 0) {
-        Write-Host 'anvil-external-types: no affected library crates; skipping'
-        exit 0
-    }
-    Write-Host "anvil-external-types: catalog tool minimum cargo-check-external-types {{ cargo_check_external_types_version }}; rustdoc toolchain {{ rust_nightly_external_types }}"
-    $failed = $false
-    foreach ($p in $packages) {
-        Write-Host "anvil-external-types: $p"
-        # cargo-check-external-types requires nightly rustdoc (uses
-        # unstable -Z flags) AND pins a specific rustdoc-types schema
-        # version. We pin nightly narrowly to the schema this tool
-        # version expects via `rust_nightly_external_types` in
-        # versions.just — bump that pin alongside any cargo-check-
-        # external-types upgrade. No tolerance for schema mismatches:
-        # if it fails, the pin or the tool needs to move.
-        & cargo '+{{ rust_nightly_external_types }}' check-external-types --manifest-path $libPkgs[$p]
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "anvil-external-types: '$p' failed. The installed tool may be newer than the catalog minimum; it must remain compatible with rustdoc from {{ rust_nightly_external_types }}."
-            $failed = $true
-        }
-    }
-    if ($failed) { exit 1 }
 
 # Install prerequisites for the `anvil-external-types` recipe.
-[group("anvil-setup")]
-anvil-external-types-setup installer="install": anvil-toolchain-nightly-external-types-install (anvil-tool-cargo-check-external-types-install installer)
+[private]
+anvil-external-types-setup installer="install": anvil-toolchain-nightly-external-types-install (anvil-tool-cargo-check-external-types-install installer) (anvil-tool-cargo-each-install installer)
 
 # Validate prerequisites for the `anvil-external-types` recipe.
-[group("anvil-setup")]
-anvil-external-types-validate-prereqs: anvil-toolchain-nightly-external-types-validate-prereqs anvil-tool-cargo-check-external-types-validate-prereqs
+[private]
+anvil-external-types-validate-prereqs: anvil-toolchain-nightly-external-types-validate-prereqs anvil-tool-cargo-check-external-types-validate-prereqs anvil-tool-cargo-each-validate-prereqs
 
 === justfiles/anvil/checks/fmt.just ===
 # Copyright (c) Microsoft Corporation.
@@ -1565,6 +1534,7 @@ anvil-external-types-validate-prereqs: anvil-toolchain-nightly-external-types-va
 # formatting command does not mix stable and nightly toolchains.
 
 # Check Rust source formatting.
+[group("anvil")]
 [arg("fix", long, value="true")]
 [script("pwsh", "-NoProfile")]
 anvil-fmt fix="false": anvil-fmt-validate-prereqs anvil-impact
@@ -1592,11 +1562,11 @@ anvil-fmt fix="false": anvil-fmt-validate-prereqs anvil-impact
 # --- pr-fast members ---
 
 # Install prerequisites for the `anvil-fmt` recipe.
-[group("anvil-setup")]
+[private]
 anvil-fmt-setup installer="install": anvil-component-nightly-rustfmt-install (anvil-tool-cargo-each-install installer)
 
 # Validate prerequisites for the `anvil-fmt` recipe.
-[group("anvil-setup")]
+[private]
 anvil-fmt-validate-prereqs: anvil-component-nightly-rustfmt-validate-prereqs anvil-tool-cargo-each-validate-prereqs
 
 === justfiles/anvil/checks/license-headers.just ===
@@ -1611,6 +1581,7 @@ anvil-fmt-validate-prereqs: anvil-component-nightly-rustfmt-validate-prereqs anv
 # Modified tier.
 
 # Check source files for required license headers.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-license-headers: anvil-license-headers-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1622,11 +1593,11 @@ anvil-license-headers: anvil-license-headers-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-license-headers` recipe.
-[group("anvil-setup")]
+[private]
 anvil-license-headers-setup installer="install": (anvil-tool-cargo-heather-install installer)
 
 # Validate prerequisites for the `anvil-license-headers` recipe.
-[group("anvil-setup")]
+[private]
 anvil-license-headers-validate-prereqs: anvil-tool-cargo-heather-validate-prereqs
 
 === justfiles/anvil/checks/llvm-cov.just ===
@@ -1638,14 +1609,13 @@ anvil-license-headers-validate-prereqs: anvil-tool-cargo-heather-validate-prereq
 
 # See https://github.com/microsoft/ox-tools/blob/main/crates/cargo-anvil/docs/design/checks.md
 
-# Affected tier. Runs on the pinned nightly toolchain: cargo-llvm-cov
-# only sets the `cfg(coverage_nightly)` that gates the workspace's
-# `#[cfg_attr(coverage_nightly, coverage(off))]` exclusions when it
-# instruments on nightly. On stable those exclusions are inert and
-# untestable code (process-shelling error paths, script-only crates,
-# etc.) wrongly counts against coverage.
+# Affected tier. cargo-coverage-gate selects the pinned nightly for every
+# collection subprocess through this Cargo invocation. It owns nextest
+# execution, released-surface filtering, stable LCOV publication, threshold
+# evaluation, and the Windows error-206 response-file recovery.
 
-# Measure test coverage and enforce the coverage gate.
+# Measure released-surface coverage and enforce the coverage gate.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-llvm-cov: anvil-llvm-cov-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1656,235 +1626,29 @@ anvil-llvm-cov: anvil-llvm-cov-validate-prereqs anvil-impact
         Write-Host 'anvil-llvm-cov: no affected packages; skipping'
         exit 0
     }
-    $pkg = @(if ($include) { -split $include } else { '--workspace' })
-    $allTestPkg = $pkg
-    # Separate coverage-opted-out packages from the measured set. A crate that
-    # is entirely `#![cfg_attr(coverage_nightly, coverage(off))]` (e.g. a
-    # script-only crate) compiles to a test binary with no __llvm_covmap,
-    # and `llvm-cov export` aborts with "no coverage data found" whenever
-    # such a package is the *only* object in the report (e.g. it is the
-    # sole affected crate). Opt-out is declared via
-    # [package.metadata.coverage-gate] min-lines-percent = 0 -- the same
-    # marker cargo-coverage-gate already treats as NO DATA -> OK. Opted-out
-    # packages still run through plain nextest; opting out of measurement
-    # never opts a changed package out of tests.
-    $testOnlyPkg = [System.Collections.Generic.List[string]]::new()
-    if ($pkg -contains '--package') {
-        $metadataJson = & cargo {{_anvil_stable_toolchain_args}} metadata --no-deps --format-version 1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error 'anvil-llvm-cov: cargo metadata failed'
-            exit $LASTEXITCODE
-        }
-        $optedOut = @(
-            ($metadataJson | ConvertFrom-Json).packages |
-                Where-Object { $null -ne $_.metadata.'coverage-gate'.'min-lines-percent' -and [double]$_.metadata.'coverage-gate'.'min-lines-percent' -eq 0 } |
-                ForEach-Object { $_.name }
-        )
-        if ($optedOut.Count -gt 0) {
-            $filtered = [System.Collections.Generic.List[string]]::new()
-            for ($i = 0; $i -lt $pkg.Count; $i++) {
-                # Impact emits version-qualified specs (name@version);
-                # compare the bare name against the opt-out set, but keep
-                # the full name@version token in $pkg so the llvm-cov
-                # measurement below resolves unambiguously.
-                if ($pkg[$i] -eq '--package' -and ($i + 1) -lt $pkg.Count -and $optedOut -contains (($pkg[$i + 1] -split '@', 2)[0])) {
-                    $testOnlyPkg.Add('--package')
-                    $testOnlyPkg.Add($pkg[$i + 1])
-                    $i++
-                    continue
-                }
-                $filtered.Add($pkg[$i])
-            }
-            $pkg = $filtered.ToArray()
-        }
-    }
-    $configs = @(
-        @{ name = 'all-features'; flag = '--all-features' },
-        @{ name = 'no-default';   flag = '--no-default-features' }
+    # An empty selector list is cargo-coverage-gate's full-workspace mode.
+    # Impact-selected values remain version-qualified (`name@version`) so
+    # collection resolves the intended workspace member unambiguously.
+    $packageArgs = @(if ($include -and $include -ne '--workspace') { -split $include })
+    $collectionArgs = @(
+        '--configuration', 'all-features',
+        '--configuration', 'no-default-features',
+        '--coverage-dir', 'target/coverage',
+        # LLVM produces unusable coverage profiles on Windows ARM, so
+        # coverage-gate runs that target's tests without measuring coverage.
+        '--no-coverage-target', 'aarch64-pc-windows-msvc'
     )
-    # cargo-llvm-cov doesn't work on aarch64-pc-windows-msvc: the
-    # llvm-profdata that ships with the rust toolchain there fails
-    # to merge the .profraw set ("no profile can be merged"). Fall
-    # back to plain `cargo nextest run` on that target so we still
-    # get test execution; coverage data from this leg wouldn't have
-    # been used anyway (coverage upload is gated on Linux only).
-    if ($IsWindows -and ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')) {
-        Write-Host 'anvil-llvm-cov: aarch64-pc-windows-msvc -- skipping coverage; running plain nextest'
-        foreach ($cfg in $configs) {
-            & cargo '+{{ rust_nightly }}' nextest run @allTestPkg $cfg.flag --no-tests=pass --locked
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        }
-        exit 0
-    }
-    if ($testOnlyPkg.Count -gt 0) {
-        Write-Host 'anvil-llvm-cov: running tests without coverage for opted-out packages'
-        foreach ($cfg in $configs) {
-            & cargo '+{{ rust_nightly }}' nextest run @testOnlyPkg $cfg.flag --no-tests=pass --locked
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        }
-    }
-    if ($pkg.Count -eq 0 -and $testOnlyPkg.Count -gt 0) {
-        Write-Host 'anvil-llvm-cov: all affected packages opted out of coverage; tests completed'
-        exit 0
-    }
-    # The *report* output directory (target/coverage/) is something we
-    # choose and must exist before --output-path runs.
-    [System.IO.Directory]::CreateDirectory('target/coverage') | Out-Null
-    function Invoke-AnvilLcovReport {
-        param(
-            [Parameter(Mandatory)][string] $OutputPath,
-            [Parameter(Mandatory)][string[]] $PackageArgs
-        )
-
-        # Capture cargo-llvm-cov's diagnostic because it is the only place its
-        # private object discovery result is exposed. Keep displaying it so a
-        # non-retriable failure has the same evidence as a direct invocation.
-        $reportOutput = @()
-        $reportExitCode = 1
-        & cargo '+{{ rust_nightly }}' llvm-cov report @PackageArgs --lcov --output-path $OutputPath 2>&1 |
-            Tee-Object -Variable reportOutput |
-            ForEach-Object { Write-Host $_.ToString() }
-        $reportExitCode = $LASTEXITCODE
-        if ($reportExitCode -eq 0) { return 0 }
-
-        $reportText = ($reportOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-        if (-not $IsWindows -or $reportText -notmatch '\(os error 206\)') {
-            return $reportExitCode
-        }
-
-        # Best-effort bridge until cargo-llvm-cov uses response files itself.
-        # Its process diagnostic is shell-shaped text rather than a stable API,
-        # so fail closed if the expected llvm-cov export form changes.
-        $failedProcess = [regex]::Match(
-            $reportText,
-            '(?s)could not execute process `(?<command>.*?)` \(never executed\).*?\(os error 206\)'
-        )
-        if (-not $failedProcess.Success) {
-            Write-Warning 'anvil-llvm-cov: could not parse the Windows error 206 process diagnostic'
-            return $reportExitCode
-        }
-        $command = [regex]::Match(
-            $failedProcess.Groups['command'].Value,
-            '(?s)^(?:"(?<quoted>[^"]+)"|''(?<singleQuoted>[^'']+)''|(?<bare>\S+))\s+export\s+(?<arguments>.*)$'
-        )
-        if (-not $command.Success) {
-            Write-Warning 'anvil-llvm-cov: the failed process was not an llvm-cov export command'
-            return $reportExitCode
-        }
-        $llvmCov = if ($command.Groups['quoted'].Success) {
-            $command.Groups['quoted'].Value
-        } elseif ($command.Groups['singleQuoted'].Success) {
-            $command.Groups['singleQuoted'].Value
-        } else {
-            $command.Groups['bare'].Value
-        }
-        if ([System.IO.Path]::GetFileNameWithoutExtension($llvmCov) -ne 'llvm-cov') {
-            Write-Warning 'anvil-llvm-cov: the failed export executable was not named llvm-cov'
-            return $reportExitCode
-        }
-        $responsePath = [System.IO.Path]::GetFullPath("$OutputPath.llvm-cov.rsp")
-        $responseArguments = [regex]::Replace(
-            $command.Groups['arguments'].Value,
-            "'(?<value>[^']*)'",
-            { param($match) '"' + $match.Groups['value'].Value.Replace('"', '\"') + '"' }
-        )
-        try {
-            [System.IO.File]::WriteAllText(
-                $responsePath,
-                $responseArguments,
-                [System.Text.UTF8Encoding]::new($false)
-            )
-            Write-Host 'anvil-llvm-cov: retrying Windows error 206 with an LLVM response file'
-            & $llvmCov export "@$responsePath" > $OutputPath
-            $retryExitCode = $LASTEXITCODE
-            if ($retryExitCode -ne 0) {
-                Remove-Item -LiteralPath $OutputPath -Force -ErrorAction SilentlyContinue
-            }
-            return $retryExitCode
-        } finally {
-            Remove-Item -LiteralPath $responsePath -Force -ErrorAction SilentlyContinue
-        }
-    }
-    # Instrument and run tests once per feature configuration, each as a
-    # SELF-CONTAINED llvm-cov run that exports only its own config's
-    # objects. Dual config (--all-features + --no-default-features) catches
-    # lines that only execute under one feature configuration (feature-gated
-    # code dead with default features off, plus default-only code paths).
-    #
-    # Crucially this does NOT merge both configs' objects into one report.
-    # A single `llvm-cov report` over the union shells one `--object=` per
-    # test binary and reaches the Windows CreateProcess command-line limit
-    # sooner. A sufficiently large single config can still overflow, so the
-    # report helper retries that specific failure through a response file.
-    # The two configs are reconciled *downstream* instead of via a merged
-    # report:
-    #   * cargo-coverage-gate merges the two lcov files at the line level
-    #     (per-line counts summed) -- this is the gate;
-    #   * Codecov ingests both lcov files (it coalesces uploads);
-    #   * ADO's PublishCodeCoverageResults coalesces both lcov files.
-    # This also avoids needing a platform-specific lcov merger (`lcov -a`
-    # is Linux-only). HTML output is dropped -- it had no cloud-workflow
-    # consumer and would reintroduce the overflowing union report; run
-    # `cargo llvm-cov --html` ad hoc for a local viewer.
-    #
-    # A full `llvm-cov clean` between configs wipes the prior config's
-    # objects so each `report` is scoped to the current config only.
-    #
-    # Note: nextest's exit-4 ("no tests to run") IS treated as a failure
-    # here -- a llvm-cov run that finds no tests almost always means a
-    # config mistake (wrong package filter, missing test target, etc.), not
-    # a legitimate empty set. anvil-miri is the exception (see its comment).
-    foreach ($cfg in $configs) {
-        cargo '+{{ rust_nightly }}' llvm-cov clean --workspace
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        & cargo '+{{ rust_nightly }}' llvm-cov nextest @pkg $cfg.flag --locked --no-report
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        # The same lcov report feeds the gate, Codecov, and ADO. On Windows,
-        # retry only CreateProcess error 206 through llvm-cov's response-file
-        # support; all other cargo-llvm-cov failures propagate unchanged.
-        $reportExitCode = Invoke-AnvilLcovReport "target/coverage/lcov-$($cfg.name).info" $pkg
-        if ($reportExitCode -ne 0) { exit $reportExitCode }
-    }
-    # Local coverage gate: cargo-coverage-gate compares per-package line
-    # coverage against per-package thresholds carried in Cargo.toml
-    # ([package.metadata.coverage-gate] min-lines-percent, falling back to
-    # [workspace.metadata.coverage-gate], then the built-in 100.0 default).
-    # It merges the two per-config lcovs (line-level) so the gate sees the
-    # union coverage. Exits non-zero when any gated package falls below its
-    # threshold, so coverage regressions fail the PR locally and in cloud
-    # workflows -- the Codecov upload stays purely for display, not the gate.
-    #
-    # Scope the gate to the same package set we measured. When impact
-    # scoping is active, $pkg holds `--package X@ver ...` (already opt-out
-    # filtered above); pass those through so the gate only gates packages
-    # that were actually instrumented -- otherwise unmeasured members would
-    # report NO DATA and fail the gate. When unscoped, $pkg is `--workspace`
-    # (no gate flag); drop it so the gate defaults to every member.
-    #
-    # cargo-coverage-gate keys on bare package names from cargo metadata, so
-    # strip the @version qualifier the measurement used for disambiguation.
-    $gateArgs = [System.Collections.Generic.List[string]]::new()
-    for ($i = 0; $i -lt $pkg.Count; $i++) {
-        if ($pkg[$i] -eq '--workspace') { continue }
-        if ($pkg[$i] -eq '--package' -and ($i + 1) -lt $pkg.Count) {
-            $gateArgs.Add('--package')
-            $gateArgs.Add(($pkg[$i + 1] -split '@', 2)[0])
-            $i++
-            continue
-        }
-        $gateArgs.Add($pkg[$i])
-    }
-    & cargo {{_anvil_stable_toolchain_args}} coverage-gate @gateArgs --lcov target/coverage/lcov-all-features.info --lcov target/coverage/lcov-no-default.info
+    & cargo '+{{ rust_nightly }}' coverage-gate run @packageArgs @collectionArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # --- pr-test members (shared with scheduled-test) ---
 
 # Install prerequisites for the `anvil-llvm-cov` recipe.
-[group("anvil-setup")]
+[private]
 anvil-llvm-cov-setup installer="install": anvil-component-nightly-llvm-tools-install (anvil-tool-cargo-llvm-cov-install installer) (anvil-tool-cargo-nextest-install installer) (anvil-tool-cargo-coverage-gate-install installer)
 
 # Validate prerequisites for the `anvil-llvm-cov` recipe.
-[group("anvil-setup")]
+[private]
 anvil-llvm-cov-validate-prereqs: anvil-component-nightly-llvm-tools-validate-prereqs anvil-tool-cargo-llvm-cov-validate-prereqs anvil-tool-cargo-nextest-validate-prereqs anvil-tool-cargo-coverage-gate-validate-prereqs
 
 === justfiles/anvil/checks/loom.just ===
@@ -1918,8 +1682,8 @@ anvil-llvm-cov-validate-prereqs: anvil-component-nightly-llvm-tools-validate-pre
 #     (source swaps std<->loom atomics on `#[cfg(loom)]`, and
 #     `[target.'cfg(loom)'.dependencies] loom` links only under the cfg).
 #     The feature does NOT replace the cfg; both are required.
-# We scope `cargo test` to the owning package with `-p` (never
-# `--workspace`) so a global `--cfg loom` never leaks into deps reachable
+# We scope `cargo test` to the owning package (via cargo-each's
+# source-qualified `{cargo-spec}`, never `--workspace`) so a global `--cfg loom` never leaks into deps reachable
 # only through *other* members (e.g. concurrent-queue), and run
 # single-threaded (loom drives its own scheduling). --release per the
 # loom docs: permutation exploration is wall-clock dominated by the SUT.
@@ -1939,6 +1703,7 @@ anvil-llvm-cov-validate-prereqs: anvil-component-nightly-llvm-tools-validate-pre
 # invocations cleanly on both pwsh/bash.
 
 # Run Loom concurrency tests for affected workspace packages.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-loom: anvil-loom-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -1952,31 +1717,20 @@ anvil-loom: anvil-loom-validate-prereqs anvil-impact
     $meta = & cargo {{_anvil_stable_toolchain_args}} metadata --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    # Optional impact-scoping: recover bare package names from the
-    # impact step's version-qualified `--package name@version` pairs.
-    # Full-workspace modes (`--workspace` -- e.g. the scheduled tier,
-    # ANVIL_IMPACT=off, or no impact cache) carry no `--package` tokens,
-    # so $affected stays $null and the package set is left unfiltered
-    # (filtering on an empty set would wrongly skip every loom target).
-    $affected = $null
-    $tokens = @(-split $include)
-    for ($i = 0; $i -lt $tokens.Count; $i++) {
-        if ($tokens[$i] -eq '--package' -and ($i + 1) -lt $tokens.Count) {
-            if ($null -eq $affected) { $affected = @() }
-            $affected += ($tokens[$i + 1] -split '@', 2)[0]
-            $i++
-        }
-    }
+    # Impact scoping keeps the packages whose `name@version` spec the impact
+    # step selected. Full-workspace modes (`--workspace` -- e.g. the scheduled
+    # tier, ANVIL_IMPACT=off, or no impact cache) leave the set unfiltered.
     $pkgs = $meta.packages
-    if ($null -ne $affected) {
-        $pkgs = @($pkgs | Where-Object { $_.name -in $affected })
+    if ($include -match '(^|\s)--package\s') {
+        $affected = @(-split $include | Where-Object { $_ -ne '--package' })
+        $pkgs = @($pkgs | Where-Object { "$($_.name)@$($_.version)" -in $affected })
     }
 
     # Authoritative detection: [[test]] targets with required-features = ["loom"].
     $loomTargets = @(foreach ($pkg in $pkgs) {
         foreach ($t in $pkg.targets) {
             if (($t.kind -contains 'test') -and ($t.'required-features' -contains 'loom')) {
-                [pscustomobject]@{ pkg = $pkg.name; target = $t.name }
+                [pscustomobject]@{ pkg = $pkg.name; spec = "$($pkg.name)@$($pkg.version)"; target = $t.name }
             }
         }
     })
@@ -2002,21 +1756,24 @@ anvil-loom: anvil-loom-validate-prereqs anvil-impact
     $env:RUSTFLAGS = "--cfg loom $($env:RUSTFLAGS)".Trim()
     foreach ($lt in $loomTargets) {
         Write-Host "anvil-loom: $($lt.pkg) :: $($lt.target)"
-        & cargo {{_anvil_stable_toolchain_args}} test -p $lt.pkg --release --all-features --locked --test $lt.target -- --test-threads=1
+        # cargo-each resolves the spec against workspace members and passes
+        # Cargo a source-qualified '{cargo-spec}', which stays unambiguous
+        # when a registry dependency shares the member's name and version.
+        & cargo {{_anvil_stable_toolchain_args}} each --package $lt.spec '--' cargo {{_anvil_stable_toolchain_args}} test --package '{cargo-spec}' --release --all-features --locked --test $lt.target '--' --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
-# loom is a regular cargo-test invocation with RUSTFLAGS=--cfg loom;
-# no dedicated tool to install. The rust toolchain (rustc + cargo)
-# is the only prerequisite.
+# loom is a regular cargo-test invocation with RUSTFLAGS=--cfg loom,
+# run through cargo-each for unambiguous package selection. The rust
+# toolchain (rustc + cargo) and cargo-each are the prerequisites.
 
 # Install prerequisites for the `anvil-loom` recipe.
-[group("anvil-setup")]
-anvil-loom-setup installer="install": anvil-toolchain-stable-install
+[private]
+anvil-loom-setup installer="install": anvil-toolchain-stable-install (anvil-tool-cargo-each-install installer)
 
 # Validate prerequisites for the `anvil-loom` recipe.
-[group("anvil-setup")]
-anvil-loom-validate-prereqs: anvil-tool-rustc-validate-prereqs
+[private]
+anvil-loom-validate-prereqs: anvil-tool-rustc-validate-prereqs anvil-tool-cargo-each-validate-prereqs
 
 === justfiles/anvil/checks/miri-race-coverage.just ===
 # Copyright (c) Microsoft Corporation.
@@ -2035,14 +1792,15 @@ anvil-loom-validate-prereqs: anvil-tool-rustc-validate-prereqs
 # per-seed crashes, so coverage matters more than depth-per-seed.
 
 # Run Miri tests with race coverage tracking.
+[group("anvil")]
 anvil-miri-race-coverage: anvil-miri-race-coverage-validate-prereqs (_anvil-miri-test "race-coverage")
 
 # Install prerequisites for the `anvil-miri-race-coverage` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-race-coverage-setup installer="install": anvil-component-nightly-miri-install anvil-component-nightly-rust-src-install
 
 # Validate prerequisites for the `anvil-miri-race-coverage` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-race-coverage-validate-prereqs: anvil-component-nightly-miri-validate-prereqs anvil-component-nightly-rust-src-validate-prereqs
 
 === justfiles/anvil/checks/miri-strict-provenance.just ===
@@ -2055,14 +1813,15 @@ anvil-miri-race-coverage-validate-prereqs: anvil-component-nightly-miri-validate
 # See https://github.com/microsoft/ox-tools/blob/main/crates/cargo-anvil/docs/design/checks.md
 
 # Run Miri tests with strict provenance checks.
+[group("anvil")]
 anvil-miri-strict-provenance: anvil-miri-strict-provenance-validate-prereqs (_anvil-miri-test "strict-provenance")
 
 # Install prerequisites for the `anvil-miri-strict-provenance` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-strict-provenance-setup installer="install": anvil-component-nightly-miri-install anvil-component-nightly-rust-src-install
 
 # Validate prerequisites for the `anvil-miri-strict-provenance` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-strict-provenance-validate-prereqs: anvil-component-nightly-miri-validate-prereqs anvil-component-nightly-rust-src-validate-prereqs
 
 === justfiles/anvil/checks/miri-tree-borrows.just ===
@@ -2089,6 +1848,7 @@ anvil-miri-strict-provenance-validate-prereqs: anvil-component-nightly-miri-vali
 # honors --skip.
 
 # Run Miri tests with the Tree Borrows model.
+[group("anvil")]
 anvil-miri-tree-borrows: anvil-miri-tree-borrows-validate-prereqs (_anvil-miri-test "tree-borrows")
 
 # The three nightly-miri profiles share the same toolchain prereqs
@@ -2097,11 +1857,11 @@ anvil-miri-tree-borrows: anvil-miri-tree-borrows-validate-prereqs (_anvil-miri-t
 # regular (groups.just can iterate without special-casing).
 
 # Install prerequisites for the `anvil-miri-tree-borrows` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-tree-borrows-setup installer="install": anvil-component-nightly-miri-install anvil-component-nightly-rust-src-install
 
 # Validate prerequisites for the `anvil-miri-tree-borrows` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-tree-borrows-validate-prereqs: anvil-component-nightly-miri-validate-prereqs anvil-component-nightly-rust-src-validate-prereqs
 
 === justfiles/anvil/checks/miri.just ===
@@ -2129,13 +1889,15 @@ anvil-miri-tree-borrows-validate-prereqs: anvil-component-nightly-miri-validate-
 # [package.metadata.anvil.miri]
 # exclude = true
 #
-# They can still compile as dependencies of selected consumers. Workspace runs
-# translate the metadata to `--exclude`; impact-scoped runs remove matching
-# `--package name@version` pairs before compilation.
+# They can still compile as dependencies of selected consumers. Selection is
+# `--workspace --exclude ...` (unambiguous even when a registry dependency
+# shares a member's name and version); opted-out packages are added to the
+# `--exclude` list.
 #
 # ANVIL_MIRI_JOBS overrides the default of one artifact worker per logical processor.
 
 # Run Miri tests for affected workspace packages.
+[group("anvil")]
 [arg("package", long, pattern='(?:[A-Za-z0-9_.-]+)?')]
 [arg("test", long, pattern='(?:[A-Za-z0-9_.:-]+)?')]
 [arg("example", long, pattern='(?:[A-Za-z0-9_.-]+)?')]
@@ -2196,7 +1958,8 @@ _anvil-miri-test profile package="" test_filter="" example="": anvil-impact
         exit 2
     }
 
-    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
+    $env:RUSTUP_TOOLCHAIN = '{{ rust_nightly }}'
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude affected)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if (-not $package -and $include -eq '--skip') {
@@ -2230,8 +1993,6 @@ _anvil-miri-test profile package="" test_filter="" example="": anvil-impact
         exit 0
     }
 
-    # The metadata and compiler-artifact streams must come from the same Cargo
-    # version because Cargo changed package-ID formats in 1.78.
     $metadata = & cargo '+{{ rust_nightly }}' metadata --no-deps --format-version 1
     if ($LASTEXITCODE -ne 0) {
         Write-Error 'anvil miri: cargo metadata failed'
@@ -2252,47 +2013,38 @@ _anvil-miri-test profile package="" test_filter="" example="": anvil-impact
     $packageLabels = @{}
     $excludedPackages = [System.Collections.Generic.SortedSet[string]]::new([System.StringComparer]::Ordinal)
     $excludedPackageIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($package in $metadata.packages) {
-        $packageId = [string]$package.id
+    foreach ($member in $metadata.packages) {
+        $packageId = [string]$member.id
         if (-not $workspaceMembers.Contains($packageId)) { continue }
-        $packageDirectories[$packageId] = Split-Path -Parent ([string]$package.manifest_path)
-        $packageLabels[$packageId] = "$($package.name) $($package.version)"
-        if ($package.metadata.anvil.miri.exclude -eq $true) {
-            [void]$excludedPackages.Add([string]$package.name)
+        $packageDirectories[$packageId] = Split-Path -Parent ([string]$member.manifest_path)
+        $packageLabels[$packageId] = "$($member.name) $($member.version)"
+        if ($member.metadata.anvil.miri.exclude -eq $true) {
+            [void]$excludedPackages.Add([string]$member.name)
             [void]$excludedPackageIds.Add($packageId)
         }
     }
 
     if ($packageArgs -contains '--workspace') {
-        if ($workspaceMembers.Count -gt 0 -and $excludedPackageIds.Count -eq $workspaceMembers.Count) {
-            Write-Host 'anvil miri: all selected packages are excluded; nothing to test'
-            exit 0
+        # Impact selection arrives as `--workspace --exclude <name> ...`;
+        # add the Miri opt-outs that are still selected.
+        $impactExcluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        for ($i = 0; $i -lt $packageArgs.Count; $i++) {
+            if ($packageArgs[$i] -eq '--exclude' -and ($i + 1) -lt $packageArgs.Count) {
+                [void]$impactExcluded.Add($packageArgs[++$i])
+            }
         }
         foreach ($packageName in $excludedPackages) {
-            $packageArgs += @('--exclude', $packageName)
-        }
-    } else {
-        $filtered = [System.Collections.Generic.List[string]]::new()
-        for ($i = 0; $i -lt $packageArgs.Count; $i++) {
-            if ($packageArgs[$i] -ne '--package') {
-                Write-Error "anvil miri: unexpected impact argument '$($packageArgs[$i])'"
-                exit 1
+            if ($impactExcluded.Add($packageName)) {
+                $packageArgs += @('--exclude', $packageName)
             }
-            if (($i + 1) -ge $packageArgs.Count) {
-                Write-Error 'anvil miri: --package is missing its package spec'
-                exit 1
-            }
-            $packageSpec = $packageArgs[++$i]
-            $packageName = ($packageSpec -split '@', 2)[0]
-            if ($excludedPackages.Contains($packageName)) { continue }
-            $filtered.Add('--package')
-            $filtered.Add($packageSpec)
         }
-        $packageArgs = $filtered.ToArray()
-        if ($packageArgs.Count -eq 0) {
+        if ($workspaceMembers.Count -gt 0 -and $impactExcluded.Count -ge $workspaceMembers.Count) {
             Write-Host 'anvil miri: all selected packages are excluded; nothing to test'
             exit 0
         }
+    } elseif ($excludedPackages.Contains(($package -split '@', 2)[0])) {
+        Write-Host 'anvil miri: all selected packages are excluded; nothing to test'
+        exit 0
     }
 
     $logRoot = Join-Path ([IO.Path]::GetTempPath()) "anvil-miri-$PID-$([guid]::NewGuid())"
@@ -2478,11 +2230,11 @@ _anvil-miri-test profile package="" test_filter="" example="": anvil-impact
 # --- pr-runtime-analysis members ---
 
 # Install prerequisites for the `anvil-miri` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-setup installer="install": anvil-component-nightly-miri-install anvil-component-nightly-rust-src-install
 
 # Validate prerequisites for the `anvil-miri` recipe.
-[group("anvil-setup")]
+[private]
 anvil-miri-validate-prereqs: anvil-component-nightly-miri-validate-prereqs anvil-component-nightly-rust-src-validate-prereqs
 
 === justfiles/anvil/checks/msrv-test.just ===
@@ -2495,13 +2247,10 @@ anvil-miri-validate-prereqs: anvil-component-nightly-miri-validate-prereqs anvil
 # See https://github.com/microsoft/ox-tools/blob/main/crates/cargo-anvil/docs/design/checks.md
 
 # Run affected-package tests under the declared MSRV.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-msrv-test: anvil-msrv-test-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include affected)
-    $impactExit = $LASTEXITCODE
-    if ($impactExit -ne 0) { exit $impactExit }
-    if ($include -eq '--skip') { Write-Host 'anvil-msrv-test: no affected packages; skipping'; exit 0 }
     $toolchainOutput = & "{{ just_executable() }}" _anvil-resolve-stable msrv | Out-String
     $resolverExit = $LASTEXITCODE
     if ($resolverExit -ne 0) { exit $resolverExit }
@@ -2510,11 +2259,16 @@ anvil-msrv-test: anvil-msrv-test-validate-prereqs anvil-impact
         Write-Host 'anvil-msrv-test: no root MSRV declared; skipping'
         exit 0
     }
+    $env:RUSTUP_TOOLCHAIN = $toolchain
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude affected)
+    $impactExit = $LASTEXITCODE
+    if ($impactExit -ne 0) { exit $impactExit }
+    if ($include -eq '--skip') { Write-Host 'anvil-msrv-test: no affected packages; skipping'; exit 0 }
     $pkg = @(if ($include) { -split $include } else { '--workspace' })
     # `--tests` = lib/bin unit tests + integration tests. NOT `--all-targets`,
     # which adds `--benches`: `cargo test` EXECUTES bench harnesses, and a
     # `harness = false` bench needs a driver binary this group never installs.
-    # Benches/examples stay compile-only (`anvil-bench`, `anvil-examples`).
+    # Bench compilation and example execution belong to `anvil-bench` and `anvil-examples`.
     # `--tests` over `--lib --bins --tests`: `--lib` fails on bin-only packages.
     & cargo "+$toolchain" test @pkg --tests --all-features --locked
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -2522,14 +2276,14 @@ anvil-msrv-test: anvil-msrv-test-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install the declared MSRV toolchain only when this check is required.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-msrv-test-setup installer="install":
     & "{{ just_executable() }}" _anvil-resolve-stable install-msrv
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Validate the MSRV prerequisite.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-msrv-test-validate-prereqs:
     $toolchainOutput = & "{{ just_executable() }}" _anvil-resolve-stable msrv | Out-String
@@ -2579,6 +2333,7 @@ anvil-msrv-test-validate-prereqs:
 # affected leg. Coverage on the other three legs is unchanged.
 
 # Run mutation testing for changes relative to the base branch.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-mutants-diff: anvil-mutants-diff-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -2620,11 +2375,11 @@ anvil-mutants-diff: anvil-mutants-diff-validate-prereqs anvil-impact
 # --- pr-mutants members ---
 
 # Install prerequisites for the `anvil-mutants-diff` recipe.
-[group("anvil-setup")]
+[private]
 anvil-mutants-diff-setup installer="install": (anvil-tool-cargo-mutants-install installer)
 
 # Validate prerequisites for the `anvil-mutants-diff` recipe.
-[group("anvil-setup")]
+[private]
 anvil-mutants-diff-validate-prereqs: anvil-tool-cargo-mutants-validate-prereqs
 
 === justfiles/anvil/checks/mutants-full.just ===
@@ -2640,6 +2395,7 @@ anvil-mutants-diff-validate-prereqs: anvil-tool-cargo-mutants-validate-prereqs
 # workspace regardless of diff.
 
 # Run exhaustive mutation testing across the workspace.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-mutants-full: anvil-mutants-full-validate-prereqs
     $ErrorActionPreference = 'Stop'
@@ -2654,11 +2410,11 @@ anvil-mutants-full: anvil-mutants-full-validate-prereqs
 #     cargo-hack and bench are dedicated tools) ---
 
 # Install prerequisites for the `anvil-mutants-full` recipe.
-[group("anvil-setup")]
+[private]
 anvil-mutants-full-setup installer="install": (anvil-tool-cargo-mutants-install installer)
 
 # Validate prerequisites for the `anvil-mutants-full` recipe.
-[group("anvil-setup")]
+[private]
 anvil-mutants-full-validate-prereqs: anvil-tool-cargo-mutants-validate-prereqs
 
 === justfiles/anvil/checks/pr-title.just ===
@@ -2684,6 +2440,7 @@ anvil-mutants-full-validate-prereqs: anvil-tool-cargo-mutants-validate-prereqs
 # the check loudly rather than silently passing.
 
 # Validate the pull request title.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-pr-title: anvil-pr-title-validate-prereqs
     $title = $env:PR_TITLE
@@ -2737,11 +2494,11 @@ anvil-pr-title: anvil-pr-title-validate-prereqs
 # pr-title is a pwsh script; no cargo tool to install.
 
 # Prepare the PowerShell prerequisite for pull request title validation.
-[group("anvil-setup")]
+[private]
 anvil-pr-title-setup installer="install": anvil-tool-pwsh-validate-prereqs
 
 # Validate prerequisites for the `anvil-pr-title` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-title-validate-prereqs: anvil-tool-pwsh-validate-prereqs
 
 === justfiles/anvil/checks/readme-check.just ===
@@ -2858,18 +2615,20 @@ _anvil-readme mode: anvil-readme-check-validate-prereqs
     if ($hadFailure) { exit 1 }
 
 # Check README files, or regenerate them with `--fix`.
+[group("anvil")]
 [arg("fix", long, value="true")]
 anvil-readme fix="false": (_anvil-readme if fix == "true" { "generate" } else { "check" })
 
 # Check that crate README files are up to date.
+[group("anvil")]
 anvil-readme-check: (_anvil-readme "check")
 
 # Install prerequisites for the `anvil-readme-check` recipe.
-[group("anvil-setup")]
+[private]
 anvil-readme-check-setup installer="install": (anvil-tool-cargo-doc2readme-install installer)
 
 # Validate prerequisites for the `anvil-readme-check` recipe.
-[group("anvil-setup")]
+[private]
 anvil-readme-check-validate-prereqs: anvil-tool-cargo-doc2readme-validate-prereqs
 
 === justfiles/anvil/checks/semver-check.just ===
@@ -2921,6 +2680,7 @@ anvil-readme-check-validate-prereqs: anvil-tool-cargo-doc2readme-validate-prereq
 # ...") and bin->bin+lib transitions (reported as a missing lib target).
 
 # Check affected crates for semantic versioning violations.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-semver-check: anvil-semver-check-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
@@ -3114,11 +2874,11 @@ anvil-semver-check: anvil-semver-check-validate-prereqs anvil-impact
     exit 0
 
 # Install prerequisites for the `anvil-semver-check` recipe.
-[group("anvil-setup")]
+[private]
 anvil-semver-check-setup installer="install": (anvil-tool-cargo-semver-checks-install installer)
 
 # Validate prerequisites for the `anvil-semver-check` recipe.
-[group("anvil-setup")]
+[private]
 anvil-semver-check-validate-prereqs: anvil-tool-cargo-semver-checks-validate-prereqs
 
 === justfiles/anvil/checks/spellcheck.just ===
@@ -3149,6 +2909,7 @@ anvil-semver-check-validate-prereqs: anvil-tool-cargo-semver-checks-validate-pre
 # leaving the path dangling.
 
 # Check spelling in source comments and documentation.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-spellcheck: anvil-spellcheck-validate-prereqs
     $ErrorActionPreference = 'Stop'
@@ -3177,11 +2938,11 @@ anvil-spellcheck: anvil-spellcheck-validate-prereqs
 # successful prebuilt installation does not require libclang.
 
 # Install prerequisites for the `anvil-spellcheck` recipe.
-[group("anvil-setup")]
+[private]
 anvil-spellcheck-setup installer="install": (anvil-tool-cargo-spellcheck-install installer)
 
 # Validate prerequisites for the `anvil-spellcheck` recipe.
-[group("anvil-setup")]
+[private]
 anvil-spellcheck-validate-prereqs: anvil-tool-cargo-spellcheck-validate-prereqs
 
 === justfiles/anvil/checks/udeps.just ===
@@ -3212,10 +2973,11 @@ anvil-spellcheck-validate-prereqs: anvil-tool-cargo-spellcheck-validate-prereqs
 # of {unused dep, unused dev-dep, dep that should be a dev-dep}.
 
 # Check required workspace packages for unused dependencies.
+[group("anvil")]
 [script("pwsh", "-NoProfile")]
 anvil-udeps: anvil-udeps-validate-prereqs anvil-impact
     $ErrorActionPreference = 'Stop'
-    $include = (& "{{ just_executable() }}" _anvil-impact-include required)
+    $include = (& "{{ just_executable() }}" _anvil-impact-exclude required)
     $impactExit = $LASTEXITCODE
     if ($impactExit -ne 0) { exit $impactExit }
     if ($include -eq '--skip') { Write-Host 'anvil-udeps: no affected packages; skipping'; exit 0 }
@@ -3229,11 +2991,11 @@ anvil-udeps: anvil-udeps-validate-prereqs anvil-impact
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-udeps` recipe.
-[group("anvil-setup")]
+[private]
 anvil-udeps-setup installer="install": anvil-toolchain-nightly-install (anvil-tool-cargo-udeps-install installer)
 
 # Validate prerequisites for the `anvil-udeps` recipe.
-[group("anvil-setup")]
+[private]
 anvil-udeps-validate-prereqs: anvil-toolchain-nightly-validate-prereqs anvil-tool-cargo-udeps-validate-prereqs
 
 === justfiles/anvil/container.just ===
@@ -3964,7 +3726,8 @@ _anvil-container-image:
 
 # Run a command inside the pinned Linux image.
 #
-# The tokens after the recipe name are the argv, executed verbatim in the
+# A leading --github-token opts in to forwarding the supplied GITHUB_TOKEN.
+# The remaining tokens after the recipe name are the argv, executed verbatim in the
 # image. Anvil recipes are reached by naming `just` like any other command.
 #
 #   just anvil-container just anvil-pr    # a tier
@@ -3983,6 +3746,14 @@ anvil-container *command:
     # argv here. Whitespace is the only separator, so an argument containing a
     # space does not survive; pass such a value through the environment.
     $argv = @('{{ replace(command, "'", "''") }}' -split '\s+' | Where-Object { $_ })
+    $forwardGithubToken = $argv.Count -gt 0 -and $argv[0] -ceq '--github-token'
+    if ($forwardGithubToken) {
+        $argv = @($argv | Select-Object -Skip 1)
+        if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+            Write-Error "anvil-container: --github-token requires an explicitly supplied GITHUB_TOKEN; no host credential is acquired automatically"
+            exit 1
+        }
+    }
     if ($env:ANVIL_IN_CONTAINER -eq '1') {
         if ($argv.Count -eq 0) {
             # The no-argument form asks for a shell in the image, and this is
@@ -4166,93 +3937,7 @@ anvil-container *command:
     $forwardedEnv = @()
     $hookEnv = @()
 
-    # anvil-aprz queries the GitHub advisory API, which allows 60 requests an
-    # hour unauthenticated -- less than a full tier needs. Unauthenticated is
-    # not a degraded-but-working mode: `cargo aprz deps` sleeps until the quota
-    # resets rather than failing, so a containerized tier blocks for up to an
-    # hour with no way to opt out. Authentication is what makes the check
-    # terminate, not what makes it fast.
-    #
-    # Resolve the token exactly as the recipe does natively -- GITHUB_TOKEN
-    # first, then the gh CLI's stored token -- so a containerized run
-    # authenticates for the same developers a native run does.
-    #
-    # An already-exported GITHUB_TOKEN is forwarded whatever the command is:
-    # that is exact parity, since a native run exposes it to every process the
-    # shell spawns too. Deriving one from `gh` is different -- it manufactures a
-    # credential the developer did not put in this environment, and PID 1's
-    # environment is inherited by every build script and proc macro in the
-    # container, where natively the recipe would mint it in its own process. So
-    # it is derived only when the command is known to read the variable, or when
-    # there is no command at all: an interactive session can run anything, and
-    # refusing there would reintroduce the silent hour-long stall on a tier the
-    # developer runs from inside the shell.
-    # `gh auth token` is non-interactive and never opens a prompt.
-    #
-    # The predicate is the variable itself rather than the name of a check, so
-    # the driver stays generic: a catalog that adds another GitHub-authenticated
-    # check is covered without touching this recipe.
-    #
-    # Set here and passed by NAME, so the value never reaches the host's
-    # process command line, and unset again with the hook's variables below.
-    if (-not $env:GITHUB_TOKEN -and (Get-Command gh -ErrorAction SilentlyContinue)) {
-        $needsToken = $argv.Count -eq 0
-        # Only a `just` command can be planned, and planning is the only way to
-        # know whether what runs reads the variable. Anything else keeps the
-        # environment it was given: a manufactured credential reaches every
-        # process in the container, so an unknown command does not earn one.
-        if (-not $needsToken -and $argv[0] -eq 'just') {
-            # A dry run has no side effects, and a target that cannot be planned
-            # (a typo, a recipe needing arguments) yields nothing, so the run
-            # fails on its own terms rather than on a missing token.
-            #
-            # A plan covers the bodies just runs itself, not the body of a
-            # recipe that one of them launches as a child process. The unscoped
-            # tier wrapper launches its tier that way, so planning
-            # `anvil-scheduled` shows the wrapper and none of the checks
-            # underneath it. Follow each nested target a plan names, or a
-            # wrapped tier reads as needing nothing and runs unauthenticated.
-            $plan = ''
-            $targets = [System.Collections.Generic.List[object]]::new()
-            $targets.Add([string[]]@($argv | Select-Object -Skip 1))
-            $planned = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-            for ($i = 0; $i -lt $targets.Count; $i++) {
-                $target = [string[]]$targets[$i]
-                # A recipe reachable twice is planned once, and a body naming
-                # itself terminates.
-                if (-not $planned.Add(($target -join ' '))) { continue }
-                # The same executable that launched this tree, for the reason
-                # every other nested call uses it: a caller invoking `just` by
-                # absolute path with its directory off PATH would otherwise fail
-                # here. That failure is silent, because an empty plan reads as
-                # "does not need a token" -- so anvil-aprz would run
-                # unauthenticated in an image with no gh of its own and block on
-                # the rate limit for up to an hour.
-                $step = ''
-                try {
-                    $step = (& '{{ replace(just_executable(), "'", "''") }}' --dry-run @target 2>&1 |
-                        ForEach-Object { $_.ToString() }) -join "`n"
-                } catch {
-                    $step = ''
-                }
-                $plan = "$plan`n$step"
-                # A launched recipe appears as a quoted argument to `just`.
-                foreach ($nested in [regex]::Matches($step, "'(_anvil-[^'\s]+)'")) {
-                    $targets.Add([string[]]@($nested.Groups[1].Value))
-                }
-            }
-            $needsToken = $plan -match 'GITHUB_TOKEN'
-        }
-        if ($needsToken) {
-            $ghToken = $null
-            try { $ghToken = (gh auth token --hostname github.com 2>$null) } catch { $ghToken = $null }
-            if ($ghToken -and $ghToken.Trim()) {
-                Set-Item -LiteralPath 'Env:GITHUB_TOKEN' -Value $ghToken.Trim()
-                $hookEnv += 'GITHUB_TOKEN'
-            }
-        }
-    }
-    if ($env:GITHUB_TOKEN) {
+    if ($forwardGithubToken) {
         $forwardedEnv += 'GITHUB_TOKEN'
         $runArgs += @('-e', 'GITHUB_TOKEN')
     }
@@ -4321,6 +4006,14 @@ anvil-container *command:
                 exit 1
             }
             foreach ($name in $hookVars.Keys) {
+                if ($name -ieq 'GITHUB_TOKEN') {
+                    if (-not $forwardGithubToken) {
+                        Write-Error "anvil-container: GITHUB_TOKEN is reserved; Anvil-RunEnv cannot forward it without --github-token"
+                        exit 1
+                    }
+                    # The explicit host input is authoritative, not the hook.
+                    continue
+                }
                 if ([string]::IsNullOrWhiteSpace($hookVars[$name])) {
                     Write-Error "anvil: Anvil-RunEnv returned an empty value for '$name'"
                     exit 1
@@ -4460,6 +4153,7 @@ anvil-container-down:
 # Update behaviour: https://github.com/microsoft/ox-tools/blob/main/crates/cargo-anvil/docs/design/updates.md
 
 # Build all targets and features for local development.
+[group("anvil")]
 [arg("package", long, pattern='(?:[A-Za-z0-9_.-]+)?')]
 [arg("profile", long, pattern='(?:[A-Za-z0-9_.-]+)?')]
 [script("pwsh", "-NoProfile")]
@@ -4469,11 +4163,11 @@ anvil-build package="" profile="": anvil-build-validate-prereqs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Install prerequisites for the `anvil-build` recipe.
-[group("anvil-setup")]
+[private]
 anvil-build-setup installer="install": anvil-toolchain-stable-install
 
 # Validate prerequisites for the `anvil-build` recipe.
-[group("anvil-setup")]
+[private]
 anvil-build-validate-prereqs: anvil-tool-rustc-validate-prereqs
 
 === justfiles/anvil/groups/pr-fast.just ===
@@ -4512,7 +4206,7 @@ anvil-pr-fast: anvil-pr-fast-validate-prereqs \
 # validate-prereqs recipes take no parameters.
 
 # Install prerequisites for the `anvil-pr-fast` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-fast-setup installer="install": \
     (anvil-tool-cargo-delta-install installer) \
     (anvil-fmt-setup installer) \
@@ -4533,7 +4227,7 @@ anvil-pr-fast-setup installer="install": \
     (anvil-external-types-setup installer)
 
 # Validate prerequisites for the `anvil-pr-fast` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-fast-validate-prereqs: \
     anvil-tool-cargo-delta-validate-prereqs \
     anvil-fmt-validate-prereqs \
@@ -4567,13 +4261,13 @@ anvil-pr-fast-validate-prereqs: \
 anvil-pr-msrv: anvil-pr-msrv-validate-prereqs anvil-msrv-test
 
 # Install prerequisites for the `anvil-pr-msrv` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-msrv-setup installer="install": \
     (anvil-tool-cargo-delta-install installer) \
     (anvil-msrv-test-setup installer)
 
 # Validate prerequisites for the `anvil-pr-msrv` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-msrv-validate-prereqs: \
     anvil-tool-cargo-delta-validate-prereqs \
     anvil-msrv-test-validate-prereqs
@@ -4592,13 +4286,13 @@ anvil-pr-msrv-validate-prereqs: \
 anvil-pr-mutants: anvil-pr-mutants-validate-prereqs anvil-mutants-diff
 
 # Install prerequisites for the `anvil-pr-mutants` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-mutants-setup installer="install": \
     (anvil-tool-cargo-delta-install installer) \
     (anvil-mutants-diff-setup installer)
 
 # Validate prerequisites for the `anvil-pr-mutants` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-mutants-validate-prereqs: \
     anvil-tool-cargo-delta-validate-prereqs \
     anvil-mutants-diff-validate-prereqs
@@ -4621,7 +4315,7 @@ anvil-pr-runtime-analysis: anvil-pr-runtime-analysis-validate-prereqs \
     anvil-bolero
 
 # Install prerequisites for the `anvil-pr-runtime-analysis` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-runtime-analysis-setup installer="install": \
     (anvil-tool-cargo-delta-install installer) \
     (anvil-miri-setup installer) \
@@ -4630,7 +4324,7 @@ anvil-pr-runtime-analysis-setup installer="install": \
     (anvil-bolero-setup installer)
 
 # Validate prerequisites for the `anvil-pr-runtime-analysis` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-runtime-analysis-validate-prereqs: \
     anvil-tool-cargo-delta-validate-prereqs \
     anvil-miri-validate-prereqs \
@@ -4669,7 +4363,7 @@ anvil-pr-runtime-analysis-validate-prereqs: \
 anvil-pr-slow: anvil-pr-slow-validate-prereqs anvil-pr-test anvil-pr-msrv anvil-pr-runtime-analysis anvil-pr-mutants
 
 # Install prerequisites for the `anvil-pr-slow` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-slow-setup installer="install": \
     (anvil-pr-test-setup installer) \
     (anvil-pr-msrv-setup installer) \
@@ -4677,7 +4371,7 @@ anvil-pr-slow-setup installer="install": \
     (anvil-pr-mutants-setup installer)
 
 # Validate prerequisites for the `anvil-pr-slow` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-slow-validate-prereqs: \
     anvil-pr-test-validate-prereqs \
     anvil-pr-msrv-validate-prereqs \
@@ -4701,7 +4395,7 @@ anvil-pr-test: anvil-pr-test-validate-prereqs \
     anvil-examples
 
 # Install prerequisites for the `anvil-pr-test` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-test-setup installer="install": \
     (anvil-tool-cargo-delta-install installer) \
     (anvil-llvm-cov-setup installer) \
@@ -4709,7 +4403,7 @@ anvil-pr-test-setup installer="install": \
     (anvil-examples-setup installer)
 
 # Validate prerequisites for the `anvil-pr-test` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-test-validate-prereqs: \
     anvil-tool-cargo-delta-validate-prereqs \
     anvil-llvm-cov-validate-prereqs \
@@ -4742,7 +4436,7 @@ _anvil-scheduled-advisories: anvil-scheduled-advisories-validate-prereqs \
     anvil-clippy
 
 # Install prerequisites for the `anvil-scheduled-advisories` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-advisories-setup installer="install": \
     (anvil-deny-setup installer) \
     (anvil-audit-setup installer) \
@@ -4750,7 +4444,7 @@ anvil-scheduled-advisories-setup installer="install": \
     (anvil-clippy-setup installer)
 
 # Validate prerequisites for the `anvil-scheduled-advisories` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-advisories-validate-prereqs: \
     anvil-deny-validate-prereqs \
     anvil-audit-validate-prereqs \
@@ -4782,14 +4476,14 @@ _anvil-scheduled-exhaustive: anvil-scheduled-exhaustive-validate-prereqs \
     anvil-bench
 
 # Install prerequisites for the `anvil-scheduled-exhaustive` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-exhaustive-setup installer="install": \
     (anvil-mutants-full-setup installer) \
     (anvil-cargo-hack-setup installer) \
     (anvil-bench-setup installer)
 
 # Validate prerequisites for the `anvil-scheduled-exhaustive` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-exhaustive-validate-prereqs: \
     anvil-mutants-full-validate-prereqs \
     anvil-cargo-hack-validate-prereqs \
@@ -4827,7 +4521,7 @@ _anvil-scheduled-runtime-analysis: anvil-scheduled-runtime-analysis-validate-pre
     anvil-miri-race-coverage
 
 # Install prerequisites for the `anvil-scheduled-runtime-analysis` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-runtime-analysis-setup installer="install": \
     (anvil-miri-setup installer) \
     (anvil-miri-tree-borrows-setup installer) \
@@ -4835,7 +4529,7 @@ anvil-scheduled-runtime-analysis-setup installer="install": \
     (anvil-miri-race-coverage-setup installer)
 
 # Validate prerequisites for the `anvil-scheduled-runtime-analysis` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-runtime-analysis-validate-prereqs: \
     anvil-miri-validate-prereqs \
     anvil-miri-tree-borrows-validate-prereqs \
@@ -4871,14 +4565,14 @@ _anvil-scheduled-test: anvil-scheduled-test-validate-prereqs \
     anvil-examples
 
 # Install prerequisites for the `anvil-scheduled-test` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-test-setup installer="install": \
     (anvil-llvm-cov-setup installer) \
     (anvil-doc-test-setup installer) \
     (anvil-examples-setup installer)
 
 # Validate prerequisites for the `anvil-scheduled-test` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-test-validate-prereqs: \
     anvil-llvm-cov-validate-prereqs \
     anvil-doc-test-validate-prereqs \
@@ -4940,8 +4634,12 @@ anvil-scheduled-test-validate-prereqs: \
 #     rather than `?? "--workspace"`, which would splat an empty arg cargo
 #     rejects).
 #   * "--package A@v --package B@v" - the tier has members. Packages are
-#     version-qualified cargo specs so they resolve uniquely even when a
-#     like-named crate is also a transitive dependency.
+#     version-qualified cargo specs. Aggregate Cargo commands instead call
+#     _anvil-impact-exclude, which returns the same set as
+#     "--workspace --exclude C ...": Cargo resolves that against workspace
+#     members only, so it stays unambiguous when a registry dependency has
+#     the same name and version as a member. Per-package fan-out passes the
+#     specs to cargo-each and uses its source-qualified '{cargo-spec}'.
 #   * "--skip" - the tier is empty for this change (recipe exits 0).
 #
 # These resolver outputs are only meaningful when the resolver succeeded, so
@@ -5797,6 +5495,66 @@ _anvil-impact-include tier:
         Write-Output $default
     }
 
+# Private. Same contract as _anvil-impact-include, but a member list is
+# returned as aggregate Cargo selection: "--workspace --exclude <name> ...".
+# Cargo resolves --exclude against workspace members only, so this stays
+# unambiguous when a registry dependency shares a member's name and version
+# (where `--package name@version` fails). "--skip", "--workspace" and the
+# empty modified default pass through unchanged, so callers keep their
+# explicit skip: excluding every member is a Cargo error, not a no-op.
+
+# Resolve a tier's scope as workspace-exclude Cargo selection.
+[script("pwsh", "-NoProfile")]
+_anvil-impact-exclude tier:
+    Set-StrictMode -Version 3.0
+    $ErrorActionPreference = 'Stop'
+    $include = (& "{{ just_executable() }}" _anvil-impact-include '{{ tier }}')
+    $impactExit = $LASTEXITCODE
+    if ($impactExit -ne 0) { exit $impactExit }
+    if ($include -notmatch '(^|\s)--package\s') { Write-Output $include; exit 0 }
+    $specs = @(-split $include | Where-Object { $_ -ne '--package' })
+    & "{{ just_executable() }}" _anvil-workspace-exclude @specs
+    exit $LASTEXITCODE
+
+# Private. Prints "--workspace --exclude <name> ..." selecting exactly the
+# given workspace-member name@version specs. Fails when a spec is not a
+# workspace member, so a stale selection never widens silently.
+
+# Convert workspace-member specs to workspace-exclude Cargo selection.
+[script("pwsh", "-NoProfile")]
+_anvil-workspace-exclude +specs:
+    Set-StrictMode -Version 3.0
+    $ErrorActionPreference = 'Stop'
+    $selected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($spec in -split '{{ specs }}') { [void]$selected.Add($spec) }
+    $metadataJson = & cargo {{_anvil_stable_toolchain_args}} metadata --locked --no-deps --format-version 1
+    $metadataExit = $LASTEXITCODE
+    if ($metadataExit -ne 0) {
+        [Console]::Error.WriteLine('anvil: cargo metadata failed')
+        exit $metadataExit
+    }
+    $meta = $metadataJson | ConvertFrom-Json
+    $workspaceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($id in $meta.workspace_members) { [void]$workspaceIds.Add("$id") }
+    $selection = [System.Collections.Generic.List[string]]::new()
+    $selection.Add('--workspace')
+    $found = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($p in @($meta.packages | Where-Object { $workspaceIds.Contains("$($_.id)") })) {
+        $spec = "$($p.name)@$($p.version)"
+        if ($selected.Contains($spec)) {
+            [void]$found.Add($spec)
+        } else {
+            $selection.Add('--exclude')
+            $selection.Add($p.name)
+        }
+    }
+    $missing = @($selected | Where-Object { -not $found.Contains($_) })
+    if ($missing.Count -gt 0) {
+        [Console]::Error.WriteLine("anvil: not workspace members: $($missing -join ', ')")
+        exit 1
+    }
+    Write-Output ($selection -join ' ')
+
 === justfiles/anvil/mod.just ===
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
@@ -5960,19 +5718,19 @@ _anvil-full: anvil-full-validate-prereqs \
 # Local users who want "install everything" run `just anvil-setup`.
 
 # Install prerequisites for the `anvil-pr` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-setup installer="install": \
     (anvil-pr-fast-setup installer) \
     (anvil-pr-slow-setup installer)
 
 # Validate prerequisites for the `anvil-pr` recipe.
-[group("anvil-setup")]
+[private]
 anvil-pr-validate-prereqs: \
     anvil-pr-fast-validate-prereqs \
     anvil-pr-slow-validate-prereqs
 
 # Install prerequisites for the `anvil-scheduled` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-setup installer="install": \
     (anvil-scheduled-test-setup installer) \
     (anvil-scheduled-advisories-setup installer) \
@@ -5980,7 +5738,7 @@ anvil-scheduled-setup installer="install": \
     (anvil-scheduled-exhaustive-setup installer)
 
 # Validate prerequisites for the `anvil-scheduled` recipe.
-[group("anvil-setup")]
+[private]
 anvil-scheduled-validate-prereqs: \
     anvil-scheduled-test-validate-prereqs \
     anvil-scheduled-advisories-validate-prereqs \
@@ -5988,13 +5746,13 @@ anvil-scheduled-validate-prereqs: \
     anvil-scheduled-exhaustive-validate-prereqs
 
 # Install prerequisites for the `anvil-full` recipe.
-[group("anvil-setup")]
+[private]
 anvil-full-setup installer="install": \
     (anvil-pr-setup installer) \
     (anvil-scheduled-setup installer)
 
 # Validate prerequisites for the `anvil-full` recipe.
-[group("anvil-setup")]
+[private]
 anvil-full-validate-prereqs: \
     anvil-pr-validate-prereqs \
     anvil-scheduled-validate-prereqs
@@ -6033,7 +5791,7 @@ anvil-validate-prereqs: anvil-full-validate-prereqs anvil-tool-cargo-delta-valid
 # System-level prerequisites (libclang, etc.)
 # ============================================================================
 
-# Public: probe for system-level prerequisites that catalog tools need
+# Internal: probe for system-level prerequisites that catalog tools need
 # to BUILD from source. The `binstall` install path downloads pre-built
 # binaries and does not need these. The installer invokes this check only
 # immediately before a source build, including fallback after binstall fails.
@@ -6059,7 +5817,7 @@ anvil-validate-prereqs: anvil-full-validate-prereqs anvil-tool-cargo-delta-valid
 # package-manager choice stay with the user.
 
 # Check cargo-spellcheck source-build prerequisites.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-cargo-spellcheck-source-deps-check:
     $ErrorActionPreference = 'Stop'
@@ -6160,7 +5918,7 @@ anvil-tool-cargo-spellcheck-source-deps-check:
 # are read-only and only surface a friendly error if a prerequisite is absent.
 
 # Validate that rustc is available and workspace MSRVs are compatible.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-rustc-validate-prereqs:
     if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) {
@@ -6173,7 +5931,7 @@ anvil-tool-rustc-validate-prereqs:
     }
 
 # Validate that PowerShell Core is available.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-pwsh-validate-prereqs:
     if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
@@ -6428,7 +6186,7 @@ _anvil-resolve-stable action="install":
 # dependency, which Just deduplicates within one setup invocation.
 
 # Ensure the selected stable toolchain is available while preserving native repository toolchain-file behavior.
-[group("anvil-setup")]
+[private]
 anvil-toolchain-stable-install: (_anvil-resolve-stable "install")
 
 # _install-tool-core: install a cargo subcommand at the catalog version,
@@ -6460,7 +6218,8 @@ _install-tool-core name version installer source_prereq="":
     # every post-restore run would try to re-install on top of the
     # cached binaries and fail with "binary already exists in destination".
     $installed = $null
-    $pattern = '^' + [regex]::Escape($name) + ' v(\S+):'
+    # Path and git installs append their source: `name vX.Y.Z (source):`.
+    $pattern = '^' + [regex]::Escape($name) + ' v(\S+?)(?: \(.*\))?:$'
     foreach ($line in (& cargo {{_anvil_stable_toolchain_args}} install --list 2>$null)) {
         if ($line -match $pattern) { $installed = $Matches[1]; break }
     }
@@ -6519,7 +6278,8 @@ _check-tool name version:
     $version = '{{version}}'
 
     $installed = $null
-    $pattern = '^' + [regex]::Escape($name) + ' v(\S+):'
+    # Path and git installs append their source: `name vX.Y.Z (source):`.
+    $pattern = '^' + [regex]::Escape($name) + ' v(\S+?)(?: \(.*\))?:$'
     $previousAutoInstall = $env:RUSTUP_AUTO_INSTALL
     try {
         # Validation must not let the rustup proxy provision a missing selection.
@@ -6805,19 +6565,19 @@ _check-component toolchain component:
 # ============================================================================
 
 # Install the pinned nightly Rust toolchain.
-[group("anvil-setup")]
+[private]
 anvil-toolchain-nightly-install: (_install-toolchain rust_nightly)
 
 # Validate that the pinned nightly Rust toolchain is available.
-[group("anvil-setup")]
+[private]
 anvil-toolchain-nightly-validate-prereqs: (_check-toolchain rust_nightly)
 
 # Install the pinned nightly Rust toolchain for external-type checks.
-[group("anvil-setup")]
+[private]
 anvil-toolchain-nightly-external-types-install: (_install-toolchain rust_nightly_external_types)
 
 # Validate that the pinned nightly Rust toolchain for external-type checks is available.
-[group("anvil-setup")]
+[private]
 anvil-toolchain-nightly-external-types-validate-prereqs: (_check-toolchain rust_nightly_external_types)
 
 # ============================================================================
@@ -6829,43 +6589,43 @@ anvil-toolchain-nightly-external-types-validate-prereqs: (_check-toolchain rust_
 # relevant anvil-<toolchain>-install recipe) and then add the component.
 
 # Install the pinned `clippy` component for the default toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-default-clippy-install: anvil-toolchain-stable-install (_install-component "default" "clippy")
 
 # Validate that the pinned `clippy` component is available for the default toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-default-clippy-validate-prereqs: (_check-component "default" "clippy")
 
 # Install the pinned `rustfmt` component for the default toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-default-rustfmt-install: anvil-toolchain-stable-install (_install-component "default" "rustfmt")
 
 # Validate that the pinned `rustfmt` component is available for the default toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-default-rustfmt-validate-prereqs: (_check-component "default" "rustfmt")
 
 # Install the pinned `rustfmt` component for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-rustfmt-install: anvil-toolchain-nightly-install (_install-component rust_nightly "rustfmt")
 
 # Validate that the pinned `rustfmt` component is available for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-rustfmt-validate-prereqs: anvil-toolchain-nightly-validate-prereqs (_check-component rust_nightly "rustfmt")
 
 # Install the pinned `miri` component for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-miri-install: anvil-toolchain-nightly-install (_install-component rust_nightly "miri")
 
 # Validate that the pinned `miri` component is available for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-miri-validate-prereqs: anvil-toolchain-nightly-validate-prereqs (_check-component rust_nightly "miri")
 
 # Install the pinned `rust-src` component for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-rust-src-install: anvil-toolchain-nightly-install (_install-component rust_nightly "rust-src")
 
 # Validate that the pinned `rust-src` component is available for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-rust-src-validate-prereqs: anvil-toolchain-nightly-validate-prereqs (_check-component rust_nightly "rust-src")
 
 # llvm-tools ships the llvm-profdata / llvm-cov binaries that
@@ -6879,11 +6639,11 @@ anvil-component-nightly-rust-src-validate-prereqs: anvil-toolchain-nightly-valid
 # `rustup component add` install path.
 
 # Install the pinned `llvm-tools` component for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-llvm-tools-install: anvil-toolchain-nightly-install (_install-component rust_nightly "llvm-tools")
 
 # Validate that the pinned `llvm-tools` component is available for the nightly toolchain.
-[group("anvil-setup")]
+[private]
 anvil-component-nightly-llvm-tools-validate-prereqs: anvil-toolchain-nightly-validate-prereqs (_check-component rust_nightly "llvm-tools")
 
 # ============================================================================
@@ -6896,19 +6656,19 @@ anvil-component-nightly-llvm-tools-validate-prereqs: anvil-toolchain-nightly-val
 # parameter; the validate-prereqs recipes do not (they only read state).
 
 # Install the pinned `cargo-aprz` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-aprz-install installer="install": (_install-tool "cargo-aprz" cargo_aprz_version installer)
 
 # Validate that the pinned `cargo-aprz` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-aprz-validate-prereqs: (_check-tool "cargo-aprz" cargo_aprz_version)
 
 # Install the pinned `cargo-audit` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-audit-install installer="install": (_install-tool "cargo-audit" cargo_audit_version installer)
 
 # Validate that the pinned `cargo-audit` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-audit-validate-prereqs: (_check-tool "cargo-audit" cargo_audit_version)
 
 # cargo-bolero is Linux-only: its `bolero-afl` build dependency
@@ -6923,7 +6683,7 @@ anvil-tool-cargo-audit-validate-prereqs: (_check-tool "cargo-audit" cargo_audit_
 # treat bolero as a no-op rather than a setup failure.
 
 # Install the pinned `cargo-bolero` tool.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-cargo-bolero-install installer="install": anvil-toolchain-stable-install
     if (-not $IsLinux) {
@@ -6934,7 +6694,7 @@ anvil-tool-cargo-bolero-install installer="install": anvil-toolchain-stable-inst
     exit $LASTEXITCODE
 
 # Validate that the pinned `cargo-bolero` tool is available.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-cargo-bolero-validate-prereqs:
     if (-not $IsLinux) {
@@ -6945,99 +6705,99 @@ anvil-tool-cargo-bolero-validate-prereqs:
     exit $LASTEXITCODE
 
 # Install the pinned `cargo-careful` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-careful-install installer="install": (_install-tool "cargo-careful" cargo_careful_version installer)
 
 # Validate that the pinned `cargo-careful` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-careful-validate-prereqs: (_check-tool "cargo-careful" cargo_careful_version)
 
 # Install the pinned `cargo-check-external-types` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-check-external-types-install installer="install": (_install-tool "cargo-check-external-types" cargo_check_external_types_version installer)
 
 # Validate that the pinned `cargo-check-external-types` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-check-external-types-validate-prereqs: (_check-tool "cargo-check-external-types" cargo_check_external_types_version)
 
 # Install the pinned `cargo-coverage-gate` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-coverage-gate-install installer="install": (_install-tool "cargo-coverage-gate" cargo_coverage_gate_version installer)
 
 # Validate that the pinned `cargo-coverage-gate` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-coverage-gate-validate-prereqs: (_check-tool "cargo-coverage-gate" cargo_coverage_gate_version)
 
 # Install the pinned `cargo-delta` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-delta-install installer="install": (_install-tool "cargo-delta" cargo_delta_version installer)
 
 # Validate that the pinned `cargo-delta` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-delta-validate-prereqs: (_check-tool "cargo-delta" cargo_delta_version)
 
 # Install the pinned `cargo-deny` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-deny-install installer="install": (_install-tool "cargo-deny" cargo_deny_version installer)
 
 # Validate that the pinned `cargo-deny` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-deny-validate-prereqs: (_check-tool "cargo-deny" cargo_deny_version)
 
 # Install the pinned `cargo-doc2readme` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-doc2readme-install installer="install": (_install-tool "cargo-doc2readme" cargo_doc2readme_version installer)
 
 # Validate that the pinned `cargo-doc2readme` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-doc2readme-validate-prereqs: (_check-tool "cargo-doc2readme" cargo_doc2readme_version)
 
 # Install the pinned `cargo-each` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-each-install installer="install": (_install-tool "cargo-each" cargo_each_version installer)
 
 # Validate that the pinned `cargo-each` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-each-validate-prereqs: (_check-tool "cargo-each" cargo_each_version)
 
 # Install the pinned `cargo-ensure-no-cyclic-deps` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-ensure-no-cyclic-deps-install installer="install": (_install-tool "cargo-ensure-no-cyclic-deps" cargo_ensure_no_cyclic_deps_version installer)
 
 # Validate that the pinned `cargo-ensure-no-cyclic-deps` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-ensure-no-cyclic-deps-validate-prereqs: (_check-tool "cargo-ensure-no-cyclic-deps" cargo_ensure_no_cyclic_deps_version)
 
 # Install the pinned `cargo-ensure-no-default-features` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-ensure-no-default-features-install installer="install": (_install-tool "cargo-ensure-no-default-features" cargo_ensure_no_default_features_version installer)
 
 # Validate that the pinned `cargo-ensure-no-default-features` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-ensure-no-default-features-validate-prereqs: (_check-tool "cargo-ensure-no-default-features" cargo_ensure_no_default_features_version)
 
 # Install the pinned `cargo-hack` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-hack-install installer="install": (_install-tool "cargo-hack" cargo_hack_version installer)
 
 # Validate that the pinned `cargo-hack` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-hack-validate-prereqs: (_check-tool "cargo-hack" cargo_hack_version)
 
 # Install the pinned `cargo-heather` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-heather-install installer="install": (_install-tool "cargo-heather" cargo_heather_version installer)
 
 # Validate that the pinned `cargo-heather` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-heather-validate-prereqs: (_check-tool "cargo-heather" cargo_heather_version)
 
 # Install the pinned `cargo-llvm-cov` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-llvm-cov-install installer="install": (_install-tool "cargo-llvm-cov" cargo_llvm_cov_version installer)
 
 # Validate that the pinned `cargo-llvm-cov` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-llvm-cov-validate-prereqs: (_check-tool "cargo-llvm-cov" cargo_llvm_cov_version)
 
 # cargo-mutants doesn't build on aarch64-pc-windows-msvc (upstream
@@ -7048,7 +6808,7 @@ anvil-tool-cargo-llvm-cov-validate-prereqs: (_check-tool "cargo-llvm-cov" cargo_
 # target, so the check is effectively a no-op end-to-end there.
 
 # Install the pinned `cargo-mutants` tool.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-cargo-mutants-install installer="install": anvil-toolchain-stable-install
     if ($IsWindows -and ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')) {
@@ -7059,7 +6819,7 @@ anvil-tool-cargo-mutants-install installer="install": anvil-toolchain-stable-ins
     exit $LASTEXITCODE
 
 # Validate that the pinned `cargo-mutants` tool is available.
-[group("anvil-setup")]
+[private]
 [script("pwsh", "-NoProfile")]
 anvil-tool-cargo-mutants-validate-prereqs:
     if ($IsWindows -and ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64')) {
@@ -7070,43 +6830,43 @@ anvil-tool-cargo-mutants-validate-prereqs:
     exit $LASTEXITCODE
 
 # Install the pinned `cargo-nextest` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-nextest-install installer="install": (_install-tool "cargo-nextest" cargo_nextest_version installer)
 
 # Validate that the pinned `cargo-nextest` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-nextest-validate-prereqs: (_check-tool "cargo-nextest" cargo_nextest_version)
 
 # Install the pinned `cargo-semver-checks` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-semver-checks-install installer="install": (_install-tool "cargo-semver-checks" cargo_semver_checks_version installer)
 
 # Validate that the pinned `cargo-semver-checks` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-semver-checks-validate-prereqs: (_check-tool "cargo-semver-checks" cargo_semver_checks_version)
 
 # Install the pinned `cargo-sort` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-sort-install installer="install": (_install-tool "cargo-sort" cargo_sort_version installer)
 
 # Validate that the pinned `cargo-sort` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-sort-validate-prereqs: (_check-tool "cargo-sort" cargo_sort_version)
 
 # Install the pinned `cargo-spellcheck` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-spellcheck-install installer="install": (_install-tool "cargo-spellcheck" cargo_spellcheck_version installer "anvil-tool-cargo-spellcheck-source-deps-check")
 
 # Validate that the pinned `cargo-spellcheck` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-spellcheck-validate-prereqs: (_check-tool "cargo-spellcheck" cargo_spellcheck_version)
 
 # Install the pinned `cargo-udeps` tool.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-udeps-install installer="install": (_install-tool "cargo-udeps" cargo_udeps_version installer)
 
 # Validate that the pinned `cargo-udeps` tool is available.
-[group("anvil-setup")]
+[private]
 anvil-tool-cargo-udeps-validate-prereqs: (_check-tool "cargo-udeps" cargo_udeps_version)
 
 === justfiles/anvil/versions.just ===
@@ -7222,11 +6982,11 @@ cargo_audit_version := "0.22.2"
 cargo_bolero_version := "0.13.4"
 cargo_careful_version := "0.4.10"
 cargo_check_external_types_version := "0.5.0"
-cargo_coverage_gate_version := "0.4.0"
+cargo_coverage_gate_version := "0.7.1"
 cargo_delta_version := "0.3.1"
 cargo_deny_version := "0.20.2"
 cargo_doc2readme_version := "0.7.3"
-cargo_each_version := "0.3.0"
+cargo_each_version := "0.6.0"
 cargo_ensure_no_cyclic_deps_version := "0.2.0"
 cargo_ensure_no_default_features_version := "1.1.0"
 cargo_hack_version := "0.6.45"

@@ -95,6 +95,9 @@ missed, and onboarding new Rust repos requires copying-and-praying.
   catalog pins.
 - Managing exact tool versions on the user's behalf — we enforce minimums only. See
   [local.md §3](./local.md#3-tool-versions-and-installation).
+- Supporting Cargo older than 1.93, the minimum supported version for every toolchain an
+  adopter selects, including a declared MSRV. Recipes rely on its behaviour, such as
+  source-qualified package IDs in `cargo metadata`, and keep no workarounds for older Cargo.
 - Hosting a service. The tool is a CLI binary; updates ship via crates.io.
 - Acting as a runtime: the tool emits `just` recipes and cloud-workflow building blocks, then exits.
   It is **not** invoked at build/test/cloud workflows time. `just` is the runtime. (A narrow exception
@@ -448,7 +451,7 @@ pipeline.
 |-------------------------------------------------------------|----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | `pr-fast`, `scheduled-advisories`                             | All legs above                         | Contain compile-sensitive checks (clippy, doc-build, udeps, semver-check, external-types) that only see the host's compiled crate graph -- cfg-gated code is invisible to a single-leg run. Text/metadata checks running redundantly is cheaper than splitting jobs. |
 | `pr-test`, `pr-msrv`, `pr-runtime-analysis`, `scheduled-test`          | All legs above                         | Where compile-time and runtime OS / arch bugs actually surface. `pr-msrv` runs the affected test suite under the minimum supported compiler. The slow PR groups run as parallel cloud-workflow jobs for shorter wall-clock per leg. |
-| `pr-mutants`                                                    | GH: Linux x86_64 + Windows x86_64 + Linux aarch64 (windows-arm self-skips). ADO: Linux x86_64 + Windows x86_64 | Diff-scoped mutation testing. cargo-mutants doesn't build on `aarch64-pc-windows-msvc`; the recipe self-skips so the windows-arm leg is a no-op. |
+| `pr-mutants`                                                    | GH: Windows x86_64 executes; the other three legs are compatibility no-ops. ADO: Linux x86_64 + Windows x86_64 | Diff-scoped mutation testing. GitHub preserves all four stable ruleset contexts while running the campaign on one reliable Windows runner; `scheduled-exhaustive` retains Linux + Windows mutation coverage. |
 | `scheduled-exhaustive`                                       | Linux x86_64 + Windows x86_64 | Full `cargo-mutants` / `cargo-hack` / `bench`. cargo-mutants doesn't build on `aarch64-pc-windows-msvc`; rather than splitting the matrix to add an ARM-Linux leg for cargo-hack and bench, the whole group is x86-only. Adopters with ARM-specific concerns extend the matrix in their root workflow. |
 
 macOS is not in the default matrix — adopters who need it fork the owned reusable

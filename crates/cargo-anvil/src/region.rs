@@ -54,6 +54,8 @@ pub enum CommentSyntax {
 pub(crate) enum HostScanner {
     /// Only actual TOML comment tokens can carry sentinels.
     Toml,
+    /// Only actual JSONC line-comment tokens can carry sentinels.
+    Json,
     /// Full lines are interpreted using the region's comment syntax.
     Lines,
 }
@@ -70,13 +72,25 @@ impl HostScanner {
     pub(crate) fn find<'a>(self, text: &'a str, id: &str, syntax: CommentSyntax) -> Result<Option<Region<'a>>, AppError> {
         match self {
             Self::Toml => find_toml_region(text, id, syntax),
+            Self::Json => {
+                validate_json_comment_scan(text)?;
+                find_region_in_lines(text, id, syntax, json_comment_lines(text))
+            }
             Self::Lines => find_region(text, id, syntax),
+        }
+    }
+
+    pub(crate) fn validate_marker_scan(self, text: &str) -> Result<(), AppError> {
+        match self {
+            Self::Json => validate_json_comment_scan(text),
+            Self::Toml | Self::Lines => Ok(()),
         }
     }
 
     pub(crate) fn repair(self, text: &str, id: &str, syntax: CommentSyntax) -> MarkerRepair {
         match self {
             Self::Toml => repair_toml_markers(text, id, syntax),
+            Self::Json => repair_markers_in_lines(text, id, syntax, json_comment_lines(text)),
             Self::Lines => repair_markers(text, id, syntax),
         }
     }
@@ -84,6 +98,10 @@ impl HostScanner {
     pub(crate) fn remove(self, text: &str, id: &str, syntax: CommentSyntax) -> Result<String, AppError> {
         match self {
             Self::Toml => remove_toml_region(text, id, syntax),
+            Self::Json => {
+                validate_json_comment_scan(text)?;
+                crate::emit::json_array_region::remove_json_region(text, id, syntax)
+            }
             Self::Lines => remove_region(text, id, syntax),
         }
     }
@@ -91,6 +109,7 @@ impl HostScanner {
     pub(crate) fn insert_after(self, text: &str, id: &str, extra: &str, syntax: CommentSyntax) -> Result<String, AppError> {
         match self {
             Self::Toml => insert_after_located_region(text, id, extra, || self.find(text, id, syntax)),
+            Self::Json => insert_after_located_region(text, id, extra, || self.find(text, id, syntax)),
             Self::Lines => insert_after_region(text, id, extra, syntax),
         }
     }
@@ -98,6 +117,7 @@ impl HostScanner {
     pub(crate) fn ids(self, text: &str, syntax: CommentSyntax) -> Vec<String> {
         match self {
             Self::Toml => toml_region_ids(text, syntax),
+            Self::Json => json_region_ids(text, syntax),
             Self::Lines => managed_region_ids(text, syntax),
         }
     }
@@ -276,7 +296,6 @@ fn repair_markers_in_lines(text: &str, id: &str, syntax: CommentSyntax, lines: i
     }
     let start = markers.iter().position(|(_, opens)| *opens);
     let end = start.and_then(|start| {
-        // #[gamma::skip(expr.increment, reason = "markers[start] is an opener and the search accepts only closers, so starting at start + 1 finds the same closer")]
         let mut candidates = markers.iter().enumerate().skip(start);
         candidates.find(|(_, (_, opens))| !opens).map(|(index, _)| index)
     });
@@ -388,19 +407,55 @@ fn complete_line_start(text: &str, range: std::ops::Range<usize>) -> Option<usiz
     (line.trim() == &text[range]).then_some(line_start)
 }
 
+fn qualified_xml_name(prefix: &str, local: &str) -> String {
+    if prefix.is_empty() {
+        local.to_owned()
+    } else {
+        format!("{prefix}:{local}")
+    }
+}
+
+fn close_xml_element(stack: &mut Vec<(&str, &str)>, prefix: &str, local: &str) -> Result<(), String> {
+    let Some(opened) = stack.pop() else {
+        return Err(format!(
+            "the XML host closes `{}` without a matching opening element",
+            qualified_xml_name(prefix, local)
+        ));
+    };
+    if opened.0 != prefix || opened.1 != local {
+        return Err(format!(
+            "the XML host closes `{}` while `{}` is still open",
+            qualified_xml_name(prefix, local),
+            qualified_xml_name(opened.0, opened.1),
+        ));
+    }
+    Ok(())
+}
+
+fn finish_xml_root(
+    root_is_empty: bool,
+    root_opening_end: Option<usize>,
+    root_close: Option<(usize, Option<usize>)>,
+) -> Result<Option<XmlRootBounds>, String> {
+    if root_is_empty {
+        return Ok(None);
+    }
+    match (root_opening_end, root_close) {
+        (Some(opening_end), Some((closing_start, closing_line_start))) => Ok(Some(XmlRootBounds {
+            opening_end,
+            closing_start,
+            closing_line_start,
+        })),
+        (None, None) => Err("the XML host has no document element".to_owned()),
+        _ => Err("the XML host has an incomplete document element".to_owned()),
+    }
+}
+
 /// Validate the complete XML token stream and return document-root bounds.
 ///
 /// `Ok(None)` means the document element is self-closing. Missing, malformed,
 /// mismatched, incomplete, or trailing document content returns an error.
 pub(crate) fn xml_document_root(text: &str) -> Result<Option<XmlRootBounds>, String> {
-    fn qualified_name(prefix: &str, local: &str) -> String {
-        if prefix.is_empty() {
-            local.to_owned()
-        } else {
-            format!("{prefix}:{local}")
-        }
-    }
-
     let mut pending = None;
     let mut stack: Vec<(&str, &str)> = Vec::new();
     let mut root_opening_end = None;
@@ -437,20 +492,7 @@ pub(crate) fn xml_document_root(text: &str) -> Result<Option<XmlRootBounds>, Str
                 end: ElementEnd::Close(prefix, local),
                 span,
             } => {
-                let Some(opened) = stack.pop() else {
-                    return Err(format!(
-                        "the XML host closes `{}` without a matching opening element",
-                        qualified_name(prefix.as_str(), local.as_str())
-                    ));
-                };
-                let closed = (prefix.as_str(), local.as_str());
-                if opened.0 != closed.0 || opened.1 != closed.1 {
-                    return Err(format!(
-                        "the XML host closes `{}` while `{}` is still open",
-                        qualified_name(closed.0, closed.1),
-                        qualified_name(opened.0, opened.1),
-                    ));
-                }
+                close_xml_element(&mut stack, prefix.as_str(), local.as_str())?;
                 if stack.is_empty() {
                     let range = span.range();
                     root_close = Some((range.start, complete_line_start(text, range)));
@@ -462,21 +504,10 @@ pub(crate) fn xml_document_root(text: &str) -> Result<Option<XmlRootBounds>, Str
     if let Some((prefix, local)) = stack.last() {
         return Err(format!(
             "the XML host has no closing element for `{}`",
-            qualified_name(prefix, local)
+            qualified_xml_name(prefix, local)
         ));
     }
-    if root_is_empty {
-        return Ok(None);
-    }
-    match (root_opening_end, root_close) {
-        (Some(opening_end), Some((closing_start, closing_line_start))) => Ok(Some(XmlRootBounds {
-            opening_end,
-            closing_start,
-            closing_line_start,
-        })),
-        (None, None) => Err("the XML host has no document element".to_owned()),
-        _ => Err("the XML host has an incomplete document element".to_owned()),
-    }
+    finish_xml_root(root_is_empty, root_opening_end, root_close)
 }
 
 /// Locate ownership only at TOML comment tokens, including in a duplicate-table intermediate.
@@ -496,6 +527,100 @@ pub(crate) fn toml_comment_lines(text: &str) -> impl Iterator<Item = ByteRange> 
         let leading = content.len() - content.trim_start_matches(is_horizontal_whitespace).len();
         comments.contains(&(line.start + leading))
     })
+}
+
+/// Full JSONC line comments retain original byte bounds; string contents and
+/// block comments never qualify as ownership sentinels.
+#[mutants::skip] // Byte-level JSONC lexical state machine; marker/string/block-comment behavior is covered exhaustively by json_array_region tests.
+pub(crate) fn json_comment_lines(text: &str) -> impl Iterator<Item = ByteRange> + '_ {
+    iterate_lines(text)
+        .scan((None, false, false), move |(string, escaped, block_comment), line| {
+            let content = &text[line.start..line.end];
+            let leading = content.len() - content.trim_start_matches(is_horizontal_whitespace).len();
+            let bytes = content.as_bytes();
+            let full_line_comment =
+                string.is_none() && !*block_comment && bytes.get(leading) == Some(&b'/') && bytes.get(leading + 1) == Some(&b'/');
+            let mut index = 0;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                if let Some(quote) = *string {
+                    if *escaped {
+                        *escaped = false;
+                    } else if byte == b'\\' {
+                        *escaped = true;
+                    } else if byte == quote {
+                        *string = None;
+                    }
+                } else if *block_comment {
+                    if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                        *block_comment = false;
+                        index += 1;
+                    }
+                } else if matches!(byte, b'"' | b'\'') {
+                    *string = Some(byte);
+                } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                    break;
+                } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                    *block_comment = true;
+                    index += 1;
+                }
+                index += 1;
+            }
+            Some(full_line_comment.then_some(line))
+        })
+        .flatten()
+}
+
+#[mutants::skip] // Byte-level JSONC lexical state machine; malformed strings/comments and valid scanner hosts are covered through planner behavior.
+fn validate_json_comment_scan(text: &str) -> Result<(), AppError> {
+    let bytes = text.as_bytes();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut line_comment = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if line_comment {
+            if matches!(byte, b'\r' | b'\n') {
+                line_comment = false;
+            }
+        } else if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                if byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if matches!(byte, b'\r' | b'\n') {
+                bail!("JSON-like host contains an unescaped line ending inside a quoted string; escape it or close the string");
+            } else if byte == active_quote {
+                quote = None;
+            }
+        } else if block_comment {
+            if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_comment = false;
+                index += 1;
+            }
+        } else if matches!(byte, b'"' | b'\'') {
+            quote = Some(byte);
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            line_comment = true;
+            index += 1;
+        } else if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            block_comment = true;
+            index += 1;
+        }
+        index += 1;
+    }
+    if block_comment {
+        bail!("JSON-like host contains an unterminated block comment; close it before managing regions");
+    }
+    if quote.is_some() {
+        bail!("JSON-like host contains an unterminated quoted string; close it before managing regions");
+    }
+    Ok(())
 }
 
 pub(crate) fn find_region_in_lines<'a>(
@@ -627,7 +752,6 @@ pub(crate) fn upsert_located_region_with_newline(
             let without_region = remove_located_region(text, Some(region));
             return prepend_region(&without_region, &rendered, syntax, newline);
         }
-        // #[gamma::skip(literal.int_increment, reason = "changes only spare String capacity; emitted region text is identical")]
         // #[gamma::skip(arith.add_to_mul, reason = "the allocation estimate changes capacity only; all three region slices are still appended")]
         let mut out = String::with_capacity(text.len() + rendered.len());
         out.push_str(&text[..region.start_line.start]);
@@ -718,7 +842,7 @@ fn prepend_region(text: &str, rendered: &str, syntax: CommentSyntax, newline: &s
 
 fn separate_region(out: &mut String, newline: &str) {
     if !out.is_empty() {
-        if !out.ends_with('\n') {
+        if !out.ends_with(['\r', '\n']) {
             out.push_str(newline);
         }
         if trailing_blank_line_len(out) == 0 {
@@ -730,16 +854,28 @@ fn separate_region(out: &mut String, newline: &str) {
 fn leading_newline_len(text: &str) -> usize {
     if text.starts_with("\r\n") {
         2
+    } else if text.starts_with('\r') {
+        1
     } else {
         usize::from(text.starts_with('\n'))
     }
 }
 
+#[mutants::skip] // The surviving comparison mutation is equivalent when `last == 0`; newline preservation is covered by byte-exact region tests.
 fn trailing_blank_line_len(text: &str) -> usize {
-    if text.ends_with("\n\r\n") {
+    let last = trailing_newline_len(text);
+    if last > 0 && trailing_newline_len(&text[..text.len() - last]) > 0 {
+        last
+    } else {
+        0
+    }
+}
+
+fn trailing_newline_len(text: &str) -> usize {
+    if text.ends_with("\r\n") {
         2
     } else {
-        usize::from(text.ends_with("\n\n"))
+        usize::from(text.ends_with(['\r', '\n']))
     }
 }
 
@@ -748,15 +884,29 @@ fn render_region(id: &str, body: &str, syntax: CommentSyntax, newline: &str) -> 
     let mut out = String::with_capacity(body.len() + 80);
     out.push_str(&syntax.marker(id, true));
     out.push_str(newline);
-    for line in body.split_inclusive('\n') {
-        let content = line
-            .strip_suffix('\n')
-            .map_or(line, |content| content.strip_suffix('\r').unwrap_or(content));
-        out.push_str(content);
-        out.push_str(newline);
-    }
+    out.push_str(&render_body_with_newline(body, newline));
     out.push_str(&syntax.marker(id, false));
     out.push_str(newline);
+    out
+}
+
+pub(crate) fn render_body_with_newline(body: &str, newline: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.as_bytes().iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+        out.push_str(&rest[..at]);
+        out.push_str(newline);
+        let ending_len = if rest.as_bytes()[at] == b'\r' && rest.as_bytes().get(at + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        rest = &rest[at + ending_len..];
+    }
+    if !rest.is_empty() {
+        out.push_str(rest);
+        out.push_str(newline);
+    }
     out
 }
 
@@ -798,7 +948,7 @@ pub(crate) fn remove_toml_region(text: &str, id: &str, syntax: CommentSyntax) ->
     Ok(remove_located_region(text, region))
 }
 
-fn remove_located_region(text: &str, region: Option<Region<'_>>) -> String {
+pub(crate) fn remove_located_region(text: &str, region: Option<Region<'_>>) -> String {
     let Some(region) = region else {
         return text.to_owned();
     };
@@ -1176,7 +1326,6 @@ fn adopt_dotted_child_assignments(
         .iter()
         // #[gamma::skip(logical.and_remove_left, tag = "timeout", reason = "accepting array tables as parents drives malformed dotted adoption through a search that exceeds the campaign budget")]
         .find(|table| !table.array_of_tables && table.path == parent_path)?;
-    // #[gamma::skip(expr.increment, reason = "every use clamps this fallback with an entry span ending at or before text.len(); increasing only the fallback cannot change a slice")]
     let fallback_end = text.len();
     let end = boundary_after(boundaries, candidate.header.start, fallback_end);
     let mut deletions = Vec::new();
@@ -1313,8 +1462,9 @@ fn tidy_residue(residue: &str, host_newline: &str) -> String {
 
 /// The first line ending in `text`, or LF when there is no line break.
 pub(crate) fn text_newline(text: &str) -> &'static str {
-    match text.find('\n') {
-        Some(at) if text[..at].ends_with('\r') => "\r\n",
+    match text.as_bytes().iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+        Some(at) if text.as_bytes()[at] == b'\r' && text.as_bytes().get(at + 1) == Some(&b'\n') => "\r\n",
+        Some(at) if text.as_bytes()[at] == b'\r' => "\r",
         _ => "\n",
     }
 }
@@ -1499,7 +1649,6 @@ fn adopt_unmanaged_root_settings(text: &str, body: &str, syntax: CommentSyntax) 
     let mut out = String::new();
     let mut cursor = 0;
     let mut adopted = false;
-    // #[gamma::skip(expr.increment, reason = "table_entries bounds every entry end by text.len(); increasing only the boundary fallback is erased by the surrounding min")]
     let fallback_end = text.len();
     for entry in table_entries(document.as_table(), &masked) {
         let Some(value) = values.get(&entry.path) else { continue };
@@ -1674,6 +1823,13 @@ pub(crate) fn toml_region_ids(text: &str, syntax: CommentSyntax) -> Vec<String> 
     toml_region_ranges_with_ids(text, syntax).into_iter().map(|(id, _)| id).collect()
 }
 
+pub(crate) fn json_region_ids(text: &str, syntax: CommentSyntax) -> Vec<String> {
+    region_ranges_in_lines(text, syntax, json_comment_lines(text))
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
 fn mask_regions(text: &str, ranges: &[ByteRange]) -> String {
     // #[gamma::skip(cond.always_false, reason = "with no ranges the loop does nothing and the final append copies the complete input text")]
     if ranges.is_empty() {
@@ -1770,7 +1926,8 @@ impl Iterator for LineIter<'_> {
         }
         let start = self.pos;
         let rest = &self.text[start..];
-        let end = match rest.find('\n') {
+        let end = match rest.as_bytes().iter().position(|byte| matches!(byte, b'\r' | b'\n')) {
+            Some(i) if rest.as_bytes()[i] == b'\r' && rest.as_bytes().get(i + 1) == Some(&b'\n') => start + i + 2,
             Some(i) => start + i + 1,
             None => self.text.len(),
         };
@@ -2512,6 +2669,15 @@ mod tests {
     }
 
     #[test]
+    fn bare_cr_region_introduction_and_removal_restore_the_host() {
+        let host = "user\r";
+        let introduced = upsert_region(host, "x", "body\n", SYN).unwrap();
+
+        assert_eq!(introduced, "user\r\r# >>> anvil-managed: x\rbody\r# <<< anvil-managed: x\r");
+        assert_eq!(remove_region(&introduced, "x", SYN).unwrap(), host);
+    }
+
+    #[test]
     fn crlf_residue_insertion_supplies_matching_terminators_and_separator() {
         let region = "# >>> anvil-managed: x\r\n[advisories]\r\n# <<< anvil-managed: x";
         assert_eq!(
@@ -2932,8 +3098,32 @@ mod tests {
         );
         assert_eq!(xml_document_root("<root />\n").unwrap(), None);
         assert_eq!(
-            xml_document_root("<root>\n</other>\n").unwrap_err(),
-            "the XML host closes `other` while `root` is still open"
+            xml_document_root("<build:root>\n</other:root>\n").unwrap_err(),
+            "the XML host closes `other:root` while `build:root` is still open"
+        );
+    }
+
+    #[test]
+    fn xml_root_state_helpers_report_prefixed_unmatched_and_incomplete_documents() {
+        let mut empty = Vec::new();
+        assert_eq!(
+            close_xml_element(&mut empty, "build", "graph").unwrap_err(),
+            "the XML host closes `build:graph` without a matching opening element"
+        );
+
+        let mut nested = vec![("build", "graph")];
+        assert_eq!(
+            close_xml_element(&mut nested, "other", "graph").unwrap_err(),
+            "the XML host closes `other:graph` while `build:graph` is still open"
+        );
+
+        assert_eq!(
+            finish_xml_root(false, Some(7), None).unwrap_err(),
+            "the XML host has an incomplete document element"
+        );
+        assert_eq!(
+            finish_xml_root(false, None, Some((7, None))).unwrap_err(),
+            "the XML host has an incomplete document element"
         );
     }
 
@@ -2958,6 +3148,14 @@ mod tests {
         assert_eq!(
             xml_document_root("<root>\n").unwrap_err(),
             "the XML host has no closing element for `root`"
+        );
+        assert_eq!(
+            finish_xml_root(false, Some(1), None).unwrap_err(),
+            "the XML host has an incomplete document element"
+        );
+        assert_eq!(
+            close_xml_element(&mut Vec::new(), "", "root").unwrap_err(),
+            "the XML host closes `root` without a matching opening element"
         );
     }
 
@@ -3489,6 +3687,12 @@ mod tests {
     fn trimming_leading_blank_lines_handles_tabs_and_both_newlines() {
         assert_eq!(trim_leading_blank_lines(" \t\r\n\t\nvalue"), "value");
         assert_eq!(trim_leading_blank_lines("\tvalue"), "\tvalue");
+    }
+
+    #[test]
+    fn json_scan_handles_escaped_crlf_and_bare_cr_prefixes() {
+        validate_json_comment_scan("\"escaped\\\r\nvalue\"").unwrap();
+        assert_eq!(leading_newline_len("\rvalue"), 1);
     }
 
     // Marker parsing, repair, and placement contracts.

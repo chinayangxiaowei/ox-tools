@@ -5,8 +5,6 @@
 //! root workflows, each an owned file gated on [`Backend::GitHub`].
 //!
 //! Holds the embedded templates and registry functions.
-//!
-//! See [`github.md`](../../../docs/design/github.md).
 
 use crate::backend::Backend;
 use crate::catalog::Artifact;
@@ -545,6 +543,10 @@ export -f just
         ] {
             assert!(PR_IMPL_WORKFLOW.contains(name), "PR impl workflow missing display name '{name}'");
         }
+        assert!(
+            PR_IMPL_WORKFLOW.contains("if: matrix.os == 'windows'") && PR_IMPL_WORKFLOW.contains("if: matrix.os != 'windows'"),
+            "the mutation matrix must run on Windows and no-op every compatibility context"
+        );
         assert!(PR_IMPL_WORKFLOW.contains("publish_commit_statuses:"));
         assert_eq!(
             PR_IMPL_WORKFLOW.matches("BASE_REF: ${{ inputs.base_ref }}").count(),

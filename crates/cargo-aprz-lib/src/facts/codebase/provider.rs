@@ -660,17 +660,20 @@ fn accumulate_source_results(
 }
 
 fn filter_source_entry(entry: &walkdir::DirEntry, max_file_size: u64) -> Option<PathBuf> {
-    let metadata = entry
-        .metadata()
-        .inspect_err(|error| log::debug!(target: LOG_TARGET, "Could not read metadata for {}: {error:#}", entry.path().display()))
+    filter_source_metadata(entry.path(), entry.metadata().map(|metadata| metadata.len()), max_file_size)
+}
+
+fn filter_source_metadata<E: std::fmt::Display>(path: &Path, size: core::result::Result<u64, E>, max_file_size: u64) -> Option<PathBuf> {
+    let size = size
+        .inspect_err(|error| log::debug!(target: LOG_TARGET, "Could not read metadata for {}: {error:#}", path.display()))
         .ok()?;
 
-    if metadata.len() > max_file_size {
-        log::debug!(target: LOG_TARGET, "Skipping large file '{}' ({} bytes)", entry.path().display(), metadata.len());
+    if size > max_file_size {
+        log::debug!(target: LOG_TARGET, "Skipping large file '{}' ({} bytes)", path.display(), size);
         return None;
     }
 
-    Some(entry.path().to_path_buf())
+    Some(path.to_path_buf())
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -978,11 +981,15 @@ jobs:
 
     const ALICE: [&str; 4] = ["-c", "user.name=Alice Fixture", "-c", "user.email=alice@example.invalid"];
     const BOB: [&str; 4] = ["-c", "user.name=Bob Fixture", "-c", "user.email=bob@example.invalid"];
+    static REPO_FIXTURE_GIT_LOCK: Mutex<()> = Mutex::new(());
 
     impl RepoFixture {
         /// Build a repository with commits outside the largest window and inside the 365-, 180-,
         /// and 90-day windows. One commit deliberately falls between the 90- and 180-day cutoffs.
         fn new(options: FixtureOptions) -> Self {
+            let _git_setup = REPO_FIXTURE_GIT_LOCK
+                .lock()
+                .expect("fixture setup cannot recover after another Git fixture panics while holding the setup lock");
             let tmp = tempfile::tempdir().expect("creating temp dir");
             let path = tmp.path().join("fixture-repo");
             fs::create_dir_all(&path).expect("creating fixture repo dir");
@@ -1683,23 +1690,16 @@ jobs:
         assert!(!is_rust_source_entry(&entry));
     }
 
-    #[cfg(unix)]
     #[test]
-    #[cfg_attr(miri, ignore = "uses filesystem; Miri isolation forbids it")]
-    fn source_entry_metadata_errors_are_skipped() {
-        let tmp = tempfile::tempdir().expect("creating temp dir");
-        let path = tmp.path().join("vanished.rs");
-        fs::write(&path, "pub fn fixture() {}\n").unwrap();
-        let entry = walkdir::WalkDir::new(tmp.path())
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .next()
-            .expect("fixture has one entry")
-            .expect("fixture entry is initially readable");
-        fs::remove_file(&path).unwrap();
-
-        assert_eq!(filter_source_entry(&entry, 1_000), None);
+    fn campaign_regression_source_metadata_errors_and_size_boundaries_are_respected() {
+        let path = Path::new("source.rs");
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "scripted missing source");
+        assert_eq!(filter_source_metadata(path, Err(missing), 1_000), None);
+        assert_eq!(
+            filter_source_metadata(path, Ok::<_, std::io::Error>(1_000), 1_000),
+            Some(path.to_path_buf())
+        );
+        assert_eq!(filter_source_metadata(path, Ok::<_, std::io::Error>(1_001), 1_000), None);
     }
 
     #[cfg(unix)]
