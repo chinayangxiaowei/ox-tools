@@ -370,7 +370,7 @@ mod tests {
             "'--no-coverage-target', 'aarch64-pc-windows-msvc'",
             "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "could not resolve the cargo-careful executable",
-            "anvil-mutants-full: aarch64-pc-windows-msvc",
+            "gamma run --workspace --min-score 100 --max-flaky 0",
         ] {
             assert!(checks.contains(needle), "checks tree missing safety behavior '{needle}'");
         }
@@ -378,12 +378,12 @@ mod tests {
             assert!(checks.contains(needle), "checks tree missing advisory behavior '{needle}'");
         }
         assert!(
-            checks.contains("bolero list --profile release --package '{cargo-spec}'"),
-            "bolero discovery must use the execution profile once per affected package"
+            checks.contains("bolero list --profile release --target $hostTarget --package '{cargo-spec}'"),
+            "bolero discovery must use the execution profile and host target once per affected package"
         );
         assert!(
-            checks.contains("bolero test --profile release --engine libfuzzer"),
-            "bolero execution must use the profile option accepted by the pinned cargo-bolero"
+            checks.contains("bolero test --profile release --target $hostTarget --engine libfuzzer"),
+            "bolero execution must use the supported profile option and explicit host target"
         );
         assert!(
             !checks.contains("bolero list @bareArgs"),
@@ -394,7 +394,7 @@ mod tests {
         // one failing target does not stop the remaining targets.
         for needle in [
             "$target | Add-Member -NotePropertyName anvilPackageSpec -NotePropertyValue $packageSpec",
-            "each --package $t.anvilPackageSpec '--' cargo '+{{ rust_nightly }}' bolero test --profile release --engine libfuzzer -T 60s --package '{cargo-spec}' $testName",
+            "each --package $t.anvilPackageSpec '--' cargo '+{{ rust_nightly }}' bolero test --profile release --target $hostTarget --engine libfuzzer -T 60s --package '{cargo-spec}' $testName",
             "if ($LASTEXITCODE -ne 0) { $failed = $true }",
             "if ($failed) { exit 1 }",
         ] {
@@ -449,6 +449,48 @@ mod tests {
             .split_once("    $include = (& \"{{ just_executable() }}\" _anvil-impact-exclude affected)")
             .expect("Miri resolves affected packages through workspace exclusions");
         assert!(before_selection.contains("    $env:RUSTUP_TOOLCHAIN = '{{ rust_nightly }}'"));
+    }
+
+    // Protect setup dependencies, the pinned command, and exit-forwarding syntax in memory;
+    // this does not execute setup or verify the prepared standard library.
+    #[test]
+    fn miri_setup_template_wires_pinned_sysroot_preparation() {
+        let miri = CHECK_FILES
+            .iter()
+            .find_map(|(path, body)| path.ends_with("/miri.just").then_some(*body))
+            .expect("miri.just is registered in CHECK_FILES");
+
+        let lines: Vec<_> = miri
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .collect();
+        let declaration = lines
+            .iter()
+            .position(|line| line.starts_with("anvil-miri-setup "))
+            .expect("miri.just must declare its setup recipe");
+        let start = lines[..declaration]
+            .iter()
+            .rposition(|line| !line.starts_with('['))
+            .map_or(0, |index| index + 1);
+        let end = lines[declaration + 1..]
+            .iter()
+            .position(|line| !line.starts_with("    "))
+            .map_or(lines.len(), |index| declaration + 1 + index);
+
+        assert_eq!(
+            &lines[start..end],
+            &[
+                "[private]",
+                "[script(\"pwsh\", \"-NoProfile\")]",
+                concat!(
+                    "anvil-miri-setup installer=\"install\": anvil-component-nightly-miri-install ",
+                    "anvil-component-nightly-rust-src-install",
+                ),
+                "    $ErrorActionPreference = 'Stop'",
+                "    & cargo '+{{ rust_nightly }}' miri setup",
+                "    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            ]
+        );
     }
 
     // A missing MSRV skips without discovery; otherwise discovery inherits the validated compiler.
@@ -742,24 +784,38 @@ mod tests {
     }
 
     #[test]
-    fn semver_check_compares_against_the_pr_branch_baseline() {
+    fn semver_check_compares_locked_snapshots_against_the_pr_branch_baseline() {
         let (_, body) = CHECK_FILES
             .iter()
             .find(|(path, _)| *path == "justfiles/anvil/checks/semver-check.just")
-            .expect("semver check template is registered");
+            .expect("CHECK_FILES above always registers the SemVer check template");
 
-        // The recipe must resolve the PR target branch via the shared
-        // resolver _anvil-base-ref, and pass it to cargo-semver-checks
-        // as the baseline rather than comparing against the last crates.io release.
         for needle in [
             "_anvil-base-ref",
             "git rev-parse --verify \"$base^{commit}\"",
-            "git cat-file -e $baselineManifest",
+            "git cat-file -e ('{0}:{1}' -f $baseSha, $manifestPath)",
             "$stableArgs = {{_anvil_stable_toolchain_args}}",
-            "cargo @stableArgs semver-checks --package $p --baseline-rev $base",
+            "git clone --shared --no-checkout --quiet",
+            "-c filter.lfs.process= -c filter.lfs.smudge=",
+            "-c filter.lfs.required=false checkout --quiet --detach $baseSha",
+            "function Get-RustdocSnapshot",
+            "rustdoc --locked --lib",
+            "--package $package.id",
+            "--target $target --target-dir $targetDir",
+            "--output-format=json",
+            "--document-private-items",
+            "--document-hidden-items",
+            "'unstable', 'nightly', 'bench', 'no_std'",
+            "'^(_|unstable[-_])'",
+            "Remove-Item -LiteralPath $json",
+            "Get-RustdocSnapshot $currentPackage $meta.workspace_root",
+            "Get-RustdocSnapshot $old $baselineMeta.workspace_root",
+            "--current-rustdoc $current.Path --baseline-rustdoc $baseline.Path",
         ] {
             assert!(body.contains(needle), "semver check template missing '{needle}'");
         }
+        assert!(!body.contains("semver-checks --package $p --baseline-rev"));
+        assert!(!body.contains("cargo @stableArgs update"));
     }
 
     #[test]
@@ -930,7 +986,7 @@ mod tests {
             "cargo_llvm_cov_version",
             "cargo_deny_version",
             "cargo_each_version",
-            "cargo_mutants_version",
+            "cargo_gamma_version",
             "cargo_aprz_version",
         ] {
             assert!(VERSIONS_JUST.contains(needle), "versions.just missing variable '{needle}'");
@@ -976,16 +1032,18 @@ mod tests {
             "the bolero installer must invoke the generated just executable for its core helper"
         );
         assert!(
-            TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _install-tool-core cargo-mutants {{cargo_mutants_version}} {{installer}}"#),
-            "the mutants installer must invoke the generated just executable for its core helper"
+            TOOLS_JUST.contains(
+                r#"anvil-tool-cargo-gamma-install installer="install": (_install-tool "cargo-gamma" cargo_gamma_version installer)"#
+            ),
+            "the gamma installer must use the shared tool installer"
         );
         assert!(
             TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _check-tool cargo-bolero {{cargo_bolero_version}}"#),
             "the bolero prerequisite check must invoke the generated just executable"
         );
         assert!(
-            TOOLS_JUST.contains(r#"& "{{ just_executable() }}" _check-tool cargo-mutants {{cargo_mutants_version}}"#),
-            "the mutants prerequisite check must invoke the generated just executable"
+            TOOLS_JUST.contains(r#"anvil-tool-cargo-gamma-validate-prereqs: (_check-tool "cargo-gamma" cargo_gamma_version)"#),
+            "the gamma prerequisite check must use the shared tool validator"
         );
         for component in ["clippy", "rustfmt"] {
             let expected = format!("anvil-component-default-{component}-install: anvil-toolchain-stable-install");
@@ -1129,6 +1187,7 @@ mod tests {
         use std::process::{Command, Output};
         use std::{env, fs};
 
+        use serial_test::serial;
         use tempfile::{Builder, TempDir};
 
         use super::{TOOLS_JUST, VERSIONS_JUST};
@@ -1270,6 +1329,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn honors_environment_files_and_msrv_in_precedence_order() {
             if !tools_available() {
                 return;
@@ -1286,6 +1346,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn passes_selected_arguments_directly_to_cargo() {
             if !tools_available() {
                 return;
@@ -1377,6 +1438,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn installs_default_components_on_the_selected_stable_toolchain() {
             if !tools_available() {
                 return;
@@ -1480,6 +1542,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn rejects_missing_or_too_new_workspace_msrvs() {
             if !tools_available() {
                 return;
@@ -1590,6 +1653,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn diagnoses_missing_rustup_before_installing_a_toolchain() {
             if !tools_available() {
                 return;
@@ -1633,6 +1697,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn rejects_an_unpaired_internal_msrv_mapping_for_stable_selection() {
             if !tools_available() {
                 return;
@@ -1658,6 +1723,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn provisions_public_and_mapped_msrv_toolchains() {
             if !tools_available() {
                 return;
@@ -1766,6 +1832,7 @@ mod tests {
         }
 
         #[test]
+        #[serial]
         fn resolves_msrv_whenever_the_root_declares_one() {
             if !tools_available() {
                 return;
@@ -1783,11 +1850,12 @@ mod tests {
                 output.status.success(),
                 "a repository without a declared MSRV must skip the MSRV test"
             );
-            assert!(
+            assert_eq!(
                 String::from_utf8(output.stdout)
                     .expect("resolver output must be UTF-8")
                     .trim()
-                    .is_empty()
+                    .len(),
+                0
             );
 
             let temp = fixture("[workspace.package]\nrust-version = \"1.93\"\n");

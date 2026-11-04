@@ -611,18 +611,18 @@ fn confirm_enumeration_with(attempt: Attempt<'_>, output: String, observe: impl 
         // Timeout or memory-limit evidence from an exonerating run cannot be attributed to the
         // mutant because no mutant was active. Returning either verdict would record the suite as
         // having missed a mutant that was switched off for the run that produced the evidence.
-        unestablished => unconfirmed(None, &unestablished),
+        unestablished => unconfirmed(&unestablished),
     }
 }
 
-fn unconfirmed(test: Option<String>, verdict: &Verdict) -> Verdict {
+fn unconfirmed(verdict: &Verdict) -> Verdict {
     let reason = match verdict {
         Verdict::TimedOut => "exceeded its time budget",
         Verdict::Stalled(_) => "stopped reporting progress",
         Verdict::MemoryLimit { .. } => "exceeded its memory ceiling",
         _ => "did not establish a trustworthy passing result",
     };
-    Verdict::Unconfirmed(test, reason)
+    Verdict::Unconfirmed(None, reason)
 }
 
 /// Says on the diagnostic stream that a verdict was reached on less output than the binary produced.
@@ -1193,6 +1193,11 @@ fn supervise(
                     announce_partial(binary);
                 }
 
+                #[cfg(unix)]
+                if let Some(verdict) = stopped_by_ceiling(under_nextest, code, usage.peak, ceiling) {
+                    return (verdict, usage, evidence);
+                }
+
                 // Asked before the ceiling is turned into a verdict, because the harness's own
                 // report is the more useful of the two: a named test is somewhere a reader can go,
                 // and a memory verdict that pre-empted it would leave them with a number and no
@@ -1504,6 +1509,18 @@ fn prefer_named(verdict: Verdict, peak: Option<u64>, ceiling: Option<u64>) -> Ve
     }
 }
 
+/// The verdict for a runner that its memory ceiling stopped before it could report a test.
+///
+/// On macOS the sampler ends cargo-nextest together with the test that passed the ceiling, so the
+/// runner exits by signal instead of reporting a failed test. Without a ceiling breach, a signal
+/// from nextest is still not a verdict about the mutant. Only Unix ends a process by signal.
+#[cfg(unix)]
+fn stopped_by_ceiling(under_nextest: bool, code: Option<i32>, peak: Option<u64>, ceiling: Option<u64>) -> Option<Verdict> {
+    ceiling
+        .filter(|_limit| under_nextest && code.is_none())
+        .map(|limit| Verdict::MemoryLimit { peak, limit })
+}
+
 /// The verdict a run cut short by a failure the harness announced reaches.
 ///
 /// Stated once, and in the same terms as the ordinary exit path, because the two are the same run
@@ -1722,8 +1739,8 @@ impl ReachCapture {
 fn reach_from_records(bytes: &[u8], ordinal: u32) -> ReachObservation {
     let mut sealed = false;
     let mut reached = false;
-    for record in bytes.chunks_exact(core::mem::size_of::<u32>()) {
-        let value = u32::from_le_bytes(record.try_into().expect("chunks_exact yields exactly one runtime reach record"));
+    for record in bytes.as_chunks::<{ core::mem::size_of::<u32>() }>().0 {
+        let value = u32::from_le_bytes(*record);
         if value == ordinal {
             reached = true;
         }
@@ -1849,7 +1866,7 @@ mod pulse_wait_regression_tests {
                     assert_eq!(collected.authoritative, expected);
                     assert_eq!(collected.text, bytes);
                     assert_eq!(collected.stdout_tail, b"tail");
-                    assert!(collected.stderr_tail.is_empty());
+                    assert_eq!(collected.stderr_tail.len(), 0);
                     assert_eq!(collected.whole, complete);
                     assert!(!collected.tail_truncated);
                 }
@@ -1866,7 +1883,7 @@ mod pulse_wait_regression_tests {
         let (kept, tail, truncated, whole) = drain(pipe, &progress, &Pulse::default(), false, false);
         assert_eq!(kept.len(), OUTPUT_CAP);
         assert_eq!(kept.last(), Some(&b'\n'));
-        assert!(tail.is_empty());
+        assert_eq!(tail.len(), 0);
         assert!(!truncated);
         assert!(whole);
     }
@@ -1879,10 +1896,10 @@ mod pulse_wait_regression_tests {
         };
         let collected = collected(&receiver, Duration::ZERO);
         assert!(receiver.replies.borrow().is_empty());
-        assert!(collected.text.is_empty());
-        assert!(collected.authoritative.is_empty());
-        assert!(collected.stdout_tail.is_empty());
-        assert!(collected.stderr_tail.is_empty());
+        assert_eq!(collected.text.len(), 0);
+        assert_eq!(collected.authoritative.len(), 0);
+        assert_eq!(collected.stdout_tail.len(), 0);
+        assert_eq!(collected.stderr_tail.len(), 0);
         assert!(!collected.tail_truncated);
         assert!(!collected.whole);
     }
@@ -2580,7 +2597,7 @@ mod final_survivor_tests {
             .collect::<Vec<_>>();
         assert_eq!(exact, [(false, 1, 0, 0, 0, 0), (false, 0, 7, 0, 0, 0)]);
         let _costs = super::super::sweep::take_execution_costs();
-        assert!(super::super::sweep::take_selection_trace().is_empty());
+        assert_eq!(super::super::sweep::take_selection_trace().len(), 0);
     }
 
     #[test]
@@ -2671,7 +2688,7 @@ mod final_survivor_tests {
         json["launches"] = attempts;
         let legacy: super::super::session::AttemptCost = serde_json::from_value(json).unwrap();
         assert_eq!(&legacy, cost, "previously named attempt counters remain readable");
-        assert!(super::super::sweep::take_selection_trace().is_empty());
+        assert_eq!(super::super::sweep::take_selection_trace().len(), 0);
     }
 
     #[test]
@@ -2715,7 +2732,7 @@ mod final_survivor_tests {
             assert!(!costs[0].0, "only the first observation is a primary execution");
             assert!(costs[1..].iter().all(|(confirmation, cost)| *confirmation && cost.launches == 1));
             assert_eq!(costs.iter().map(|(_, cost)| cost.launches).sum::<usize>(), expected);
-            assert!(super::super::sweep::take_selection_trace().is_empty());
+            assert_eq!(super::super::sweep::take_selection_trace().len(), 0);
         }
     }
 
@@ -2960,6 +2977,7 @@ mod final_survivor_tests {
         stopped: Option<bool>,
         collected: std::cell::Cell<bool>,
         stop_error: Option<String>,
+        usage: MemoryUsage,
     }
 
     impl ScriptedSupervision {
@@ -2970,6 +2988,7 @@ mod final_survivor_tests {
                 stopped: None,
                 collected: std::cell::Cell::new(false),
                 stop_error: None,
+                usage: MemoryUsage::default(),
             }
         }
     }
@@ -2991,7 +3010,7 @@ mod final_survivor_tests {
         }
         fn usage(&self) -> MemoryUsage {
             assert!(self.collected.get(), "completed output is collected before usage");
-            MemoryUsage::default()
+            self.usage
         }
         fn cut_short(&mut self, settled: bool) -> Result<(MemoryUsage, Option<u64>), (Verdict, MemoryUsage)> {
             assert!(self.stopped.replace(settled).is_none(), "only one termination is scripted");
@@ -3068,6 +3087,27 @@ mod final_survivor_tests {
                 assert_eq!(supervision.stopped, None);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nextest_runner_signalled_after_its_ceiling_was_passed_is_out_of_memory() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let binary = crate::testing::test_binary("ceiling-evidence");
+        let progress = Mutex::new(Progress::new(Watch::Off));
+        let mut supervision = ScriptedSupervision::new(Ok(Some(ExitStatus::from_raw(libc::SIGKILL))), (false, false));
+        supervision.usage = MemoryUsage {
+            peak: Some(7),
+            exhausted: true,
+        };
+        let request = MemoryRequest {
+            limit: Some(5),
+            ..MemoryRequest::default()
+        };
+        let (verdict, usage, _evidence) = supervise(&mut supervision, &binary, Some(37), true, request, &progress, false);
+        assert_eq!(verdict, Verdict::MemoryLimit { peak: Some(7), limit: 5 });
+        assert_eq!(usage, supervision.usage);
     }
 
     #[test]
@@ -3250,8 +3290,8 @@ mod final_survivor_tests {
                     assert!(String::from_utf8_lossy(&output.stdout_tail).contains("stdout-marker"));
                     assert!(String::from_utf8_lossy(&output.stderr_tail).contains("stderr-marker"));
                 } else {
-                    assert!(output.stdout_tail.is_empty());
-                    assert!(output.stderr_tail.is_empty());
+                    assert_eq!(output.stdout_tail.len(), 0);
+                    assert_eq!(output.stderr_tail.len(), 0);
                 }
                 assert_eq!(
                     pulse.seen() - before,
@@ -3339,6 +3379,30 @@ mod final_survivor_tests {
         let progress = recorded_failures(false);
         assert_eq!(unfinished_nextest_failure(false, &progress), None);
         assert!(matches!(unfinished_nextest_failure(true, &progress), Some(Verdict::Unmetered(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nextest_runner_ended_by_signal_after_a_breach_is_out_of_memory() {
+        assert_eq!(
+            stopped_by_ceiling(true, None, Some(7), Some(5)),
+            Some(Verdict::MemoryLimit { peak: Some(7), limit: 5 })
+        );
+        assert_eq!(
+            stopped_by_ceiling(true, None, Some(7), None),
+            None,
+            "a signal without a breach is not a verdict"
+        );
+        assert_eq!(
+            stopped_by_ceiling(true, Some(100), Some(7), Some(5)),
+            None,
+            "an exit code is settled by nextest's meaning"
+        );
+        assert_eq!(
+            stopped_by_ceiling(false, None, Some(7), Some(5)),
+            None,
+            "a direct binary keeps the existing path"
+        );
     }
 
     #[test]

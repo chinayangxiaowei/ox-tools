@@ -21,6 +21,8 @@ use cargo_gamma_unsafe::interrupt;
 use cargo_gamma_unsafe::job::{self, Job};
 use cargo_gamma_unsafe::{PlatformError, Situation};
 
+#[cfg(target_os = "macos")]
+use crate::descendants;
 #[cfg(any(test, feature = "fault-injection"))]
 use crate::faults;
 #[cfg(target_os = "macos")]
@@ -1764,13 +1766,28 @@ fn start_sampler(child: &mut Child, guard: &SpawnGuard, group: i32, slot: usize)
 }
 
 /// Signals the retained group using the existing exited-leader handling.
+///
+/// On macOS, this first stops and ends every descendant found through its parent, which killing
+/// the group alone would leave running.
 #[cfg(unix)]
 fn sweep_group(group: Option<i32>, leader_exited: bool) -> io::Result<()> {
     group.map_or(Ok(()), |group| {
-        if leader_exited {
-            group::kill_after_exit(group)
-        } else {
-            group::kill(group)
+        let kill = || {
+            if leader_exited {
+                group::kill_after_exit(group)
+            } else {
+                group::kill(group)
+            }
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            descendants::sweep(group, kill)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            kill()
         }
     })
 }
@@ -4144,7 +4161,7 @@ mod tests {
             matches!(failed.cause().kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory),
             "the missing working directory should prevent the spawn: {failed}"
         );
-        assert!(!failed.to_string().is_empty());
+        assert_ne!(failed.to_string(), "");
         let source = failed
             .source()
             .and_then(|cause| cause.downcast_ref::<io::Error>())
